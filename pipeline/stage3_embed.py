@@ -84,7 +84,11 @@ COLLECTION_NAME   = "phpba_codebase"
 EMBEDDING_MODEL   = "all-MiniLM-L6-v2"   # local sentence-transformers model
 CHROMA_SUBDIR     = "chromadb"
 CHUNK_BATCH_SIZE  = 64       # documents per ChromaDB upsert call
-MAX_CHUNK_CHARS   = 1500     # soft cap — longer chunks are split
+MAX_CHUNK_CHARS   = 1000     # hard cap — all-MiniLM-L6-v2 truncates at ~256 tokens (~1000 chars)
+
+# Semantic splitting constants
+COLS_PER_SCHEMA_PART   = 12   # db_schema: max columns per sub-chunk
+EDGES_SPLIT_THRESHOLD  = 14   # graph_neighbourhood: split when degree exceeds this
 
 # Superglobals that carry user-supplied input (used for auth/input tagging)
 INPUT_SUPERGLOBALS  = {"$_POST", "$_GET", "$_REQUEST", "$_FILES"}
@@ -297,6 +301,235 @@ def _module_id_for_file(filepath: str, file_module: dict[str, str]) -> str:
             return mid
     return "unknown"
 
+
+# ─── Semantic Anchors & Splitting Helpers ─────────────────────────────────────
+
+def _make_anchor(chunk_type: str, metadata: dict[str, str]) -> str:
+    """
+    Build a one-line structured header that is prepended to every chunk
+    before embedding.
+
+    Purpose
+    -------
+    sentence-transformers (all-MiniLM-L6-v2) learns token importance
+    from position and frequency.  A consistent structured prefix encodes
+    the four most retrieval-relevant facts at the very start of every chunk:
+
+        CHUNK_TYPE | primary_subject | module:name | role/context
+
+    This lets the model distinguish "UserController methods" from
+    "users table schema" even when the body text is similar.
+
+    Format per chunk type
+    ---------------------
+    FILE_SUMMARY        FILE_SUMMARY | login.php | module:auth | page entry-point
+    FUNCTION_DEF        FUNCTION_DEF | validate_phone | login.php | module:auth
+    SQL_OPERATION       SQL_OPERATION | INSERT | table:users | registration.php
+    NAVIGATION_FLOW     NAVIGATION_FLOW | checksession.php | auth guard | module:auth
+    FORM_INPUTS         FORM_INPUTS | registration.php | POST fields | module:auth
+    CLASS_SUMMARY       CLASS_SUMMARY | UserController | controller | module:auth
+    DB_SCHEMA           DB_SCHEMA | CREATE TABLE users | columns 1-12 | module:unknown
+    GRAPH_NEIGHBOURHOOD GRAPH_NEIGHBOURHOOD | TABLE:users | db_table | degree:24
+    """
+    t = chunk_type.upper()
+
+    if t == "FILE_SUMMARY":
+        fname  = metadata.get("filename", "?")
+        role   = metadata.get("file_role", "script")
+        module = metadata.get("module_id", "unknown")
+        return f"FILE_SUMMARY | {fname} | module:{module} | {role} entry-point"
+
+    if t == "FUNCTION_DEF":
+        name   = metadata.get("function_name", "?")
+        fname  = metadata.get("filename", "?")
+        module = metadata.get("module_id", "unknown")
+        return f"FUNCTION_DEF | {name} | {fname} | module:{module}"
+
+    if t == "SQL_OPERATION":
+        op     = metadata.get("sql_operation", "?")
+        table  = metadata.get("table_name", "?")
+        fname  = metadata.get("filename", "?")
+        module = metadata.get("module_id", "unknown")
+        return f"SQL_OPERATION | {op} | table:{table} | {fname} | module:{module}"
+
+    if t == "NAVIGATION_FLOW":
+        fname  = metadata.get("filename", "?")
+        is_auth = metadata.get("involves_auth", "false") == "true"
+        module = metadata.get("module_id", "unknown")
+        role   = "auth guard" if is_auth else "navigation"
+        return f"NAVIGATION_FLOW | {fname} | {role} | module:{module}"
+
+    if t == "FORM_INPUTS":
+        fname  = metadata.get("filename", "?")
+        fields = metadata.get("post_fields", "")
+        module = metadata.get("module_id", "unknown")
+        preview = (fields[:40] + "...") if len(fields) > 40 else fields
+        return f"FORM_INPUTS | {fname} | POST:{preview} | module:{module}"
+
+    if t == "CLASS_SUMMARY":
+        name   = metadata.get("class_name", "?")
+        etype  = metadata.get("entity_type", "class")
+        module = metadata.get("module_id", "unknown")
+        return f"CLASS_SUMMARY | {name} | {etype} | module:{module}"
+
+    if t == "DB_SCHEMA":
+        table  = metadata.get("table_name", "?")
+        op     = metadata.get("sql_operation", "CREATE")
+        part   = metadata.get("part_label", "")
+        module = metadata.get("module_id", "unknown")
+        part_str = f" | {part}" if part else ""
+        return f"DB_SCHEMA | {op} TABLE {table}{part_str} | module:{module}"
+
+    if t == "GRAPH_NEIGHBOURHOOD":
+        nid    = metadata.get("node_id", "?")
+        ntype  = metadata.get("node_type", "?")
+        degree = metadata.get("degree", "?")
+        part   = metadata.get("part_label", "")
+        part_str = f" | {part}" if part else ""
+        return f"GRAPH_NEIGHBOURHOOD | {nid} | {ntype} | degree:{degree}{part_str}"
+
+    # Fallback for any future chunk type
+    return f"{t} | {metadata.get('filename', metadata.get('source_file', '?'))}"
+
+
+def _split_db_schema(
+    table:     str,
+    operation: str,
+    filename:  str,
+    columns:   list[dict],
+    base_meta: dict[str, str],
+    n_per_part: int = COLS_PER_SCHEMA_PART,
+) -> list[dict]:
+    """
+    Split a wide table schema into sub-chunks of at most n_per_part columns.
+
+    Each sub-chunk repeats the table header so it is self-contained:
+
+        DB_SCHEMA | CREATE TABLE wp_posts | columns 13-24 of 40 | module:cms
+        Database Schema: CREATE TABLE 'wp_posts' (columns 13-24 of 40)
+        Defined in: 2024_create_wp_posts.php
+        Columns:
+          col_13: varchar(255) [nullable]
+          ...
+
+    Called only when len(columns) > n_per_part.  When the table fits in one
+    chunk it is emitted by _chunks_db_schema directly (no overhead).
+    """
+    total   = len(columns)
+    batches = [columns[i:i + n_per_part] for i in range(0, total, n_per_part)]
+    chunks  = []
+
+    for idx, batch in enumerate(batches):
+        start    = idx * n_per_part + 1
+        end      = start + len(batch) - 1
+        part_lbl = f"columns {start}-{end} of {total}"
+
+        col_lines = []
+        for col in batch:
+            col_name = col.get("name", "?")
+            col_type = col.get("type", "?")
+            mods     = col.get("modifiers", [])
+            mod_str  = f" [{', '.join(mods)}]" if mods else ""
+            col_lines.append(f"  {col_name}: {col_type}{mod_str}")
+
+        body = (
+            f"Database Schema: {operation.upper()} TABLE '{table}' ({part_lbl})\n"
+            f"Defined in: {filename}\n"
+            f"Columns:\n" + "\n".join(col_lines)
+        )
+
+        meta = {**base_meta, "part_label": part_lbl, "part_num": str(idx + 1),
+                "total_parts": str(len(batches))}
+        anchor = _make_anchor("db_schema", meta)
+        text   = anchor + "\n" + body
+
+        chunks.append(_make_chunk(
+            text        = text,
+            chunk_type  = "db_schema",
+            source_file = base_meta.get("source_file", ""),
+            metadata    = meta,
+        ))
+
+    return chunks
+
+
+def _split_graph_neighbourhood(
+    node_id:   str,
+    node_name: str,
+    node_type: str,
+    degree:    int,
+    source_file: str,
+    in_edges:  list[str],
+    out_edges: list[str],
+    db_summary: list[str],
+    base_meta: dict[str, str],
+) -> list[dict]:
+    """
+    Split a high-degree graph node into at most three focused sub-chunks:
+
+        Part 1 — "connections summary"  (header + compact read/write/ddl lines)
+        Part 2 — "incoming edges"       (all ← edges in batches)
+        Part 3 — "outgoing edges"       (all → edges in batches)
+
+    Part 1 always exists.  Parts 2 and 3 are only created when there are
+    enough edges to warrant it (threshold: EDGES_SPLIT_THRESHOLD).
+
+    Each sub-chunk repeats the node identity line so it is self-contained.
+    """
+    chunks = []
+    header = f"Graph node: {node_name} (type={node_type}, degree={degree})"
+    if source_file:
+        header += f"\nDefined in: {source_file}"
+
+    # ── Part 1: summary (db_summary lines + compact edge counts) ─────────────
+    summary_lines = [header]
+    summary_lines.append(
+        f"Connections: {len(in_edges)} incoming, {len(out_edges)} outgoing"
+    )
+    summary_lines.extend(db_summary)   # Read by / Written by / Schema defined in
+    # Include a sample of edges so the summary is useful on its own
+    SAMPLE = 4
+    if in_edges:
+        summary_lines.append("Sample incoming:\n" + "\n".join(in_edges[:SAMPLE]))
+    if out_edges:
+        summary_lines.append("Sample outgoing:\n" + "\n".join(out_edges[:SAMPLE]))
+
+    meta1 = {**base_meta, "part_label": "summary"}
+    anchor1 = _make_anchor("graph_neighbourhood", meta1)
+    chunks.append(_make_chunk(
+        text        = anchor1 + "\n" + "\n".join(summary_lines),
+        chunk_type  = "graph_neighbourhood",
+        source_file = source_file,
+        metadata    = meta1,
+    ))
+
+    # ── Part 2: full incoming edges ───────────────────────────────────────────
+    if in_edges:
+        body2 = header + "\nIncoming connections (all):\n" + "\n".join(in_edges)
+        meta2 = {**base_meta, "part_label": "incoming"}
+        anchor2 = _make_anchor("graph_neighbourhood", meta2)
+        chunks.append(_make_chunk(
+            text        = anchor2 + "\n" + body2,
+            chunk_type  = "graph_neighbourhood",
+            source_file = source_file,
+            metadata    = meta2,
+        ))
+
+    # ── Part 3: full outgoing edges ───────────────────────────────────────────
+    if out_edges:
+        body3 = header + "\nOutgoing connections (all):\n" + "\n".join(out_edges)
+        meta3 = {**base_meta, "part_label": "outgoing"}
+        anchor3 = _make_anchor("graph_neighbourhood", meta3)
+        chunks.append(_make_chunk(
+            text        = anchor3 + "\n" + body3,
+            chunk_type  = "graph_neighbourhood",
+            source_file = source_file,
+            metadata    = meta3,
+        ))
+
+    return chunks
+
+
 # ── Chunk Type 1: Per-file summaries
 
 def _chunks_file_summaries(cm: CodeMap, ctx: dict, file_module: dict[str, str] | None = None) -> list[dict]:
@@ -369,6 +602,31 @@ def _chunks_file_summaries(cm: CodeMap, ctx: dict, file_module: dict[str, str] |
             parts.append(f"Defines functions: {', '.join(fn_names)}")
 
         text = "\n".join(parts)
+
+        # Trim oversized file summaries: execution_path branches are the most
+        # likely culprit for God-class files.  Keep the header + SQL + redirects
+        # and truncate branch details, re-joining to stay under MAX_CHUNK_CHARS.
+        if len(text) > MAX_CHUNK_CHARS:
+            # Rebuild, capping any "Branches" line group to 2 entries
+            trimmed_parts = []
+            in_branch_block = False
+            branch_count = 0
+            for p in parts:
+                if p.startswith("Branches (") or p.startswith("  if ("):
+                    in_branch_block = True
+                if in_branch_block:
+                    branch_count += 1
+                    if branch_count <= 2:
+                        trimmed_parts.append(p)
+                    elif branch_count == 3:
+                        trimmed_parts.append("  ... (truncated for embedding)")
+                    # skip rest
+                else:
+                    trimmed_parts.append(p)
+            text = "\n".join(trimmed_parts)
+            # Hard fallback: if still too long, trim from the end
+            if len(text) > MAX_CHUNK_CHARS:
+                text = text[:MAX_CHUNK_CHARS - 30] + "\n  ... (truncated)"
 
         # Metadata flags used for filtered retrieval
         involves_auth = any(
@@ -771,36 +1029,48 @@ def _chunks_db_schema(cm: CodeMap, file_module: dict[str, str] | None = None) ->
         filepath  = schema.get("file", "")
         filename  = Path(filepath).name
 
-        parts = [
-            f"Database Schema: {operation.upper()} TABLE '{table}'",
-            f"Defined in: {filename}",
-        ]
+        base_meta = {
+            "table_name":    table,
+            "sql_operation": operation.upper(),
+            "involves_db":   "true",
+            "filename":      filename,
+            "framework":     cm.framework.value,
+            "module_id":     _module_id_for_file(filepath, file_module or {}),
+            "source_file":   filepath,
+        }
 
-        if columns:
+        if columns and len(columns) > COLS_PER_SCHEMA_PART:
+            # Wide table — semantic split into batches of COLS_PER_SCHEMA_PART
+            chunks.extend(_split_db_schema(
+                table      = table,
+                operation  = operation,
+                filename   = filename,
+                columns    = columns,
+                base_meta  = base_meta,
+            ))
+        else:
+            # Narrow table — single chunk (normal path)
             col_lines = []
-            for col in columns:
+            for col in (columns or []):
                 col_name = col.get("name", "?")
                 col_type = col.get("type", "?")
                 mods     = col.get("modifiers", [])
                 mod_str  = f" [{', '.join(mods)}]" if mods else ""
                 col_lines.append(f"  {col_name}: {col_type}{mod_str}")
-            parts.append("Columns:\n" + "\n".join(col_lines))
 
-        text = "\n".join(parts)
+            parts = [
+                f"Database Schema: {operation.upper()} TABLE '{table}'",
+                f"Defined in: {filename}",
+            ]
+            if col_lines:
+                parts.append("Columns:\n" + "\n".join(col_lines))
 
-        chunks.append(_make_chunk(
-            text        = text,
-            chunk_type  = "db_schema",
-            source_file = filepath,
-            metadata    = {
-                "table_name":    table,
-                "sql_operation": operation.upper(),
-                "involves_db":   "true",
-                "filename":      filename,
-                "framework":     cm.framework.value,
-                "module_id":     _module_id_for_file(filepath, file_module or {}),
-            },
-        ))
+            chunks.append(_make_chunk(
+                text        = "\n".join(parts),
+                chunk_type  = "db_schema",
+                source_file = filepath,
+                metadata    = base_meta,
+            ))
 
     return chunks
 
@@ -883,23 +1153,40 @@ def _chunks_graph_neighbourhoods(graph: Any, cm: CodeMap) -> list[dict]:
             if ddl:
                 parts.append(f"Schema defined in: {', '.join(ddl)}")
 
-        text = "\n".join(parts)
         source_file = data.get("file", "")
+        base_meta_g = {
+            "node_id":    node_id,
+            "node_type":  node_type,
+            "degree":     str(degree),
+            "table_name": node_name if node_type == "db_table" else "",
+            "involves_db": str(node_type == "db_table").lower(),
+            "framework":  cm.framework.value,
+            "module_id":  data.get("module_id", "unknown"),
+        }
 
-        chunks.append(_make_chunk(
-            text        = text,
-            chunk_type  = "graph_neighbourhood",
-            source_file = source_file,
-            metadata    = {
-                "node_id":    node_id,
-                "node_type":  node_type,
-                "degree":     str(degree),
-                "table_name": node_name if node_type == "db_table" else "",
-                "involves_db": str(node_type == "db_table").lower(),
-                "framework":  cm.framework.value,
-                "module_id":  data.get("module_id", "unknown"),
-            },
-        ))
+        if degree > EDGES_SPLIT_THRESHOLD:
+            # High-degree node — semantic split into summary + edges sub-chunks
+            chunks.extend(_split_graph_neighbourhood(
+                node_id     = node_id,
+                node_name   = node_name,
+                node_type   = node_type,
+                degree      = degree,
+                source_file = source_file,
+                in_edges    = in_edges,
+                out_edges   = out_edges,
+                db_summary  = [p for p in parts
+                               if p.startswith(("Read by:", "Written by:", "Schema defined in:"))],
+                base_meta   = base_meta_g,
+            ))
+        else:
+            # Normal node — single chunk
+            text = "\n".join(parts)
+            chunks.append(_make_chunk(
+                text        = text,
+                chunk_type  = "graph_neighbourhood",
+                source_file = source_file,
+                metadata    = base_meta_g,
+            ))
 
     return chunks
 
@@ -1017,9 +1304,18 @@ def _make_chunk(
         **{k: str(v) for k, v in metadata.items()},
     }
 
+    # Prepend semantic anchor unless the text already starts with one
+    # (split helpers pre-build text with anchor included to control part labels)
+    anchor_prefix = chunk_type.upper() + " |"
+    if not text.lstrip().startswith(anchor_prefix):
+        anchor = _make_anchor(chunk_type, safe_meta)
+        text   = anchor + "\n" + text.strip()
+    else:
+        text = text.strip()
+
     return {
         "id":       chunk_id,
-        "text":     text.strip(),
+        "text":     text,
         "metadata": safe_meta,
     }
 
