@@ -1,0 +1,278 @@
+{
+  "domain_name": "Car Rental System",
+  "description": "A system for users to rent cars. It handles user registration, car booking, and order management.",
+  "user_roles": [
+    {
+      "role": "Customer",
+      "description": "Can register, log in, view car tariffs, book cars, and view their rental orders.",
+      "entry_points": [
+        "login.php",
+        "registration.php",
+        "tarrif.php"
+      ]
+    },
+    {
+      "role": "Guest",
+      "description": "Can view car tariffs and register.",
+      "entry_points": [
+        "tarrif.php",
+        "registration.php"
+      ]
+    }
+  ],
+  "features": [
+    {
+      "name": "User Registration",
+      "description": "Allows new users to create an account in the system.",
+      "pages": [
+        "registration.php"
+      ],
+      "tables": [
+        "registerhere"
+      ],
+      "inputs": [
+        "fname",
+        "lname",
+        "phone",
+        "M",
+        "dob",
+        "email",
+        "uname",
+        "pwd",
+        "city",
+        "state",
+        "country"
+      ],
+      "outputs": "A new user account is created in the system.",
+      "business_rules": [
+        "Username must be unique.",
+        "Phone number must be valid (uses validate_phone_number function)."
+      ]
+    },
+    {
+      "name": "User Login",
+      "description": "Allows existing users to log in to the system.",
+      "pages": [
+        "login.php",
+        "session.php"
+      ],
+      "tables": [],
+      "inputs": [
+        "uname",
+        "pwd"
+      ],
+      "outputs": "User is authenticated and redirected to the car rental page.",
+      "business_rules": [
+        "Credentials must match a registered user."
+      ]
+    },
+    {
+      "name": "User Logout",
+      "description": "Allows logged-in users to log out of the system.",
+      "pages": [
+        "logout.php"
+      ],
+      "tables": [],
+      "inputs": [],
+      "outputs": "User session is terminated, and the user is redirected to the login page.",
+      "business_rules": []
+    },
+    {
+      "name": "Car Rental Booking",
+      "description": "Enables logged-in users to book a car for a specified period.",
+      "pages": [
+        "rent.php",
+        "request.php"
+      ],
+      "tables": [
+        "request"
+      ],
+      "inputs": [
+        "carid",
+        "doi",
+        "dor",
+        "distance",
+        "dln",
+        "cc",
+        "dc",
+        "no",
+        "mob",
+        "sub"
+      ],
+      "outputs": "A car rental request is submitted and stored.",
+      "business_rules": [
+        "Car ID must be valid.",
+        "Dates of issue and return must be valid.",
+        "Distance, driver's license number, credit card details, and mobile number are collected."
+      ]
+    },
+    {
+      "name": "View My Orders",
+      "description": "Allows logged-in users to view their past and current car rental orders.",
+      "pages": [
+        "myorder.php"
+      ],
+      "tables": [
+        "request",
+        "registerhere"
+      ],
+      "inputs": [],
+      "outputs": "A list of the user's rental orders is displayed.",
+      "business_rules": [
+        "Only logged-in users can view their orders."
+      ]
+    },
+    {
+      "name": "View Car Tariffs",
+      "description": "Displays available car information and rental rates.",
+      "pages": [
+        "tarrif.php"
+      ],
+      "tables": [],
+      "inputs": [],
+      "outputs": "A list of cars with their details and rental information.",
+      "business_rules": []
+    }
+  ],
+  "workflows": [
+    {
+      "name": "User Registration Workflow",
+      "actor": "Guest",
+      "steps": [
+        {
+          "step": 1,
+          "action": "Navigate to the registration page",
+          "page": "registration.php"
+        },
+        {
+          "step": 2,
+          "action": "Fill in registration form details",
+          "page": "registration.php"
+        },
+        {
+          "step": 3,
+          "action": "Submit registration form",
+          "page": "registration.php"
+        }
+      ],
+      "preconditions": [
+        "User is not logged in."
+      ],
+      "postconditions": [
+        "User account is created.",
+        "User is redirected to the login page (inferred from session.php redirect)."
+      ]
+    },
+    {
+      "name": "User Login Workflow",
+      "actor": "Customer",
+      "steps": [
+        {
+          "step": 1,
+          "action": "Navigate to the login page",
+          "page": "login.php"
+        },
+        {
+          "step": 2,
+          "action": "Enter username and password",
+          "page": "session.php"
+        },
+        {
+          "step": 3,
+          "action": "Submit login credentials",
+          "page": "session.php"
+        }
+      ],
+      "preconditions": [
+        "User has a registered account."
+      ],
+      "postconditions": [
+        "User is authenticated.",
+        "User is redirected to the car rental page (rent.php)."
+      ]
+    },
+    {
+      "name": "Car Rental Booking Workflow",
+      "actor": "Customer",
+      "steps": [
+        {
+          "step": 1,
+          "action": "Log in to the system",
+          "page": "session.php"
+        },
+        {
+          "step": 2,
+          "action": "Navigate to the car rental page",
+          "page": "rent.php"
+        },
+        {
+          "step": 3,
+          "action": "Select a car and enter booking details",
+          "page": "request.php"
+        },
+        {
+          "step": 4,
+          "action": "Submit booking request",
+          "page": "request.php"
+        }
+      ],
+      "preconditions": [
+        "User is logged in."
+      ],
+      "postconditions": [
+        "Rental request is saved in the 'request' table.",
+        "User is redirected to the car rental page (rent.php)."
+      ]
+    },
+    {
+      "name": "View My Orders Workflow",
+      "actor": "Customer",
+      "steps": [
+        {
+          "step": 1,
+          "action": "Log in to the system",
+          "page": "session.php"
+        },
+        {
+          "step": 2,
+          "action": "Navigate to the 'My Orders' page",
+          "page": "myorder.php"
+        }
+      ],
+      "preconditions": [
+        "User is logged in."
+      ],
+      "postconditions": [
+        "User's rental orders are displayed."
+      ]
+    },
+    {
+      "name": "Logout Workflow",
+      "actor": "Customer",
+      "steps": [
+        {
+          "step": 1,
+          "action": "Click on the logout link/button",
+          "page": "logout.php"
+        }
+      ],
+      "preconditions": [
+        "User is logged in."
+      ],
+      "postconditions": [
+        "User session is destroyed.",
+        "User is redirected to the login page."
+      ]
+    }
+  ],
+  "bounded_contexts": [
+    "User Management",
+    "Booking",
+    "Catalog"
+  ],
+  "key_entities": [
+    "User",
+    "RentalRequest",
+    "Car"
+  ]
+}

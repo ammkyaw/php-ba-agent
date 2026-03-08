@@ -1,0 +1,1451 @@
+{
+  "run_id": "20260308_123236",
+  "php_project_path": "/Users/aungmaungmaungkyaw/Downloads/tree-sitter-test/test-project",
+  "output_dir": "outputs/run_20260308_123236",
+  "created_at": "2026-03-08T12:32:36.984134",
+  "stages": {
+    "stage0_validate": {
+      "status": "completed",
+      "started_at": "2026-03-08T12:32:36.984711",
+      "completed_at": "2026-03-08T12:32:37.096742",
+      "error": null,
+      "output_path": "outputs/run_20260308_123236/validation_report.json"
+    },
+    "stage1_parse": {
+      "status": "completed",
+      "started_at": "2026-03-08T12:32:37.096957",
+      "completed_at": "2026-03-08T12:32:37.228634",
+      "error": null,
+      "output_path": "outputs/run_20260308_123236/code_map.json"
+    },
+    "stage15_paths": {
+      "status": "completed",
+      "started_at": "2026-03-08T13:44:11.277509",
+      "completed_at": "2026-03-08T13:44:11.290485",
+      "error": null,
+      "output_path": "outputs/run_20260308_123236/execution_paths.json"
+    },
+    "stage2_graph": {
+      "status": "completed",
+      "started_at": "2026-03-08T12:32:37.229419",
+      "completed_at": "2026-03-08T12:32:38.026299",
+      "error": null,
+      "output_path": "outputs/run_20260308_123236/code_graph.json"
+    },
+    "stage3_embed": {
+      "status": "completed",
+      "started_at": "2026-03-08T12:32:38.026999",
+      "completed_at": "2026-03-08T12:32:46.599193",
+      "error": null,
+      "output_path": "outputs/run_20260308_123236/chromadb"
+    },
+    "stage35_preflight": {
+      "status": "completed",
+      "started_at": "2026-03-08T12:32:46.599923",
+      "completed_at": "2026-03-08T12:32:46.618572",
+      "error": null,
+      "output_path": "outputs/run_20260308_123236/preflight_report.json"
+    },
+    "stage4_domain": {
+      "status": "completed",
+      "started_at": "2026-03-08T12:32:46.619277",
+      "completed_at": "2026-03-08T12:32:59.483930",
+      "error": null,
+      "output_path": "outputs/run_20260308_123236/domain_model.json"
+    },
+    "stage5_brd": {
+      "status": "completed",
+      "started_at": "2026-03-08T12:32:59.491650",
+      "completed_at": "2026-03-08T12:33:15.313752",
+      "error": null,
+      "output_path": "outputs/run_20260308_123236/brd.md"
+    },
+    "stage5_srs": {
+      "status": "completed",
+      "started_at": "2026-03-08T12:32:59.493827",
+      "completed_at": "2026-03-08T12:33:15.313792",
+      "error": null,
+      "output_path": "outputs/run_20260308_123236/srs.md"
+    },
+    "stage5_ac": {
+      "status": "completed",
+      "started_at": "2026-03-08T12:32:59.497016",
+      "completed_at": "2026-03-08T12:33:15.313804",
+      "error": null,
+      "output_path": "outputs/run_20260308_123236/ac.md"
+    },
+    "stage5_userstories": {
+      "status": "completed",
+      "started_at": "2026-03-08T12:32:59.499041",
+      "completed_at": "2026-03-08T12:33:15.313812",
+      "error": null,
+      "output_path": "outputs/run_20260308_123236/user_stories.md"
+    },
+    "stage6_qa": {
+      "status": "completed",
+      "started_at": "2026-03-08T12:33:15.316807",
+      "completed_at": "2026-03-08T12:33:22.429018",
+      "error": null,
+      "output_path": "outputs/run_20260308_123236/qa_report.md"
+    },
+    "stage65_postprocess": {
+      "status": "completed",
+      "started_at": "2026-03-08T12:33:22.431411",
+      "completed_at": "2026-03-08T12:33:24.017962",
+      "error": null,
+      "output_path": "outputs/run_20260308_123236/pipeline_summary.md"
+    },
+    "stage7_pdf": {
+      "status": "completed",
+      "started_at": "2026-03-08T12:33:24.018951",
+      "completed_at": "2026-03-08T12:33:29.588506",
+      "error": null,
+      "output_path": "outputs/run_20260308_123236/delivery"
+    }
+  },
+  "code_map": {
+    "framework": "raw_php",
+    "php_version": "8.1",
+    "classes": [],
+    "routes": [],
+    "models": [],
+    "controllers": [],
+    "services": [],
+    "db_schema": [],
+    "config_files": [],
+    "total_files": 12,
+    "total_lines": 694,
+    "functions": [
+      {
+        "name": "validate_phone_number",
+        "file": "registration.php",
+        "line": 71,
+        "params": [
+          {
+            "name": "$phone",
+            "type": null,
+            "default": null
+          }
+        ],
+        "return_type": null,
+        "docblock": null
+      },
+      {
+        "name": "validate_phone_number",
+        "file": "rent.php",
+        "line": 94,
+        "params": [
+          {
+            "name": "$no",
+            "type": null,
+            "default": null
+          }
+        ],
+        "return_type": null,
+        "docblock": null
+      }
+    ],
+    "includes": [
+      {
+        "type": "include",
+        "target": "checksession.php",
+        "caller": "GLOBAL_SCRIPT",
+        "file": "myorder.php",
+        "line": 3
+      },
+      {
+        "type": "include",
+        "target": "dbcreation.php",
+        "caller": "GLOBAL_SCRIPT",
+        "file": "registration.php",
+        "line": 19
+      },
+      {
+        "type": "include",
+        "target": "checksession.php",
+        "caller": "GLOBAL_SCRIPT",
+        "file": "rent.php",
+        "line": 2
+      },
+      {
+        "type": "include",
+        "target": "dbcreation.php",
+        "caller": "GLOBAL_SCRIPT",
+        "file": "rent.php",
+        "line": 38
+      },
+      {
+        "type": "include",
+        "target": "checksession.php",
+        "caller": "GLOBAL_SCRIPT",
+        "file": "request.php",
+        "line": 2
+      },
+      {
+        "type": "include",
+        "target": "dbcreation.php",
+        "caller": "GLOBAL_SCRIPT",
+        "file": "table.php",
+        "line": 2
+      }
+    ],
+    "sql_queries": [
+      {
+        "operation": "SELECT",
+        "table": "registerhere",
+        "sql": "select uname from registerhere where uname='?'",
+        "caller": "GLOBAL_SCRIPT",
+        "via": "mysqli_query",
+        "file": "checksession.php",
+        "line": 9
+      },
+      {
+        "operation": "CREATE",
+        "table": "UNKNOWN",
+        "sql": "create database UserInformation",
+        "caller": "GLOBAL_SCRIPT",
+        "via": "mysqli_query",
+        "file": "dbcreation.php",
+        "line": 16
+      },
+      {
+        "operation": "SELECT",
+        "table": "registerhere",
+        "sql": "select fname from registerhere where uname='?'",
+        "caller": "GLOBAL_SCRIPT",
+        "via": "mysqli_query",
+        "file": "myorder.php",
+        "line": 9
+      },
+      {
+        "operation": "SELECT",
+        "table": "request",
+        "sql": "select cc,dc,doi,dor from request where uname='?'",
+        "caller": "GLOBAL_SCRIPT",
+        "via": "mysqli_query",
+        "file": "myorder.php",
+        "line": 48
+      },
+      {
+        "operation": "INSERT",
+        "table": "registerhere",
+        "sql": "insert into registerhere values('?','?','?','?','?','?','?','?','?','?','?')",
+        "caller": "GLOBAL_SCRIPT",
+        "via": "mysqli_query",
+        "file": "registration.php",
+        "line": 92
+      },
+      {
+        "operation": "SELECT",
+        "table": "registerhere",
+        "sql": "select fname from registerhere where uname='?'",
+        "caller": "GLOBAL_SCRIPT",
+        "via": "mysqli_query",
+        "file": "rent.php",
+        "line": 8
+      },
+      {
+        "operation": "INSERT",
+        "table": "request",
+        "sql": "INSERT INTO request(uname,no,cc,dc,doi,dor,distance,carid,dln) values('?','?','?','?','?','?','?','?','?')",
+        "caller": "GLOBAL_SCRIPT",
+        "via": "mysqli_query",
+        "file": "rent.php",
+        "line": 123
+      },
+      {
+        "operation": "INSERT",
+        "table": "request",
+        "sql": "INSERT INTO request(uname,no,cc,dc,doi,dor,distance,carid,dln) values('?','?','?','?','?','?','?','?','?')",
+        "caller": "GLOBAL_SCRIPT",
+        "via": "mysqli_query",
+        "file": "request.php",
+        "line": 15
+      },
+      {
+        "operation": "SELECT",
+        "table": "registerhere",
+        "sql": "select uname from registerhere where uname='?' and pwd='?'",
+        "caller": "GLOBAL_SCRIPT",
+        "via": "mysqli_query",
+        "file": "session.php",
+        "line": 10
+      },
+      {
+        "operation": "CREATE",
+        "table": "registerhere",
+        "sql": "create table registerhere(fname varchar(10),lname varchar(10),phone int(10),gender varchar(2),dob DATE,email varchar(10),uname varchar(10) primary key,pwd varchar(10),city varchar(10),country varchar(...",
+        "caller": "GLOBAL_SCRIPT",
+        "via": "mysqli_query",
+        "file": "table.php",
+        "line": 5
+      }
+    ],
+    "redirects": [
+      {
+        "target": "login.php",
+        "caller": "GLOBAL_SCRIPT",
+        "file": "checksession.php",
+        "line": 14
+      },
+      {
+        "target": "login.php",
+        "caller": "GLOBAL_SCRIPT",
+        "file": "logout.php",
+        "line": 5
+      },
+      {
+        "target": "rent.php",
+        "caller": "GLOBAL_SCRIPT",
+        "file": "request.php",
+        "line": 16
+      },
+      {
+        "target": "rent.php",
+        "caller": "GLOBAL_SCRIPT",
+        "file": "session.php",
+        "line": 16
+      },
+      {
+        "target": "login.php",
+        "caller": "GLOBAL_SCRIPT",
+        "file": "session.php",
+        "line": 19
+      }
+    ],
+    "globals": [],
+    "html_pages": [
+      "carrental.php",
+      "checksession.php",
+      "login.php",
+      "logout.php",
+      "myorder.php",
+      "registration.php",
+      "rent.php",
+      "request.php",
+      "session.php",
+      "tarrif.php"
+    ],
+    "superglobals": [
+      {
+        "var": "$_SESSION",
+        "key": "username",
+        "caller": "GLOBAL_SCRIPT",
+        "file": "checksession.php",
+        "line": 3
+      },
+      {
+        "var": "$_POST",
+        "key": "register",
+        "caller": "GLOBAL_SCRIPT",
+        "file": "registration.php",
+        "line": 23
+      },
+      {
+        "var": "$_POST",
+        "key": "fname",
+        "caller": "GLOBAL_SCRIPT",
+        "file": "registration.php",
+        "line": 26
+      },
+      {
+        "var": "$_POST",
+        "key": "fname",
+        "caller": "GLOBAL_SCRIPT",
+        "file": "registration.php",
+        "line": 29
+      },
+      {
+        "var": "$_POST",
+        "key": "lname",
+        "caller": "GLOBAL_SCRIPT",
+        "file": "registration.php",
+        "line": 33
+      },
+      {
+        "var": "$_POST",
+        "key": "dob",
+        "caller": "GLOBAL_SCRIPT",
+        "file": "registration.php",
+        "line": 35
+      },
+      {
+        "var": "$_POST",
+        "key": "dob",
+        "caller": "GLOBAL_SCRIPT",
+        "file": "registration.php",
+        "line": 38
+      },
+      {
+        "var": "$_POST",
+        "key": "phone",
+        "caller": "GLOBAL_SCRIPT",
+        "file": "registration.php",
+        "line": 41
+      },
+      {
+        "var": "$_POST",
+        "key": "phone",
+        "caller": "GLOBAL_SCRIPT",
+        "file": "registration.php",
+        "line": 44
+      },
+      {
+        "var": "$_POST",
+        "key": "M",
+        "caller": "GLOBAL_SCRIPT",
+        "file": "registration.php",
+        "line": 47
+      },
+      {
+        "var": "$_POST",
+        "key": "M",
+        "caller": "GLOBAL_SCRIPT",
+        "file": "registration.php",
+        "line": 50
+      },
+      {
+        "var": "$_POST",
+        "key": "email",
+        "caller": "GLOBAL_SCRIPT",
+        "file": "registration.php",
+        "line": 53
+      },
+      {
+        "var": "$_POST",
+        "key": "email",
+        "caller": "GLOBAL_SCRIPT",
+        "file": "registration.php",
+        "line": 56
+      },
+      {
+        "var": "$_POST",
+        "key": "uname",
+        "caller": "GLOBAL_SCRIPT",
+        "file": "registration.php",
+        "line": 59
+      },
+      {
+        "var": "$_POST",
+        "key": "uname",
+        "caller": "GLOBAL_SCRIPT",
+        "file": "registration.php",
+        "line": 62
+      },
+      {
+        "var": "$_POST",
+        "key": "pwd",
+        "caller": "GLOBAL_SCRIPT",
+        "file": "registration.php",
+        "line": 65
+      },
+      {
+        "var": "$_POST",
+        "key": "pwd",
+        "caller": "GLOBAL_SCRIPT",
+        "file": "registration.php",
+        "line": 68
+      },
+      {
+        "var": "$_POST",
+        "key": "city",
+        "caller": "GLOBAL_SCRIPT",
+        "file": "registration.php",
+        "line": 86
+      },
+      {
+        "var": "$_POST",
+        "key": "state",
+        "caller": "GLOBAL_SCRIPT",
+        "file": "registration.php",
+        "line": 87
+      },
+      {
+        "var": "$_POST",
+        "key": "country",
+        "caller": "GLOBAL_SCRIPT",
+        "file": "registration.php",
+        "line": 88
+      },
+      {
+        "var": "$_POST",
+        "key": "sub",
+        "caller": "GLOBAL_SCRIPT",
+        "file": "rent.php",
+        "line": 42
+      },
+      {
+        "var": "$_POST",
+        "key": "mob",
+        "caller": "GLOBAL_SCRIPT",
+        "file": "rent.php",
+        "line": 45
+      },
+      {
+        "var": "$_POST",
+        "key": "mob",
+        "caller": "GLOBAL_SCRIPT",
+        "file": "rent.php",
+        "line": 48
+      },
+      {
+        "var": "$_POST",
+        "key": "cc",
+        "caller": "GLOBAL_SCRIPT",
+        "file": "rent.php",
+        "line": 51
+      },
+      {
+        "var": "$_POST",
+        "key": "cc",
+        "caller": "GLOBAL_SCRIPT",
+        "file": "rent.php",
+        "line": 54
+      },
+      {
+        "var": "$_POST",
+        "key": "dc",
+        "caller": "GLOBAL_SCRIPT",
+        "file": "rent.php",
+        "line": 58
+      },
+      {
+        "var": "$_POST",
+        "key": "dc",
+        "caller": "GLOBAL_SCRIPT",
+        "file": "rent.php",
+        "line": 61
+      },
+      {
+        "var": "$_POST",
+        "key": "doi",
+        "caller": "GLOBAL_SCRIPT",
+        "file": "rent.php",
+        "line": 64
+      },
+      {
+        "var": "$_POST",
+        "key": "doi",
+        "caller": "GLOBAL_SCRIPT",
+        "file": "rent.php",
+        "line": 67
+      },
+      {
+        "var": "$_POST",
+        "key": "dor",
+        "caller": "GLOBAL_SCRIPT",
+        "file": "rent.php",
+        "line": 70
+      },
+      {
+        "var": "$_POST",
+        "key": "dor",
+        "caller": "GLOBAL_SCRIPT",
+        "file": "rent.php",
+        "line": 73
+      },
+      {
+        "var": "$_POST",
+        "key": "distance",
+        "caller": "GLOBAL_SCRIPT",
+        "file": "rent.php",
+        "line": 76
+      },
+      {
+        "var": "$_POST",
+        "key": "distance",
+        "caller": "GLOBAL_SCRIPT",
+        "file": "rent.php",
+        "line": 79
+      },
+      {
+        "var": "$_POST",
+        "key": "carid",
+        "caller": "GLOBAL_SCRIPT",
+        "file": "rent.php",
+        "line": 82
+      },
+      {
+        "var": "$_POST",
+        "key": "carid",
+        "caller": "GLOBAL_SCRIPT",
+        "file": "rent.php",
+        "line": 85
+      },
+      {
+        "var": "$_POST",
+        "key": "dln",
+        "caller": "GLOBAL_SCRIPT",
+        "file": "rent.php",
+        "line": 88
+      },
+      {
+        "var": "$_POST",
+        "key": "dln",
+        "caller": "GLOBAL_SCRIPT",
+        "file": "rent.php",
+        "line": 91
+      },
+      {
+        "var": "$_POST",
+        "key": "no",
+        "caller": "GLOBAL_SCRIPT",
+        "file": "rent.php",
+        "line": 113
+      },
+      {
+        "var": "$_POST",
+        "key": "cc",
+        "caller": "GLOBAL_SCRIPT",
+        "file": "rent.php",
+        "line": 114
+      },
+      {
+        "var": "$_POST",
+        "key": "dc",
+        "caller": "GLOBAL_SCRIPT",
+        "file": "rent.php",
+        "line": 115
+      },
+      {
+        "var": "$_POST",
+        "key": "doi",
+        "caller": "GLOBAL_SCRIPT",
+        "file": "rent.php",
+        "line": 116
+      },
+      {
+        "var": "$_POST",
+        "key": "dor",
+        "caller": "GLOBAL_SCRIPT",
+        "file": "rent.php",
+        "line": 117
+      },
+      {
+        "var": "$_POST",
+        "key": "distance",
+        "caller": "GLOBAL_SCRIPT",
+        "file": "rent.php",
+        "line": 118
+      },
+      {
+        "var": "$_POST",
+        "key": "carid",
+        "caller": "GLOBAL_SCRIPT",
+        "file": "rent.php",
+        "line": 119
+      },
+      {
+        "var": "$_POST",
+        "key": "dln",
+        "caller": "GLOBAL_SCRIPT",
+        "file": "rent.php",
+        "line": 120
+      },
+      {
+        "var": "$_POST",
+        "key": "no",
+        "caller": "GLOBAL_SCRIPT",
+        "file": "request.php",
+        "line": 6
+      },
+      {
+        "var": "$_POST",
+        "key": "cc",
+        "caller": "GLOBAL_SCRIPT",
+        "file": "request.php",
+        "line": 7
+      },
+      {
+        "var": "$_POST",
+        "key": "dc",
+        "caller": "GLOBAL_SCRIPT",
+        "file": "request.php",
+        "line": 8
+      },
+      {
+        "var": "$_POST",
+        "key": "doi",
+        "caller": "GLOBAL_SCRIPT",
+        "file": "request.php",
+        "line": 9
+      },
+      {
+        "var": "$_POST",
+        "key": "dor",
+        "caller": "GLOBAL_SCRIPT",
+        "file": "request.php",
+        "line": 10
+      },
+      {
+        "var": "$_POST",
+        "key": "distance",
+        "caller": "GLOBAL_SCRIPT",
+        "file": "request.php",
+        "line": 11
+      },
+      {
+        "var": "$_POST",
+        "key": "carid",
+        "caller": "GLOBAL_SCRIPT",
+        "file": "request.php",
+        "line": 12
+      },
+      {
+        "var": "$_POST",
+        "key": "dln",
+        "caller": "GLOBAL_SCRIPT",
+        "file": "request.php",
+        "line": 13
+      },
+      {
+        "var": "$_POST",
+        "key": "uname",
+        "caller": "GLOBAL_SCRIPT",
+        "file": "session.php",
+        "line": 3
+      },
+      {
+        "var": "$_POST",
+        "key": "pwd",
+        "caller": "GLOBAL_SCRIPT",
+        "file": "session.php",
+        "line": 4
+      },
+      {
+        "var": "$_SESSION",
+        "key": "username",
+        "caller": "GLOBAL_SCRIPT",
+        "file": "session.php",
+        "line": 15
+      }
+    ],
+    "execution_paths": [
+      {
+        "file": "checksession.php",
+        "entry_conditions": [
+          {
+            "type": "session_start"
+          }
+        ],
+        "branches": [
+          {
+            "condition": "$n==0",
+            "condition_vars": [],
+            "then": [
+              {
+                "action": "redirect",
+                "target": "login.php"
+              }
+            ],
+            "else": []
+          }
+        ],
+        "data_flows": [
+          {
+            "source": [
+              "$_POST/$_GET"
+            ],
+            "sink": "sql_read",
+            "table": "registerhere",
+            "field_mapping": {}
+          }
+        ],
+        "auth_guard": null,
+        "happy_path": [
+          "Session started (session_start)",
+          "Redirect \u2192 login.php"
+        ]
+      },
+      {
+        "file": "logout.php",
+        "entry_conditions": [
+          {
+            "type": "session_start"
+          }
+        ],
+        "branches": [
+          {
+            "condition": "session_destroy()",
+            "condition_vars": [],
+            "then": [
+              {
+                "action": "redirect",
+                "target": "login.php"
+              }
+            ],
+            "else": []
+          }
+        ],
+        "data_flows": [],
+        "auth_guard": null,
+        "happy_path": [
+          "Session started (session_start)",
+          "Redirect \u2192 login.php"
+        ]
+      },
+      {
+        "file": "myorder.php",
+        "entry_conditions": [],
+        "branches": [],
+        "data_flows": [
+          {
+            "source": [
+              "$_POST/$_GET"
+            ],
+            "sink": "sql_read",
+            "table": "request",
+            "field_mapping": {}
+          },
+          {
+            "source": [
+              "$_POST/$_GET"
+            ],
+            "sink": "sql_read",
+            "table": "request",
+            "field_mapping": {}
+          }
+        ],
+        "auth_guard": null,
+        "happy_path": []
+      },
+      {
+        "file": "registration.php",
+        "entry_conditions": [],
+        "branches": [
+          {
+            "condition": "isset($_POST['register'])",
+            "condition_vars": [
+              "POST"
+            ],
+            "then": [
+              {
+                "action": "sql_query",
+                "table": "",
+                "detail": "$con,$query"
+              },
+              {
+                "action": "output_html",
+                "count": 2
+              }
+            ],
+            "else": []
+          },
+          {
+            "condition": "!empty($fname) && !empty($dob) && !empty($phone) && !empty($gender) && !empty($email) && !empty($pwd) && validate_phone_...",
+            "condition_vars": [],
+            "then": [
+              {
+                "action": "sql_query",
+                "table": "",
+                "detail": "$con,$query"
+              },
+              {
+                "action": "output_html",
+                "count": 2
+              }
+            ],
+            "else": []
+          }
+        ],
+        "data_flows": [
+          {
+            "source": [
+              "$_POST['fname']",
+              "$_POST['lname']",
+              "$_POST['dob']",
+              "$_POST['phone']",
+              "$_POST['M']",
+              "$_POST['email']",
+              "$_POST['pwd']",
+              "$_POST['city']",
+              "$_POST['state']",
+              "$_POST['country']"
+            ],
+            "sink": "sql_write",
+            "table": "registerhere",
+            "field_mapping": {
+              "fname": "$_POST['fname']",
+              "lname": "$_POST['lname']",
+              "dob": "$_POST['dob']",
+              "phone": "$_POST['phone']",
+              "M": "$_POST['M']",
+              "email": "$_POST['email']",
+              "pwd": "$_POST['pwd']",
+              "city": "$_POST['city']",
+              "state": "$_POST['state']",
+              "country": "$_POST['country']"
+            }
+          }
+        ],
+        "auth_guard": null,
+        "happy_path": [
+          "Receive input: $_POST['M'], $_POST['city'], $_POST['country'], $_POST['dob'], $_POST['email'], $_POST['fname'], $_POST['lname'], $_POST['phone'], $_POST['pwd'], $_POST['state']"
+        ]
+      },
+      {
+        "file": "rent.php",
+        "entry_conditions": [],
+        "branches": [
+          {
+            "condition": "isset($_POST['sub'])",
+            "condition_vars": [
+              "POST"
+            ],
+            "then": [
+              {
+                "action": "sql_query",
+                "table": "",
+                "detail": "$link,$sql"
+              },
+              {
+                "action": "redirect",
+                "target": "rent.php"
+              }
+            ],
+            "else": []
+          },
+          {
+            "condition": "!empty($no) && !empty($cc) && !empty($dc) && !empty($doi) && !empty($dor) && !empty($distance) && !empty($carid) && !emp...",
+            "condition_vars": [],
+            "then": [
+              {
+                "action": "sql_query",
+                "table": "",
+                "detail": "$link,$sql"
+              },
+              {
+                "action": "redirect",
+                "target": "rent.php"
+              }
+            ],
+            "else": []
+          }
+        ],
+        "data_flows": [
+          {
+            "source": [
+              "$_POST['dc']",
+              "$_POST['doi']",
+              "$_POST['dor']",
+              "$_POST['distance']",
+              "$_POST['carid']",
+              "$_POST['dln']",
+              "$_POST['no']",
+              "$_POST['cc']"
+            ],
+            "sink": "sql_write",
+            "table": "request",
+            "field_mapping": {
+              "dc": "$_POST['dc']",
+              "doi": "$_POST['doi']",
+              "dor": "$_POST['dor']",
+              "distance": "$_POST['distance']",
+              "carid": "$_POST['carid']",
+              "dln": "$_POST['dln']",
+              "no": "$_POST['no']",
+              "cc": "$_POST['cc']"
+            }
+          },
+          {
+            "source": [
+              "$_POST['dc']",
+              "$_POST['doi']",
+              "$_POST['dor']",
+              "$_POST['distance']",
+              "$_POST['carid']",
+              "$_POST['dln']",
+              "$_POST['no']",
+              "$_POST['cc']"
+            ],
+            "sink": "sql_write",
+            "table": "request",
+            "field_mapping": {
+              "dc": "$_POST['dc']",
+              "doi": "$_POST['doi']",
+              "dor": "$_POST['dor']",
+              "distance": "$_POST['distance']",
+              "carid": "$_POST['carid']",
+              "dln": "$_POST['dln']",
+              "no": "$_POST['no']",
+              "cc": "$_POST['cc']"
+            }
+          }
+        ],
+        "auth_guard": null,
+        "happy_path": [
+          "Receive input: $_POST['carid'], $_POST['cc'], $_POST['dc'], $_POST['distance'], $_POST['dln'], $_POST['doi'], $_POST['dor'], $_POST['no']",
+          "SQL QUERY on ``: $link,$sql",
+          "Redirect \u2192 rent.php"
+        ]
+      },
+      {
+        "file": "request.php",
+        "entry_conditions": [],
+        "branches": [],
+        "data_flows": [
+          {
+            "source": [
+              "$_POST['no']",
+              "$_POST['cc']",
+              "$_POST['dc']",
+              "$_POST['doi']",
+              "$_POST['dor']",
+              "$_POST['distance']",
+              "$_POST['carid']",
+              "$_POST['dln']"
+            ],
+            "sink": "sql_write",
+            "table": "request",
+            "field_mapping": {
+              "no": "$_POST['no']",
+              "cc": "$_POST['cc']",
+              "dc": "$_POST['dc']",
+              "doi": "$_POST['doi']",
+              "dor": "$_POST['dor']",
+              "distance": "$_POST['distance']",
+              "carid": "$_POST['carid']",
+              "dln": "$_POST['dln']"
+            }
+          }
+        ],
+        "auth_guard": null,
+        "happy_path": [
+          "Receive input: $_POST['carid'], $_POST['cc'], $_POST['dc'], $_POST['distance'], $_POST['dln'], $_POST['doi'], $_POST['dor'], $_POST['no']",
+          "Redirect \u2192 rent.php"
+        ]
+      },
+      {
+        "file": "session.php",
+        "entry_conditions": [
+          {
+            "type": "session_start"
+          }
+        ],
+        "branches": [
+          {
+            "condition": "$n==1",
+            "condition_vars": [],
+            "then": [
+              {
+                "action": "session_write",
+                "key": "username",
+                "detail": "$_SESSION['username'] = $uname1"
+              },
+              {
+                "action": "redirect",
+                "target": "rent.php"
+              }
+            ],
+            "else": [
+              {
+                "action": "redirect",
+                "target": "login.php"
+              },
+              {
+                "action": "output_html",
+                "count": 1
+              }
+            ]
+          }
+        ],
+        "data_flows": [
+          {
+            "source": [
+              "$_POST['uname']",
+              "$_POST['pwd']"
+            ],
+            "sink": "sql_read",
+            "table": "registerhere",
+            "field_mapping": {
+              "uname": "$_POST['uname']",
+              "pwd": "$_POST['pwd']"
+            }
+          }
+        ],
+        "auth_guard": null,
+        "happy_path": [
+          "Session started (session_start)",
+          "Receive input: $_POST['pwd'], $_POST['uname']",
+          "Write session: $_SESSION['username']",
+          "Redirect \u2192 rent.php"
+        ]
+      },
+      {
+        "file": "table.php",
+        "entry_conditions": [],
+        "branches": [],
+        "data_flows": [
+          {
+            "source": [
+              "$_POST/$_GET"
+            ],
+            "sink": "sql_ddl",
+            "table": "registerhere",
+            "field_mapping": {}
+          }
+        ],
+        "auth_guard": null,
+        "happy_path": []
+      }
+    ],
+    "call_graph": [],
+    "form_fields": [],
+    "service_deps": [],
+    "env_vars": [],
+    "auth_signals": [],
+    "http_endpoints": [],
+    "table_columns": []
+  },
+  "graph_meta": {
+    "graph_path": "outputs/run_20260308_123236/code_graph.gpickle",
+    "node_count": 42,
+    "edge_count": 57,
+    "node_types": [
+      "db_table",
+      "function",
+      "page",
+      "redirect",
+      "script",
+      "superglobal"
+    ],
+    "edge_types": [
+      "defines",
+      "includes",
+      "reads_input",
+      "redirects_to",
+      "sql_ddl",
+      "sql_read",
+      "sql_write"
+    ]
+  },
+  "embedding_meta": {
+    "collection_name": "phpba_codebase",
+    "chroma_path": "outputs/run_20260308_123236/chromadb",
+    "total_chunks": 0,
+    "embedding_model": "all-MiniLM-L6-v2"
+  },
+  "preflight": {
+    "passed": true,
+    "warnings": [
+      "W1: Only 2 unique DB table(s) found. The data model section of BA documents will be thin. Verify SQL queries are being extracted correctly.",
+      "W5: Only 1 chunk type in ChromaDB ([]). Retrieval diversity will be low. Re-run Stage 3."
+    ],
+    "blockers": []
+  },
+  "domain_model": {
+    "domain_name": "Car Rental System",
+    "description": "A system for users to rent cars. It handles user registration, car booking, and order management.",
+    "user_roles": [
+      {
+        "role": "Customer",
+        "description": "Can register, log in, view car tariffs, book cars, and view their rental orders.",
+        "entry_points": [
+          "login.php",
+          "registration.php",
+          "tarrif.php"
+        ]
+      },
+      {
+        "role": "Guest",
+        "description": "Can view car tariffs and register.",
+        "entry_points": [
+          "tarrif.php",
+          "registration.php"
+        ]
+      }
+    ],
+    "features": [
+      {
+        "name": "User Registration",
+        "description": "Allows new users to create an account in the system.",
+        "pages": [
+          "registration.php"
+        ],
+        "tables": [
+          "registerhere"
+        ],
+        "inputs": [
+          "fname",
+          "lname",
+          "phone",
+          "M",
+          "dob",
+          "email",
+          "uname",
+          "pwd",
+          "city",
+          "state",
+          "country"
+        ],
+        "outputs": "A new user account is created in the system.",
+        "business_rules": [
+          "Username must be unique.",
+          "Phone number must be valid (uses validate_phone_number function)."
+        ]
+      },
+      {
+        "name": "User Login",
+        "description": "Allows existing users to log in to the system.",
+        "pages": [
+          "login.php",
+          "session.php"
+        ],
+        "tables": [],
+        "inputs": [
+          "uname",
+          "pwd"
+        ],
+        "outputs": "User is authenticated and redirected to the car rental page.",
+        "business_rules": [
+          "Credentials must match a registered user."
+        ]
+      },
+      {
+        "name": "User Logout",
+        "description": "Allows logged-in users to log out of the system.",
+        "pages": [
+          "logout.php"
+        ],
+        "tables": [],
+        "inputs": [],
+        "outputs": "User session is terminated, and the user is redirected to the login page.",
+        "business_rules": []
+      },
+      {
+        "name": "Car Rental Booking",
+        "description": "Enables logged-in users to book a car for a specified period.",
+        "pages": [
+          "rent.php",
+          "request.php"
+        ],
+        "tables": [
+          "request"
+        ],
+        "inputs": [
+          "carid",
+          "doi",
+          "dor",
+          "distance",
+          "dln",
+          "cc",
+          "dc",
+          "no",
+          "mob",
+          "sub"
+        ],
+        "outputs": "A car rental request is submitted and stored.",
+        "business_rules": [
+          "Car ID must be valid.",
+          "Dates of issue and return must be valid.",
+          "Distance, driver's license number, credit card details, and mobile number are collected."
+        ]
+      },
+      {
+        "name": "View My Orders",
+        "description": "Allows logged-in users to view their past and current car rental orders.",
+        "pages": [
+          "myorder.php"
+        ],
+        "tables": [
+          "request",
+          "registerhere"
+        ],
+        "inputs": [],
+        "outputs": "A list of the user's rental orders is displayed.",
+        "business_rules": [
+          "Only logged-in users can view their orders."
+        ]
+      },
+      {
+        "name": "View Car Tariffs",
+        "description": "Displays available car information and rental rates.",
+        "pages": [
+          "tarrif.php"
+        ],
+        "tables": [],
+        "inputs": [],
+        "outputs": "A list of cars with their details and rental information.",
+        "business_rules": []
+      }
+    ],
+    "workflows": [
+      {
+        "name": "User Registration Workflow",
+        "actor": "Guest",
+        "steps": [
+          {
+            "step": 1,
+            "action": "Navigate to the registration page",
+            "page": "registration.php"
+          },
+          {
+            "step": 2,
+            "action": "Fill in registration form details",
+            "page": "registration.php"
+          },
+          {
+            "step": 3,
+            "action": "Submit registration form",
+            "page": "registration.php"
+          }
+        ],
+        "preconditions": [
+          "User is not logged in."
+        ],
+        "postconditions": [
+          "User account is created.",
+          "User is redirected to the login page (inferred from session.php redirect)."
+        ]
+      },
+      {
+        "name": "User Login Workflow",
+        "actor": "Customer",
+        "steps": [
+          {
+            "step": 1,
+            "action": "Navigate to the login page",
+            "page": "login.php"
+          },
+          {
+            "step": 2,
+            "action": "Enter username and password",
+            "page": "session.php"
+          },
+          {
+            "step": 3,
+            "action": "Submit login credentials",
+            "page": "session.php"
+          }
+        ],
+        "preconditions": [
+          "User has a registered account."
+        ],
+        "postconditions": [
+          "User is authenticated.",
+          "User is redirected to the car rental page (rent.php)."
+        ]
+      },
+      {
+        "name": "Car Rental Booking Workflow",
+        "actor": "Customer",
+        "steps": [
+          {
+            "step": 1,
+            "action": "Log in to the system",
+            "page": "session.php"
+          },
+          {
+            "step": 2,
+            "action": "Navigate to the car rental page",
+            "page": "rent.php"
+          },
+          {
+            "step": 3,
+            "action": "Select a car and enter booking details",
+            "page": "request.php"
+          },
+          {
+            "step": 4,
+            "action": "Submit booking request",
+            "page": "request.php"
+          }
+        ],
+        "preconditions": [
+          "User is logged in."
+        ],
+        "postconditions": [
+          "Rental request is saved in the 'request' table.",
+          "User is redirected to the car rental page (rent.php)."
+        ]
+      },
+      {
+        "name": "View My Orders Workflow",
+        "actor": "Customer",
+        "steps": [
+          {
+            "step": 1,
+            "action": "Log in to the system",
+            "page": "session.php"
+          },
+          {
+            "step": 2,
+            "action": "Navigate to the 'My Orders' page",
+            "page": "myorder.php"
+          }
+        ],
+        "preconditions": [
+          "User is logged in."
+        ],
+        "postconditions": [
+          "User's rental orders are displayed."
+        ]
+      },
+      {
+        "name": "Logout Workflow",
+        "actor": "Customer",
+        "steps": [
+          {
+            "step": 1,
+            "action": "Click on the logout link/button",
+            "page": "logout.php"
+          }
+        ],
+        "preconditions": [
+          "User is logged in."
+        ],
+        "postconditions": [
+          "User session is destroyed.",
+          "User is redirected to the login page."
+        ]
+      }
+    ],
+    "bounded_contexts": [
+      "User Management",
+      "Booking",
+      "Catalog"
+    ],
+    "key_entities": [
+      "User",
+      "RentalRequest",
+      "Car"
+    ]
+  },
+  "ba_artifacts": {
+    "brd_path": "outputs/run_20260308_123236/brd.md",
+    "srs_path": "outputs/run_20260308_123236/srs.md",
+    "ac_path": "outputs/run_20260308_123236/ac.md",
+    "user_stories_path": "outputs/run_20260308_123236/user_stories.md"
+  },
+  "qa_result": {
+    "passed": false,
+    "issues": [
+      {
+        "severity": "minor",
+        "artefact": "SRS",
+        "description": "SRS Section 3.1 Functional Requirements, User Registration, Input fields do not list all fields mentioned in BRD BR-001 and AC-01-01 (e.g., 'dob', 'city', 'state', 'country').",
+        "recommendation": "Update SRS Section 3.1 to include all input fields mentioned in BRD and AC for user registration."
+      },
+      {
+        "severity": "minor",
+        "artefact": "SRS",
+        "description": "SRS Section 3.2 User Login, Tables section is empty. It should reference the table where user credentials are stored, which is implied to be 'registerhere' based on BRD and AC.",
+        "recommendation": "Update SRS Section 3.2 to explicitly mention the 'registerhere' table for user login credential checks."
+      },
+      {
+        "severity": "minor",
+        "artefact": "cross-doc",
+        "description": "BRD BR-001 mentions the table 'registerhere'. AC-01: User Registration also mentions 'registerhere'. However, SRS does not explicitly list the 'registerhere' table in its database interface sections, only implicitly through input fields.",
+        "recommendation": "Add a dedicated section in the SRS listing all database tables used by the system, including 'registerhere'."
+      },
+      {
+        "severity": "minor",
+        "artefact": "cross-doc",
+        "description": "The SRS mentions 'validate_phone_number' function in Assumptions and Dependencies, and AC-01-03 references it. However, the User Stories do not explicitly mention this validation, though it's implied in US-001's acceptance criteria.",
+        "recommendation": "Explicitly mention the validation of the phone number using `validate_phone_number` in the Acceptance Criteria of US-001."
+      }
+    ],
+    "coverage_score": 0.8571428571428572,
+    "consistency_score": 0.9
+  }
+}

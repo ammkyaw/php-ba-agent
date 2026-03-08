@@ -1,0 +1,1358 @@
+{
+  "run_id": "20260308_132946",
+  "php_project_path": "/Users/aungmaungmaungkyaw/Downloads/tree-sitter-test/test-project",
+  "output_dir": "outputs/run_20260308_132946",
+  "created_at": "2026-03-08T13:29:46.912648",
+  "stages": {
+    "stage0_validate": {
+      "status": "completed",
+      "started_at": "2026-03-08T13:29:46.913213",
+      "completed_at": "2026-03-08T13:29:47.030796",
+      "error": null,
+      "output_path": "outputs/run_20260308_132946/validation_report.json"
+    },
+    "stage1_parse": {
+      "status": "completed",
+      "started_at": "2026-03-08T13:29:47.031031",
+      "completed_at": "2026-03-08T13:29:47.169348",
+      "error": null,
+      "output_path": "outputs/run_20260308_132946/code_map.json"
+    },
+    "stage15_paths": {
+      "status": "completed",
+      "started_at": "2026-03-08T13:29:47.170229",
+      "completed_at": "2026-03-08T13:29:47.179867",
+      "error": null,
+      "output_path": "outputs/run_20260308_132946/execution_paths.json"
+    },
+    "stage2_graph": {
+      "status": "completed",
+      "started_at": "2026-03-08T13:29:47.181074",
+      "completed_at": "2026-03-08T13:29:48.082955",
+      "error": null,
+      "output_path": "outputs/run_20260308_132946/code_graph.json"
+    },
+    "stage3_embed": {
+      "status": "completed",
+      "started_at": "2026-03-08T13:29:48.084557",
+      "completed_at": "2026-03-08T13:29:57.192295",
+      "error": null,
+      "output_path": "outputs/run_20260308_132946/chromadb"
+    },
+    "stage35_preflight": {
+      "status": "completed",
+      "started_at": "2026-03-08T13:29:57.193536",
+      "completed_at": "2026-03-08T13:29:57.212807",
+      "error": null,
+      "output_path": "outputs/run_20260308_132946/preflight_report.json"
+    },
+    "stage4_domain": {
+      "status": "failed",
+      "started_at": "2026-03-08T13:29:57.214005",
+      "completed_at": "2026-03-08T13:30:02.435769",
+      "error": "RuntimeError: Gemini rate limit hit (free tier: 15 RPM).\nWait a minute and retry.\nOriginal error: 429 RESOURCE_EXHAUSTED. {'error': {'code': 429, 'message': 'You exceeded your current quota, please check your plan and billing details. For more information on this error, head to: https://ai.google.dev/gemini-api/docs/rate-limits. To monitor your current usage, head to: https://ai.dev/rate-limit. \\n* Quota exceeded for metric: generativelanguage.googleapis.com/generate_content_free_tier_requests, limit: 20, model: gemini-2.5-flash-lite\\nPlease retry in 57.562618177s.', 'status': 'RESOURCE_EXHAUSTED', 'details': [{'@type': 'type.googleapis.com/google.rpc.Help', 'links': [{'description': 'Learn more about Gemini API quotas', 'url': 'https://ai.google.dev/gemini-api/docs/rate-limits'}]}, {'@type': 'type.googleapis.com/google.rpc.QuotaFailure', 'violations': [{'quotaMetric': 'generativelanguage.googleapis.com/generate_content_free_tier_requests', 'quotaId': 'GenerateRequestsPerDayPerProjectPerModel-FreeTier', 'quotaDimensions': {'location': 'global', 'model': 'gemini-2.5-flash-lite'}, 'quotaValue': '20'}]}, {'@type': 'type.googleapis.com/google.rpc.RetryInfo', 'retryDelay': '57s'}]}}",
+      "output_path": null
+    },
+    "stage5_brd": {
+      "status": "pending",
+      "started_at": null,
+      "completed_at": null,
+      "error": null,
+      "output_path": null
+    },
+    "stage5_srs": {
+      "status": "pending",
+      "started_at": null,
+      "completed_at": null,
+      "error": null,
+      "output_path": null
+    },
+    "stage5_ac": {
+      "status": "pending",
+      "started_at": null,
+      "completed_at": null,
+      "error": null,
+      "output_path": null
+    },
+    "stage5_userstories": {
+      "status": "pending",
+      "started_at": null,
+      "completed_at": null,
+      "error": null,
+      "output_path": null
+    },
+    "stage6_qa": {
+      "status": "pending",
+      "started_at": null,
+      "completed_at": null,
+      "error": null,
+      "output_path": null
+    },
+    "stage65_postprocess": {
+      "status": "pending",
+      "started_at": null,
+      "completed_at": null,
+      "error": null,
+      "output_path": null
+    },
+    "stage7_pdf": {
+      "status": "pending",
+      "started_at": null,
+      "completed_at": null,
+      "error": null,
+      "output_path": null
+    }
+  },
+  "code_map": {
+    "framework": "raw_php",
+    "php_version": "8.1",
+    "classes": [],
+    "routes": [],
+    "models": [],
+    "controllers": [],
+    "services": [],
+    "db_schema": [],
+    "config_files": [],
+    "total_files": 12,
+    "total_lines": 694,
+    "functions": [
+      {
+        "name": "validate_phone_number",
+        "file": "registration.php",
+        "line": 71,
+        "params": [
+          {
+            "name": "$phone",
+            "type": null,
+            "default": null
+          }
+        ],
+        "return_type": null,
+        "docblock": null
+      },
+      {
+        "name": "validate_phone_number",
+        "file": "rent.php",
+        "line": 94,
+        "params": [
+          {
+            "name": "$no",
+            "type": null,
+            "default": null
+          }
+        ],
+        "return_type": null,
+        "docblock": null
+      }
+    ],
+    "includes": [
+      {
+        "type": "include",
+        "target": "checksession.php",
+        "caller": "GLOBAL_SCRIPT",
+        "file": "myorder.php",
+        "line": 3
+      },
+      {
+        "type": "include",
+        "target": "dbcreation.php",
+        "caller": "GLOBAL_SCRIPT",
+        "file": "registration.php",
+        "line": 19
+      },
+      {
+        "type": "include",
+        "target": "checksession.php",
+        "caller": "GLOBAL_SCRIPT",
+        "file": "rent.php",
+        "line": 2
+      },
+      {
+        "type": "include",
+        "target": "dbcreation.php",
+        "caller": "GLOBAL_SCRIPT",
+        "file": "rent.php",
+        "line": 38
+      },
+      {
+        "type": "include",
+        "target": "checksession.php",
+        "caller": "GLOBAL_SCRIPT",
+        "file": "request.php",
+        "line": 2
+      },
+      {
+        "type": "include",
+        "target": "dbcreation.php",
+        "caller": "GLOBAL_SCRIPT",
+        "file": "table.php",
+        "line": 2
+      }
+    ],
+    "sql_queries": [
+      {
+        "operation": "SELECT",
+        "table": "registerhere",
+        "sql": "select uname from registerhere where uname='?'",
+        "caller": "GLOBAL_SCRIPT",
+        "via": "mysqli_query",
+        "file": "checksession.php",
+        "line": 9
+      },
+      {
+        "operation": "CREATE",
+        "table": "UNKNOWN",
+        "sql": "create database UserInformation",
+        "caller": "GLOBAL_SCRIPT",
+        "via": "mysqli_query",
+        "file": "dbcreation.php",
+        "line": 16
+      },
+      {
+        "operation": "SELECT",
+        "table": "registerhere",
+        "sql": "select fname from registerhere where uname='?'",
+        "caller": "GLOBAL_SCRIPT",
+        "via": "mysqli_query",
+        "file": "myorder.php",
+        "line": 9
+      },
+      {
+        "operation": "SELECT",
+        "table": "request",
+        "sql": "select cc,dc,doi,dor from request where uname='?'",
+        "caller": "GLOBAL_SCRIPT",
+        "via": "mysqli_query",
+        "file": "myorder.php",
+        "line": 48
+      },
+      {
+        "operation": "INSERT",
+        "table": "registerhere",
+        "sql": "insert into registerhere values('?','?','?','?','?','?','?','?','?','?','?')",
+        "caller": "GLOBAL_SCRIPT",
+        "via": "mysqli_query",
+        "file": "registration.php",
+        "line": 92
+      },
+      {
+        "operation": "SELECT",
+        "table": "registerhere",
+        "sql": "select fname from registerhere where uname='?'",
+        "caller": "GLOBAL_SCRIPT",
+        "via": "mysqli_query",
+        "file": "rent.php",
+        "line": 8
+      },
+      {
+        "operation": "INSERT",
+        "table": "request",
+        "sql": "INSERT INTO request(uname,no,cc,dc,doi,dor,distance,carid,dln) values('?','?','?','?','?','?','?','?','?')",
+        "caller": "GLOBAL_SCRIPT",
+        "via": "mysqli_query",
+        "file": "rent.php",
+        "line": 123
+      },
+      {
+        "operation": "INSERT",
+        "table": "request",
+        "sql": "INSERT INTO request(uname,no,cc,dc,doi,dor,distance,carid,dln) values('?','?','?','?','?','?','?','?','?')",
+        "caller": "GLOBAL_SCRIPT",
+        "via": "mysqli_query",
+        "file": "request.php",
+        "line": 15
+      },
+      {
+        "operation": "SELECT",
+        "table": "registerhere",
+        "sql": "select uname from registerhere where uname='?' and pwd='?'",
+        "caller": "GLOBAL_SCRIPT",
+        "via": "mysqli_query",
+        "file": "session.php",
+        "line": 10
+      },
+      {
+        "operation": "CREATE",
+        "table": "registerhere",
+        "sql": "create table registerhere(fname varchar(10),lname varchar(10),phone int(10),gender varchar(2),dob DATE,email varchar(10),uname varchar(10) primary key,pwd varchar(10),city varchar(10),country varchar(...",
+        "caller": "GLOBAL_SCRIPT",
+        "via": "mysqli_query",
+        "file": "table.php",
+        "line": 5
+      }
+    ],
+    "redirects": [
+      {
+        "target": "login.php",
+        "caller": "GLOBAL_SCRIPT",
+        "file": "checksession.php",
+        "line": 14
+      },
+      {
+        "target": "login.php",
+        "caller": "GLOBAL_SCRIPT",
+        "file": "logout.php",
+        "line": 5
+      },
+      {
+        "target": "rent.php",
+        "caller": "GLOBAL_SCRIPT",
+        "file": "request.php",
+        "line": 16
+      },
+      {
+        "target": "rent.php",
+        "caller": "GLOBAL_SCRIPT",
+        "file": "session.php",
+        "line": 16
+      },
+      {
+        "target": "login.php",
+        "caller": "GLOBAL_SCRIPT",
+        "file": "session.php",
+        "line": 19
+      }
+    ],
+    "globals": [],
+    "html_pages": [
+      "carrental.php",
+      "checksession.php",
+      "login.php",
+      "logout.php",
+      "myorder.php",
+      "registration.php",
+      "rent.php",
+      "request.php",
+      "session.php",
+      "tarrif.php"
+    ],
+    "superglobals": [
+      {
+        "var": "$_SESSION",
+        "key": "username",
+        "caller": "GLOBAL_SCRIPT",
+        "file": "checksession.php",
+        "line": 3
+      },
+      {
+        "var": "$_POST",
+        "key": "register",
+        "caller": "GLOBAL_SCRIPT",
+        "file": "registration.php",
+        "line": 23
+      },
+      {
+        "var": "$_POST",
+        "key": "fname",
+        "caller": "GLOBAL_SCRIPT",
+        "file": "registration.php",
+        "line": 26
+      },
+      {
+        "var": "$_POST",
+        "key": "fname",
+        "caller": "GLOBAL_SCRIPT",
+        "file": "registration.php",
+        "line": 29
+      },
+      {
+        "var": "$_POST",
+        "key": "lname",
+        "caller": "GLOBAL_SCRIPT",
+        "file": "registration.php",
+        "line": 33
+      },
+      {
+        "var": "$_POST",
+        "key": "dob",
+        "caller": "GLOBAL_SCRIPT",
+        "file": "registration.php",
+        "line": 35
+      },
+      {
+        "var": "$_POST",
+        "key": "dob",
+        "caller": "GLOBAL_SCRIPT",
+        "file": "registration.php",
+        "line": 38
+      },
+      {
+        "var": "$_POST",
+        "key": "phone",
+        "caller": "GLOBAL_SCRIPT",
+        "file": "registration.php",
+        "line": 41
+      },
+      {
+        "var": "$_POST",
+        "key": "phone",
+        "caller": "GLOBAL_SCRIPT",
+        "file": "registration.php",
+        "line": 44
+      },
+      {
+        "var": "$_POST",
+        "key": "M",
+        "caller": "GLOBAL_SCRIPT",
+        "file": "registration.php",
+        "line": 47
+      },
+      {
+        "var": "$_POST",
+        "key": "M",
+        "caller": "GLOBAL_SCRIPT",
+        "file": "registration.php",
+        "line": 50
+      },
+      {
+        "var": "$_POST",
+        "key": "email",
+        "caller": "GLOBAL_SCRIPT",
+        "file": "registration.php",
+        "line": 53
+      },
+      {
+        "var": "$_POST",
+        "key": "email",
+        "caller": "GLOBAL_SCRIPT",
+        "file": "registration.php",
+        "line": 56
+      },
+      {
+        "var": "$_POST",
+        "key": "uname",
+        "caller": "GLOBAL_SCRIPT",
+        "file": "registration.php",
+        "line": 59
+      },
+      {
+        "var": "$_POST",
+        "key": "uname",
+        "caller": "GLOBAL_SCRIPT",
+        "file": "registration.php",
+        "line": 62
+      },
+      {
+        "var": "$_POST",
+        "key": "pwd",
+        "caller": "GLOBAL_SCRIPT",
+        "file": "registration.php",
+        "line": 65
+      },
+      {
+        "var": "$_POST",
+        "key": "pwd",
+        "caller": "GLOBAL_SCRIPT",
+        "file": "registration.php",
+        "line": 68
+      },
+      {
+        "var": "$_POST",
+        "key": "city",
+        "caller": "GLOBAL_SCRIPT",
+        "file": "registration.php",
+        "line": 86
+      },
+      {
+        "var": "$_POST",
+        "key": "state",
+        "caller": "GLOBAL_SCRIPT",
+        "file": "registration.php",
+        "line": 87
+      },
+      {
+        "var": "$_POST",
+        "key": "country",
+        "caller": "GLOBAL_SCRIPT",
+        "file": "registration.php",
+        "line": 88
+      },
+      {
+        "var": "$_POST",
+        "key": "sub",
+        "caller": "GLOBAL_SCRIPT",
+        "file": "rent.php",
+        "line": 42
+      },
+      {
+        "var": "$_POST",
+        "key": "mob",
+        "caller": "GLOBAL_SCRIPT",
+        "file": "rent.php",
+        "line": 45
+      },
+      {
+        "var": "$_POST",
+        "key": "mob",
+        "caller": "GLOBAL_SCRIPT",
+        "file": "rent.php",
+        "line": 48
+      },
+      {
+        "var": "$_POST",
+        "key": "cc",
+        "caller": "GLOBAL_SCRIPT",
+        "file": "rent.php",
+        "line": 51
+      },
+      {
+        "var": "$_POST",
+        "key": "cc",
+        "caller": "GLOBAL_SCRIPT",
+        "file": "rent.php",
+        "line": 54
+      },
+      {
+        "var": "$_POST",
+        "key": "dc",
+        "caller": "GLOBAL_SCRIPT",
+        "file": "rent.php",
+        "line": 58
+      },
+      {
+        "var": "$_POST",
+        "key": "dc",
+        "caller": "GLOBAL_SCRIPT",
+        "file": "rent.php",
+        "line": 61
+      },
+      {
+        "var": "$_POST",
+        "key": "doi",
+        "caller": "GLOBAL_SCRIPT",
+        "file": "rent.php",
+        "line": 64
+      },
+      {
+        "var": "$_POST",
+        "key": "doi",
+        "caller": "GLOBAL_SCRIPT",
+        "file": "rent.php",
+        "line": 67
+      },
+      {
+        "var": "$_POST",
+        "key": "dor",
+        "caller": "GLOBAL_SCRIPT",
+        "file": "rent.php",
+        "line": 70
+      },
+      {
+        "var": "$_POST",
+        "key": "dor",
+        "caller": "GLOBAL_SCRIPT",
+        "file": "rent.php",
+        "line": 73
+      },
+      {
+        "var": "$_POST",
+        "key": "distance",
+        "caller": "GLOBAL_SCRIPT",
+        "file": "rent.php",
+        "line": 76
+      },
+      {
+        "var": "$_POST",
+        "key": "distance",
+        "caller": "GLOBAL_SCRIPT",
+        "file": "rent.php",
+        "line": 79
+      },
+      {
+        "var": "$_POST",
+        "key": "carid",
+        "caller": "GLOBAL_SCRIPT",
+        "file": "rent.php",
+        "line": 82
+      },
+      {
+        "var": "$_POST",
+        "key": "carid",
+        "caller": "GLOBAL_SCRIPT",
+        "file": "rent.php",
+        "line": 85
+      },
+      {
+        "var": "$_POST",
+        "key": "dln",
+        "caller": "GLOBAL_SCRIPT",
+        "file": "rent.php",
+        "line": 88
+      },
+      {
+        "var": "$_POST",
+        "key": "dln",
+        "caller": "GLOBAL_SCRIPT",
+        "file": "rent.php",
+        "line": 91
+      },
+      {
+        "var": "$_POST",
+        "key": "no",
+        "caller": "GLOBAL_SCRIPT",
+        "file": "rent.php",
+        "line": 113
+      },
+      {
+        "var": "$_POST",
+        "key": "cc",
+        "caller": "GLOBAL_SCRIPT",
+        "file": "rent.php",
+        "line": 114
+      },
+      {
+        "var": "$_POST",
+        "key": "dc",
+        "caller": "GLOBAL_SCRIPT",
+        "file": "rent.php",
+        "line": 115
+      },
+      {
+        "var": "$_POST",
+        "key": "doi",
+        "caller": "GLOBAL_SCRIPT",
+        "file": "rent.php",
+        "line": 116
+      },
+      {
+        "var": "$_POST",
+        "key": "dor",
+        "caller": "GLOBAL_SCRIPT",
+        "file": "rent.php",
+        "line": 117
+      },
+      {
+        "var": "$_POST",
+        "key": "distance",
+        "caller": "GLOBAL_SCRIPT",
+        "file": "rent.php",
+        "line": 118
+      },
+      {
+        "var": "$_POST",
+        "key": "carid",
+        "caller": "GLOBAL_SCRIPT",
+        "file": "rent.php",
+        "line": 119
+      },
+      {
+        "var": "$_POST",
+        "key": "dln",
+        "caller": "GLOBAL_SCRIPT",
+        "file": "rent.php",
+        "line": 120
+      },
+      {
+        "var": "$_POST",
+        "key": "no",
+        "caller": "GLOBAL_SCRIPT",
+        "file": "request.php",
+        "line": 6
+      },
+      {
+        "var": "$_POST",
+        "key": "cc",
+        "caller": "GLOBAL_SCRIPT",
+        "file": "request.php",
+        "line": 7
+      },
+      {
+        "var": "$_POST",
+        "key": "dc",
+        "caller": "GLOBAL_SCRIPT",
+        "file": "request.php",
+        "line": 8
+      },
+      {
+        "var": "$_POST",
+        "key": "doi",
+        "caller": "GLOBAL_SCRIPT",
+        "file": "request.php",
+        "line": 9
+      },
+      {
+        "var": "$_POST",
+        "key": "dor",
+        "caller": "GLOBAL_SCRIPT",
+        "file": "request.php",
+        "line": 10
+      },
+      {
+        "var": "$_POST",
+        "key": "distance",
+        "caller": "GLOBAL_SCRIPT",
+        "file": "request.php",
+        "line": 11
+      },
+      {
+        "var": "$_POST",
+        "key": "carid",
+        "caller": "GLOBAL_SCRIPT",
+        "file": "request.php",
+        "line": 12
+      },
+      {
+        "var": "$_POST",
+        "key": "dln",
+        "caller": "GLOBAL_SCRIPT",
+        "file": "request.php",
+        "line": 13
+      },
+      {
+        "var": "$_POST",
+        "key": "uname",
+        "caller": "GLOBAL_SCRIPT",
+        "file": "session.php",
+        "line": 3
+      },
+      {
+        "var": "$_POST",
+        "key": "pwd",
+        "caller": "GLOBAL_SCRIPT",
+        "file": "session.php",
+        "line": 4
+      },
+      {
+        "var": "$_SESSION",
+        "key": "username",
+        "caller": "GLOBAL_SCRIPT",
+        "file": "session.php",
+        "line": 15
+      }
+    ],
+    "execution_paths": [
+      {
+        "file": "checksession.php",
+        "entry_conditions": [
+          {
+            "type": "session_start"
+          }
+        ],
+        "branches": [
+          {
+            "condition": "$n==0",
+            "condition_vars": [],
+            "then": [
+              {
+                "action": "redirect",
+                "target": "login.php"
+              }
+            ],
+            "else": []
+          }
+        ],
+        "data_flows": [
+          {
+            "source": [
+              "$_POST/$_GET"
+            ],
+            "sink": "sql_read",
+            "table": "registerhere",
+            "field_mapping": {}
+          }
+        ],
+        "auth_guard": null,
+        "happy_path": [
+          "Session started (session_start)",
+          "Redirect \u2192 login.php"
+        ]
+      },
+      {
+        "file": "logout.php",
+        "entry_conditions": [
+          {
+            "type": "session_start"
+          }
+        ],
+        "branches": [
+          {
+            "condition": "session_destroy()",
+            "condition_vars": [],
+            "then": [
+              {
+                "action": "redirect",
+                "target": "login.php"
+              }
+            ],
+            "else": []
+          }
+        ],
+        "data_flows": [],
+        "auth_guard": null,
+        "happy_path": [
+          "Session started (session_start)",
+          "Redirect \u2192 login.php"
+        ]
+      },
+      {
+        "file": "myorder.php",
+        "entry_conditions": [],
+        "branches": [],
+        "data_flows": [
+          {
+            "source": [
+              "$_POST/$_GET"
+            ],
+            "sink": "sql_read",
+            "table": "request",
+            "field_mapping": {}
+          },
+          {
+            "source": [
+              "$_POST/$_GET"
+            ],
+            "sink": "sql_read",
+            "table": "request",
+            "field_mapping": {}
+          }
+        ],
+        "auth_guard": null,
+        "happy_path": []
+      },
+      {
+        "file": "registration.php",
+        "entry_conditions": [],
+        "branches": [
+          {
+            "condition": "isset($_POST['register'])",
+            "condition_vars": [
+              "POST"
+            ],
+            "then": [
+              {
+                "action": "sql_query",
+                "table": "",
+                "detail": "$con,$query"
+              },
+              {
+                "action": "output_html",
+                "count": 2
+              }
+            ],
+            "else": []
+          },
+          {
+            "condition": "!empty($fname) && !empty($dob) && !empty($phone) && !empty($gender) && !empty($email) && !empty($pwd) && validate_phone_...",
+            "condition_vars": [],
+            "then": [
+              {
+                "action": "sql_query",
+                "table": "",
+                "detail": "$con,$query"
+              },
+              {
+                "action": "output_html",
+                "count": 2
+              }
+            ],
+            "else": []
+          }
+        ],
+        "data_flows": [
+          {
+            "source": [
+              "$_POST['fname']",
+              "$_POST['lname']",
+              "$_POST['dob']",
+              "$_POST['phone']",
+              "$_POST['M']",
+              "$_POST['email']",
+              "$_POST['pwd']",
+              "$_POST['city']",
+              "$_POST['state']",
+              "$_POST['country']"
+            ],
+            "sink": "sql_write",
+            "table": "registerhere",
+            "field_mapping": {
+              "fname": "$_POST['fname']",
+              "lname": "$_POST['lname']",
+              "dob": "$_POST['dob']",
+              "phone": "$_POST['phone']",
+              "M": "$_POST['M']",
+              "email": "$_POST['email']",
+              "pwd": "$_POST['pwd']",
+              "city": "$_POST['city']",
+              "state": "$_POST['state']",
+              "country": "$_POST['country']"
+            }
+          }
+        ],
+        "auth_guard": null,
+        "happy_path": [
+          "Receive input: $_POST['M'], $_POST['city'], $_POST['country'], $_POST['dob'], $_POST['email'], $_POST['fname'], $_POST['lname'], $_POST['phone'], $_POST['pwd'], $_POST['state']"
+        ]
+      },
+      {
+        "file": "rent.php",
+        "entry_conditions": [],
+        "branches": [
+          {
+            "condition": "isset($_POST['sub'])",
+            "condition_vars": [
+              "POST"
+            ],
+            "then": [
+              {
+                "action": "sql_query",
+                "table": "",
+                "detail": "$link,$sql"
+              },
+              {
+                "action": "redirect",
+                "target": "rent.php"
+              }
+            ],
+            "else": []
+          },
+          {
+            "condition": "!empty($no) && !empty($cc) && !empty($dc) && !empty($doi) && !empty($dor) && !empty($distance) && !empty($carid) && !emp...",
+            "condition_vars": [],
+            "then": [
+              {
+                "action": "sql_query",
+                "table": "",
+                "detail": "$link,$sql"
+              },
+              {
+                "action": "redirect",
+                "target": "rent.php"
+              }
+            ],
+            "else": []
+          }
+        ],
+        "data_flows": [
+          {
+            "source": [
+              "$_POST['dc']",
+              "$_POST['doi']",
+              "$_POST['dor']",
+              "$_POST['distance']",
+              "$_POST['carid']",
+              "$_POST['dln']",
+              "$_POST['no']",
+              "$_POST['cc']"
+            ],
+            "sink": "sql_write",
+            "table": "request",
+            "field_mapping": {
+              "dc": "$_POST['dc']",
+              "doi": "$_POST['doi']",
+              "dor": "$_POST['dor']",
+              "distance": "$_POST['distance']",
+              "carid": "$_POST['carid']",
+              "dln": "$_POST['dln']",
+              "no": "$_POST['no']",
+              "cc": "$_POST['cc']"
+            }
+          },
+          {
+            "source": [
+              "$_POST['dc']",
+              "$_POST['doi']",
+              "$_POST['dor']",
+              "$_POST['distance']",
+              "$_POST['carid']",
+              "$_POST['dln']",
+              "$_POST['no']",
+              "$_POST['cc']"
+            ],
+            "sink": "sql_write",
+            "table": "request",
+            "field_mapping": {
+              "dc": "$_POST['dc']",
+              "doi": "$_POST['doi']",
+              "dor": "$_POST['dor']",
+              "distance": "$_POST['distance']",
+              "carid": "$_POST['carid']",
+              "dln": "$_POST['dln']",
+              "no": "$_POST['no']",
+              "cc": "$_POST['cc']"
+            }
+          }
+        ],
+        "auth_guard": null,
+        "happy_path": [
+          "Receive input: $_POST['carid'], $_POST['cc'], $_POST['dc'], $_POST['distance'], $_POST['dln'], $_POST['doi'], $_POST['dor'], $_POST['no']",
+          "SQL QUERY on ``: $link,$sql",
+          "Redirect \u2192 rent.php"
+        ]
+      },
+      {
+        "file": "request.php",
+        "entry_conditions": [],
+        "branches": [],
+        "data_flows": [
+          {
+            "source": [
+              "$_POST['no']",
+              "$_POST['cc']",
+              "$_POST['dc']",
+              "$_POST['doi']",
+              "$_POST['dor']",
+              "$_POST['distance']",
+              "$_POST['carid']",
+              "$_POST['dln']"
+            ],
+            "sink": "sql_write",
+            "table": "request",
+            "field_mapping": {
+              "no": "$_POST['no']",
+              "cc": "$_POST['cc']",
+              "dc": "$_POST['dc']",
+              "doi": "$_POST['doi']",
+              "dor": "$_POST['dor']",
+              "distance": "$_POST['distance']",
+              "carid": "$_POST['carid']",
+              "dln": "$_POST['dln']"
+            }
+          }
+        ],
+        "auth_guard": null,
+        "happy_path": [
+          "Receive input: $_POST['carid'], $_POST['cc'], $_POST['dc'], $_POST['distance'], $_POST['dln'], $_POST['doi'], $_POST['dor'], $_POST['no']",
+          "Redirect \u2192 rent.php"
+        ]
+      },
+      {
+        "file": "session.php",
+        "entry_conditions": [
+          {
+            "type": "session_start"
+          }
+        ],
+        "branches": [
+          {
+            "condition": "$n==1",
+            "condition_vars": [],
+            "then": [
+              {
+                "action": "session_write",
+                "key": "username",
+                "detail": "$_SESSION['username'] = $uname1"
+              },
+              {
+                "action": "redirect",
+                "target": "rent.php"
+              }
+            ],
+            "else": [
+              {
+                "action": "redirect",
+                "target": "login.php"
+              },
+              {
+                "action": "output_html",
+                "count": 1
+              }
+            ]
+          }
+        ],
+        "data_flows": [
+          {
+            "source": [
+              "$_POST['uname']",
+              "$_POST['pwd']"
+            ],
+            "sink": "sql_read",
+            "table": "registerhere",
+            "field_mapping": {
+              "uname": "$_POST['uname']",
+              "pwd": "$_POST['pwd']"
+            }
+          }
+        ],
+        "auth_guard": null,
+        "happy_path": [
+          "Session started (session_start)",
+          "Receive input: $_POST['pwd'], $_POST['uname']",
+          "Write session: $_SESSION['username']",
+          "Redirect \u2192 rent.php"
+        ]
+      },
+      {
+        "file": "table.php",
+        "entry_conditions": [],
+        "branches": [],
+        "data_flows": [
+          {
+            "source": [
+              "$_POST/$_GET"
+            ],
+            "sink": "sql_ddl",
+            "table": "registerhere",
+            "field_mapping": {}
+          }
+        ],
+        "auth_guard": null,
+        "happy_path": []
+      }
+    ],
+    "call_graph": [
+      {
+        "caller": "GLOBAL_SCRIPT",
+        "callee": "mysqli_select_db",
+        "file": "checksession.php",
+        "line": 6
+      },
+      {
+        "caller": "GLOBAL_SCRIPT",
+        "callee": "mysqli_error",
+        "file": "dbcreation.php",
+        "line": 8
+      },
+      {
+        "caller": "validate_phone_number",
+        "callee": "filter_var",
+        "file": "registration.php",
+        "line": 74
+      },
+      {
+        "caller": "GLOBAL_SCRIPT",
+        "callee": "validate_phone_number",
+        "file": "registration.php",
+        "line": 89
+      },
+      {
+        "caller": "GLOBAL_SCRIPT",
+        "callee": "mysqli_select_db",
+        "file": "registration.php",
+        "line": 90
+      },
+      {
+        "caller": "GLOBAL_SCRIPT",
+        "callee": "mysqli_error",
+        "file": "registration.php",
+        "line": 97
+      },
+      {
+        "caller": "validate_phone_number",
+        "callee": "filter_var",
+        "file": "rent.php",
+        "line": 97
+      },
+      {
+        "caller": "GLOBAL_SCRIPT",
+        "callee": "validate_phone_number",
+        "file": "rent.php",
+        "line": 121
+      },
+      {
+        "caller": "GLOBAL_SCRIPT",
+        "callee": "mysqli_select_db",
+        "file": "session.php",
+        "line": 7
+      },
+      {
+        "caller": "GLOBAL_SCRIPT",
+        "callee": "mysqli_select_db",
+        "file": "table.php",
+        "line": 3
+      },
+      {
+        "caller": "GLOBAL_SCRIPT",
+        "callee": "mysqli_error",
+        "file": "table.php",
+        "line": 10
+      }
+    ],
+    "form_fields": [
+      {
+        "file": "login.php",
+        "action": "session.php",
+        "method": "POST",
+        "line": 1,
+        "fields": [
+          {
+            "name": "uname",
+            "type": "text",
+            "id": null
+          },
+          {
+            "name": "pwd",
+            "type": "password",
+            "id": null
+          },
+          {
+            "name": "submit",
+            "type": "submit",
+            "id": null
+          }
+        ]
+      },
+      {
+        "file": "registration.php",
+        "action": "",
+        "method": "POST",
+        "line": 102,
+        "fields": [
+          {
+            "name": "fname",
+            "type": "text",
+            "id": null
+          },
+          {
+            "name": "lname",
+            "type": "text",
+            "id": null
+          },
+          {
+            "name": "dob",
+            "type": "text",
+            "id": null
+          },
+          {
+            "name": "phone",
+            "type": "text",
+            "id": null
+          },
+          {
+            "name": "M",
+            "type": "radio",
+            "id": null
+          },
+          {
+            "name": "M",
+            "type": "radio",
+            "id": null
+          },
+          {
+            "name": "email",
+            "type": "text",
+            "id": null
+          },
+          {
+            "name": "uname",
+            "type": "text",
+            "id": null
+          },
+          {
+            "name": "pwd",
+            "type": "password",
+            "id": null
+          },
+          {
+            "name": "city",
+            "type": "text",
+            "id": null
+          },
+          {
+            "name": "state",
+            "type": "text",
+            "id": null
+          },
+          {
+            "name": "country",
+            "type": "text",
+            "id": null
+          },
+          {
+            "name": "register",
+            "type": "submit",
+            "id": null
+          }
+        ]
+      },
+      {
+        "file": "rent.php",
+        "action": "",
+        "method": "POST",
+        "line": 129,
+        "fields": [
+          {
+            "name": "no",
+            "type": "number",
+            "id": null
+          },
+          {
+            "name": "cc",
+            "type": "text",
+            "id": null
+          },
+          {
+            "name": "dc",
+            "type": "text",
+            "id": null
+          },
+          {
+            "name": "doi",
+            "type": "date",
+            "id": null
+          },
+          {
+            "name": "dor",
+            "type": "date",
+            "id": null
+          },
+          {
+            "name": "distance",
+            "type": "number",
+            "id": null
+          },
+          {
+            "name": "carid",
+            "type": "text",
+            "id": null
+          },
+          {
+            "name": "dln",
+            "type": "text",
+            "id": null
+          },
+          {
+            "name": "sprq",
+            "type": "text",
+            "id": null
+          },
+          {
+            "name": "sub",
+            "type": "submit",
+            "id": null
+          }
+        ]
+      }
+    ],
+    "service_deps": [],
+    "env_vars": []
+  },
+  "graph_meta": {
+    "graph_path": "outputs/run_20260308_132946/code_graph.gpickle",
+    "node_count": 42,
+    "edge_count": 57,
+    "node_types": [
+      "db_table",
+      "function",
+      "page",
+      "redirect",
+      "script",
+      "superglobal"
+    ],
+    "edge_types": [
+      "defines",
+      "includes",
+      "reads_input",
+      "redirects_to",
+      "sql_ddl",
+      "sql_read",
+      "sql_write"
+    ]
+  },
+  "embedding_meta": {
+    "collection_name": "phpba_codebase",
+    "chroma_path": "outputs/run_20260308_132946/chromadb",
+    "total_chunks": 63,
+    "embedding_model": "all-MiniLM-L6-v2"
+  },
+  "preflight": {
+    "passed": true,
+    "warnings": [
+      "W1: Only 2 unique DB table(s) found. The data model section of BA documents will be thin. Verify SQL queries are being extracted correctly.",
+      "W5: Only 1 chunk type in ChromaDB ([]). Retrieval diversity will be low. Re-run Stage 3."
+    ],
+    "blockers": []
+  },
+  "domain_model": null,
+  "ba_artifacts": null,
+  "qa_result": null
+}

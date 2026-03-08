@@ -1,0 +1,69 @@
+{
+  "passed": true,
+  "quality_score": 100,
+  "quality_band": "excellent",
+  "blockers": [],
+  "warnings": [
+    "W1: Only 2 unique DB table(s) found. The data model section of BA documents will be thin. Verify SQL queries are being extracted correctly."
+  ],
+  "details": {
+    "total_files": 12,
+    "total_lines": 694,
+    "framework": "raw_php",
+    "php_version": "8.1",
+    "sql_query_count": 10,
+    "function_count": 2,
+    "include_count": 6,
+    "redirect_count": 5,
+    "superglobal_count": 56,
+    "parse_errors": [],
+    "unique_tables": [
+      "registerhere",
+      "request"
+    ],
+    "total_chunks": 63,
+    "embedding_model": "all-MiniLM-L6-v2",
+    "collection_name": "phpba_codebase",
+    "sanity_query_distance": 0.4464793801307678,
+    "sanity_query_result": "OK (best distance=0.446)",
+    "graph_nodes": 42,
+    "graph_edges": 57,
+    "graph_node_types": [
+      "db_table",
+      "function",
+      "page",
+      "redirect",
+      "script",
+      "superglobal"
+    ],
+    "graph_edge_types": [
+      "defines",
+      "includes",
+      "reads_input",
+      "redirects_to",
+      "sql_ddl",
+      "sql_read",
+      "sql_write"
+    ],
+    "form_field_count": 22,
+    "chunk_types": [
+      "file_summary",
+      "form_inputs",
+      "function_def",
+      "graph_neighbourhood",
+      "navigation_flow",
+      "sql_operation"
+    ],
+    "signals": {
+      "has_sql": true,
+      "has_tables": true,
+      "has_forms": true,
+      "has_auth": true,
+      "has_functions": true,
+      "has_graph": true,
+      "has_embeddings": true
+    },
+    "quality_score": 100,
+    "quality_band": "excellent"
+  }
+}

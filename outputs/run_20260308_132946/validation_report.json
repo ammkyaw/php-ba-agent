@@ -1,0 +1,14 @@
+{
+  "project_path": "/Users/aungmaungmaungkyaw/Downloads/tree-sitter-test/test-project",
+  "php_binary": "/opt/homebrew/bin/php",
+  "php_version": "8.5.3",
+  "parser_script": "/Users/aungmaungmaungkyaw/private-projects/reverse-engineering/code-parsing/parse_project.php",
+  "php_file_count": 12,
+  "estimated_lines": 688,
+  "framework_hint": "raw_php",
+  "warnings": [
+    "No .env or database config file found. DB connection details and table names may not be fully mapped."
+  ],
+  "blockers": [],
+  "passed": true
+}

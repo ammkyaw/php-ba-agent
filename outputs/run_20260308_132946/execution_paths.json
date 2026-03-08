@@ -1,0 +1,369 @@
+[
+  {
+    "file": "checksession.php",
+    "entry_conditions": [
+      {
+        "type": "session_start"
+      }
+    ],
+    "branches": [
+      {
+        "condition": "$n==0",
+        "condition_vars": [],
+        "then": [
+          {
+            "action": "redirect",
+            "target": "login.php"
+          }
+        ],
+        "else": []
+      }
+    ],
+    "data_flows": [
+      {
+        "source": [
+          "$_POST/$_GET"
+        ],
+        "sink": "sql_read",
+        "table": "registerhere",
+        "field_mapping": {}
+      }
+    ],
+    "auth_guard": null,
+    "happy_path": [
+      "Session started (session_start)",
+      "Redirect → login.php"
+    ]
+  },
+  {
+    "file": "logout.php",
+    "entry_conditions": [
+      {
+        "type": "session_start"
+      }
+    ],
+    "branches": [
+      {
+        "condition": "session_destroy()",
+        "condition_vars": [],
+        "then": [
+          {
+            "action": "redirect",
+            "target": "login.php"
+          }
+        ],
+        "else": []
+      }
+    ],
+    "data_flows": [],
+    "auth_guard": null,
+    "happy_path": [
+      "Session started (session_start)",
+      "Redirect → login.php"
+    ]
+  },
+  {
+    "file": "myorder.php",
+    "entry_conditions": [],
+    "branches": [],
+    "data_flows": [
+      {
+        "source": [
+          "$_POST/$_GET"
+        ],
+        "sink": "sql_read",
+        "table": "request",
+        "field_mapping": {}
+      },
+      {
+        "source": [
+          "$_POST/$_GET"
+        ],
+        "sink": "sql_read",
+        "table": "request",
+        "field_mapping": {}
+      }
+    ],
+    "auth_guard": null,
+    "happy_path": []
+  },
+  {
+    "file": "registration.php",
+    "entry_conditions": [],
+    "branches": [
+      {
+        "condition": "isset($_POST['register'])",
+        "condition_vars": [
+          "POST"
+        ],
+        "then": [
+          {
+            "action": "sql_query",
+            "table": "",
+            "detail": "$con,$query"
+          },
+          {
+            "action": "output_html",
+            "count": 2
+          }
+        ],
+        "else": []
+      },
+      {
+        "condition": "!empty($fname) && !empty($dob) && !empty($phone) && !empty($gender) && !empty($email) && !empty($pwd) && validate_phone_...",
+        "condition_vars": [],
+        "then": [
+          {
+            "action": "sql_query",
+            "table": "",
+            "detail": "$con,$query"
+          },
+          {
+            "action": "output_html",
+            "count": 2
+          }
+        ],
+        "else": []
+      }
+    ],
+    "data_flows": [
+      {
+        "source": [
+          "$_POST['fname']",
+          "$_POST['lname']",
+          "$_POST['dob']",
+          "$_POST['phone']",
+          "$_POST['M']",
+          "$_POST['email']",
+          "$_POST['pwd']",
+          "$_POST['city']",
+          "$_POST['state']",
+          "$_POST['country']"
+        ],
+        "sink": "sql_write",
+        "table": "registerhere",
+        "field_mapping": {
+          "fname": "$_POST['fname']",
+          "lname": "$_POST['lname']",
+          "dob": "$_POST['dob']",
+          "phone": "$_POST['phone']",
+          "M": "$_POST['M']",
+          "email": "$_POST['email']",
+          "pwd": "$_POST['pwd']",
+          "city": "$_POST['city']",
+          "state": "$_POST['state']",
+          "country": "$_POST['country']"
+        }
+      }
+    ],
+    "auth_guard": null,
+    "happy_path": [
+      "Receive input: $_POST['M'], $_POST['city'], $_POST['country'], $_POST['dob'], $_POST['email'], $_POST['fname'], $_POST['lname'], $_POST['phone'], $_POST['pwd'], $_POST['state']"
+    ]
+  },
+  {
+    "file": "rent.php",
+    "entry_conditions": [],
+    "branches": [
+      {
+        "condition": "isset($_POST['sub'])",
+        "condition_vars": [
+          "POST"
+        ],
+        "then": [
+          {
+            "action": "sql_query",
+            "table": "",
+            "detail": "$link,$sql"
+          },
+          {
+            "action": "redirect",
+            "target": "rent.php"
+          }
+        ],
+        "else": []
+      },
+      {
+        "condition": "!empty($no) && !empty($cc) && !empty($dc) && !empty($doi) && !empty($dor) && !empty($distance) && !empty($carid) && !emp...",
+        "condition_vars": [],
+        "then": [
+          {
+            "action": "sql_query",
+            "table": "",
+            "detail": "$link,$sql"
+          },
+          {
+            "action": "redirect",
+            "target": "rent.php"
+          }
+        ],
+        "else": []
+      }
+    ],
+    "data_flows": [
+      {
+        "source": [
+          "$_POST['dc']",
+          "$_POST['doi']",
+          "$_POST['dor']",
+          "$_POST['distance']",
+          "$_POST['carid']",
+          "$_POST['dln']",
+          "$_POST['no']",
+          "$_POST['cc']"
+        ],
+        "sink": "sql_write",
+        "table": "request",
+        "field_mapping": {
+          "dc": "$_POST['dc']",
+          "doi": "$_POST['doi']",
+          "dor": "$_POST['dor']",
+          "distance": "$_POST['distance']",
+          "carid": "$_POST['carid']",
+          "dln": "$_POST['dln']",
+          "no": "$_POST['no']",
+          "cc": "$_POST['cc']"
+        }
+      },
+      {
+        "source": [
+          "$_POST['dc']",
+          "$_POST['doi']",
+          "$_POST['dor']",
+          "$_POST['distance']",
+          "$_POST['carid']",
+          "$_POST['dln']",
+          "$_POST['no']",
+          "$_POST['cc']"
+        ],
+        "sink": "sql_write",
+        "table": "request",
+        "field_mapping": {
+          "dc": "$_POST['dc']",
+          "doi": "$_POST['doi']",
+          "dor": "$_POST['dor']",
+          "distance": "$_POST['distance']",
+          "carid": "$_POST['carid']",
+          "dln": "$_POST['dln']",
+          "no": "$_POST['no']",
+          "cc": "$_POST['cc']"
+        }
+      }
+    ],
+    "auth_guard": null,
+    "happy_path": [
+      "Receive input: $_POST['carid'], $_POST['cc'], $_POST['dc'], $_POST['distance'], $_POST['dln'], $_POST['doi'], $_POST['dor'], $_POST['no']",
+      "SQL QUERY on ``: $link,$sql",
+      "Redirect → rent.php"
+    ]
+  },
+  {
+    "file": "request.php",
+    "entry_conditions": [],
+    "branches": [],
+    "data_flows": [
+      {
+        "source": [
+          "$_POST['no']",
+          "$_POST['cc']",
+          "$_POST['dc']",
+          "$_POST['doi']",
+          "$_POST['dor']",
+          "$_POST['distance']",
+          "$_POST['carid']",
+          "$_POST['dln']"
+        ],
+        "sink": "sql_write",
+        "table": "request",
+        "field_mapping": {
+          "no": "$_POST['no']",
+          "cc": "$_POST['cc']",
+          "dc": "$_POST['dc']",
+          "doi": "$_POST['doi']",
+          "dor": "$_POST['dor']",
+          "distance": "$_POST['distance']",
+          "carid": "$_POST['carid']",
+          "dln": "$_POST['dln']"
+        }
+      }
+    ],
+    "auth_guard": null,
+    "happy_path": [
+      "Receive input: $_POST['carid'], $_POST['cc'], $_POST['dc'], $_POST['distance'], $_POST['dln'], $_POST['doi'], $_POST['dor'], $_POST['no']",
+      "Redirect → rent.php"
+    ]
+  },
+  {
+    "file": "session.php",
+    "entry_conditions": [
+      {
+        "type": "session_start"
+      }
+    ],
+    "branches": [
+      {
+        "condition": "$n==1",
+        "condition_vars": [],
+        "then": [
+          {
+            "action": "session_write",
+            "key": "username",
+            "detail": "$_SESSION['username'] = $uname1"
+          },
+          {
+            "action": "redirect",
+            "target": "rent.php"
+          }
+        ],
+        "else": [
+          {
+            "action": "redirect",
+            "target": "login.php"
+          },
+          {
+            "action": "output_html",
+            "count": 1
+          }
+        ]
+      }
+    ],
+    "data_flows": [
+      {
+        "source": [
+          "$_POST['uname']",
+          "$_POST['pwd']"
+        ],
+        "sink": "sql_read",
+        "table": "registerhere",
+        "field_mapping": {
+          "uname": "$_POST['uname']",
+          "pwd": "$_POST['pwd']"
+        }
+      }
+    ],
+    "auth_guard": null,
+    "happy_path": [
+      "Session started (session_start)",
+      "Receive input: $_POST['pwd'], $_POST['uname']",
+      "Write session: $_SESSION['username']",
+      "Redirect → rent.php"
+    ]
+  },
+  {
+    "file": "table.php",
+    "entry_conditions": [],
+    "branches": [],
+    "data_flows": [
+      {
+        "source": [
+          "$_POST/$_GET"
+        ],
+        "sink": "sql_ddl",
+        "table": "registerhere",
+        "field_mapping": {}
+      }
+    ],
+    "auth_guard": null,
+    "happy_path": []
+  }
+]

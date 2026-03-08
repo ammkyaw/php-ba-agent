@@ -1,0 +1,714 @@
+{
+  "meta": {
+    "node_count": 42,
+    "edge_count": 57,
+    "node_types": [
+      "db_table",
+      "function",
+      "page",
+      "redirect",
+      "script",
+      "superglobal"
+    ],
+    "edge_types": [
+      "defines",
+      "includes",
+      "reads_input",
+      "redirects_to",
+      "sql_ddl",
+      "sql_read",
+      "sql_write"
+    ]
+  },
+  "nodes": [
+    {
+      "id": "rent.php",
+      "file": "rent.php",
+      "type": "page"
+    },
+    {
+      "id": "registration.php",
+      "file": "registration.php",
+      "type": "page"
+    },
+    {
+      "id": "checksession.php",
+      "file": "checksession.php",
+      "type": "page"
+    },
+    {
+      "id": "logout.php",
+      "file": "logout.php",
+      "type": "page"
+    },
+    {
+      "id": "table.php",
+      "file": "table.php",
+      "type": "script"
+    },
+    {
+      "id": "request.php",
+      "file": "request.php",
+      "type": "page"
+    },
+    {
+      "id": "myorder.php",
+      "file": "myorder.php",
+      "type": "page"
+    },
+    {
+      "id": "session.php",
+      "file": "session.php",
+      "type": "page"
+    },
+    {
+      "id": "dbcreation.php",
+      "file": "dbcreation.php",
+      "type": "script"
+    },
+    {
+      "id": "tarrif.php",
+      "file": "tarrif.php",
+      "type": "page"
+    },
+    {
+      "id": "carrental.php",
+      "file": "carrental.php",
+      "type": "page"
+    },
+    {
+      "id": "login.php",
+      "file": "login.php",
+      "type": "page"
+    },
+    {
+      "id": "registration.php::validate_phone_number",
+      "name": "validate_phone_number",
+      "file": "registration.php",
+      "line": 71,
+      "params": [
+        "$phone"
+      ],
+      "return_type": null,
+      "docblock": null,
+      "type": "function"
+    },
+    {
+      "id": "rent.php::validate_phone_number",
+      "name": "validate_phone_number",
+      "file": "rent.php",
+      "line": 94,
+      "params": [
+        "$no"
+      ],
+      "return_type": null,
+      "docblock": null,
+      "type": "function"
+    },
+    {
+      "id": "TABLE:registerhere",
+      "name": "registerhere",
+      "type": "db_table"
+    },
+    {
+      "id": "TABLE:UNKNOWN",
+      "name": "UNKNOWN",
+      "type": "db_table"
+    },
+    {
+      "id": "TABLE:request",
+      "name": "request",
+      "type": "db_table"
+    },
+    {
+      "id": "REDIRECT:login.php",
+      "name": "login.php",
+      "url": "login.php",
+      "type": "redirect"
+    },
+    {
+      "id": "REDIRECT:rent.php",
+      "name": "rent.php",
+      "url": "rent.php",
+      "type": "redirect"
+    },
+    {
+      "id": "$_SESSION[username]",
+      "name": "$_SESSION[username]",
+      "var": "$_SESSION",
+      "key": "username",
+      "type": "superglobal"
+    },
+    {
+      "id": "$_POST[register]",
+      "name": "$_POST[register]",
+      "var": "$_POST",
+      "key": "register",
+      "type": "superglobal"
+    },
+    {
+      "id": "$_POST[fname]",
+      "name": "$_POST[fname]",
+      "var": "$_POST",
+      "key": "fname",
+      "type": "superglobal"
+    },
+    {
+      "id": "$_POST[lname]",
+      "name": "$_POST[lname]",
+      "var": "$_POST",
+      "key": "lname",
+      "type": "superglobal"
+    },
+    {
+      "id": "$_POST[dob]",
+      "name": "$_POST[dob]",
+      "var": "$_POST",
+      "key": "dob",
+      "type": "superglobal"
+    },
+    {
+      "id": "$_POST[phone]",
+      "name": "$_POST[phone]",
+      "var": "$_POST",
+      "key": "phone",
+      "type": "superglobal"
+    },
+    {
+      "id": "$_POST[M]",
+      "name": "$_POST[M]",
+      "var": "$_POST",
+      "key": "M",
+      "type": "superglobal"
+    },
+    {
+      "id": "$_POST[email]",
+      "name": "$_POST[email]",
+      "var": "$_POST",
+      "key": "email",
+      "type": "superglobal"
+    },
+    {
+      "id": "$_POST[uname]",
+      "name": "$_POST[uname]",
+      "var": "$_POST",
+      "key": "uname",
+      "type": "superglobal"
+    },
+    {
+      "id": "$_POST[pwd]",
+      "name": "$_POST[pwd]",
+      "var": "$_POST",
+      "key": "pwd",
+      "type": "superglobal"
+    },
+    {
+      "id": "$_POST[city]",
+      "name": "$_POST[city]",
+      "var": "$_POST",
+      "key": "city",
+      "type": "superglobal"
+    },
+    {
+      "id": "$_POST[state]",
+      "name": "$_POST[state]",
+      "var": "$_POST",
+      "key": "state",
+      "type": "superglobal"
+    },
+    {
+      "id": "$_POST[country]",
+      "name": "$_POST[country]",
+      "var": "$_POST",
+      "key": "country",
+      "type": "superglobal"
+    },
+    {
+      "id": "$_POST[sub]",
+      "name": "$_POST[sub]",
+      "var": "$_POST",
+      "key": "sub",
+      "type": "superglobal"
+    },
+    {
+      "id": "$_POST[mob]",
+      "name": "$_POST[mob]",
+      "var": "$_POST",
+      "key": "mob",
+      "type": "superglobal"
+    },
+    {
+      "id": "$_POST[cc]",
+      "name": "$_POST[cc]",
+      "var": "$_POST",
+      "key": "cc",
+      "type": "superglobal"
+    },
+    {
+      "id": "$_POST[dc]",
+      "name": "$_POST[dc]",
+      "var": "$_POST",
+      "key": "dc",
+      "type": "superglobal"
+    },
+    {
+      "id": "$_POST[doi]",
+      "name": "$_POST[doi]",
+      "var": "$_POST",
+      "key": "doi",
+      "type": "superglobal"
+    },
+    {
+      "id": "$_POST[dor]",
+      "name": "$_POST[dor]",
+      "var": "$_POST",
+      "key": "dor",
+      "type": "superglobal"
+    },
+    {
+      "id": "$_POST[distance]",
+      "name": "$_POST[distance]",
+      "var": "$_POST",
+      "key": "distance",
+      "type": "superglobal"
+    },
+    {
+      "id": "$_POST[carid]",
+      "name": "$_POST[carid]",
+      "var": "$_POST",
+      "key": "carid",
+      "type": "superglobal"
+    },
+    {
+      "id": "$_POST[dln]",
+      "name": "$_POST[dln]",
+      "var": "$_POST",
+      "key": "dln",
+      "type": "superglobal"
+    },
+    {
+      "id": "$_POST[no]",
+      "name": "$_POST[no]",
+      "var": "$_POST",
+      "key": "no",
+      "type": "superglobal"
+    }
+  ],
+  "edges": [
+    {
+      "from": "rent.php",
+      "to": "rent.php::validate_phone_number",
+      "edge_type": "defines",
+      "file": "rent.php",
+      "line": 94
+    },
+    {
+      "from": "rent.php",
+      "to": "checksession.php",
+      "edge_type": "includes",
+      "inc_type": "include",
+      "file": "rent.php",
+      "line": 2
+    },
+    {
+      "from": "rent.php",
+      "to": "dbcreation.php",
+      "edge_type": "includes",
+      "inc_type": "include",
+      "file": "rent.php",
+      "line": 38
+    },
+    {
+      "from": "rent.php",
+      "to": "TABLE:registerhere",
+      "edge_type": "sql_read",
+      "operation": "SELECT",
+      "file": "rent.php",
+      "line": 8
+    },
+    {
+      "from": "rent.php",
+      "to": "TABLE:request",
+      "edge_type": "sql_write",
+      "operation": "INSERT",
+      "file": "rent.php",
+      "line": 123
+    },
+    {
+      "from": "rent.php",
+      "to": "$_POST[sub]",
+      "edge_type": "reads_input",
+      "file": "rent.php",
+      "line": 42
+    },
+    {
+      "from": "rent.php",
+      "to": "$_POST[mob]",
+      "edge_type": "reads_input",
+      "file": "rent.php",
+      "line": 45
+    },
+    {
+      "from": "rent.php",
+      "to": "$_POST[cc]",
+      "edge_type": "reads_input",
+      "file": "rent.php",
+      "line": 51
+    },
+    {
+      "from": "rent.php",
+      "to": "$_POST[dc]",
+      "edge_type": "reads_input",
+      "file": "rent.php",
+      "line": 58
+    },
+    {
+      "from": "rent.php",
+      "to": "$_POST[doi]",
+      "edge_type": "reads_input",
+      "file": "rent.php",
+      "line": 64
+    },
+    {
+      "from": "rent.php",
+      "to": "$_POST[dor]",
+      "edge_type": "reads_input",
+      "file": "rent.php",
+      "line": 70
+    },
+    {
+      "from": "rent.php",
+      "to": "$_POST[distance]",
+      "edge_type": "reads_input",
+      "file": "rent.php",
+      "line": 76
+    },
+    {
+      "from": "rent.php",
+      "to": "$_POST[carid]",
+      "edge_type": "reads_input",
+      "file": "rent.php",
+      "line": 82
+    },
+    {
+      "from": "rent.php",
+      "to": "$_POST[dln]",
+      "edge_type": "reads_input",
+      "file": "rent.php",
+      "line": 88
+    },
+    {
+      "from": "rent.php",
+      "to": "$_POST[no]",
+      "edge_type": "reads_input",
+      "file": "rent.php",
+      "line": 113
+    },
+    {
+      "from": "registration.php",
+      "to": "registration.php::validate_phone_number",
+      "edge_type": "defines",
+      "file": "registration.php",
+      "line": 71
+    },
+    {
+      "from": "registration.php",
+      "to": "dbcreation.php",
+      "edge_type": "includes",
+      "inc_type": "include",
+      "file": "registration.php",
+      "line": 19
+    },
+    {
+      "from": "registration.php",
+      "to": "TABLE:registerhere",
+      "edge_type": "sql_write",
+      "operation": "INSERT",
+      "file": "registration.php",
+      "line": 92
+    },
+    {
+      "from": "registration.php",
+      "to": "$_POST[register]",
+      "edge_type": "reads_input",
+      "file": "registration.php",
+      "line": 23
+    },
+    {
+      "from": "registration.php",
+      "to": "$_POST[fname]",
+      "edge_type": "reads_input",
+      "file": "registration.php",
+      "line": 26
+    },
+    {
+      "from": "registration.php",
+      "to": "$_POST[lname]",
+      "edge_type": "reads_input",
+      "file": "registration.php",
+      "line": 33
+    },
+    {
+      "from": "registration.php",
+      "to": "$_POST[dob]",
+      "edge_type": "reads_input",
+      "file": "registration.php",
+      "line": 35
+    },
+    {
+      "from": "registration.php",
+      "to": "$_POST[phone]",
+      "edge_type": "reads_input",
+      "file": "registration.php",
+      "line": 41
+    },
+    {
+      "from": "registration.php",
+      "to": "$_POST[M]",
+      "edge_type": "reads_input",
+      "file": "registration.php",
+      "line": 47
+    },
+    {
+      "from": "registration.php",
+      "to": "$_POST[email]",
+      "edge_type": "reads_input",
+      "file": "registration.php",
+      "line": 53
+    },
+    {
+      "from": "registration.php",
+      "to": "$_POST[uname]",
+      "edge_type": "reads_input",
+      "file": "registration.php",
+      "line": 59
+    },
+    {
+      "from": "registration.php",
+      "to": "$_POST[pwd]",
+      "edge_type": "reads_input",
+      "file": "registration.php",
+      "line": 65
+    },
+    {
+      "from": "registration.php",
+      "to": "$_POST[city]",
+      "edge_type": "reads_input",
+      "file": "registration.php",
+      "line": 86
+    },
+    {
+      "from": "registration.php",
+      "to": "$_POST[state]",
+      "edge_type": "reads_input",
+      "file": "registration.php",
+      "line": 87
+    },
+    {
+      "from": "registration.php",
+      "to": "$_POST[country]",
+      "edge_type": "reads_input",
+      "file": "registration.php",
+      "line": 88
+    },
+    {
+      "from": "checksession.php",
+      "to": "TABLE:registerhere",
+      "edge_type": "sql_read",
+      "operation": "SELECT",
+      "file": "checksession.php",
+      "line": 9
+    },
+    {
+      "from": "checksession.php",
+      "to": "REDIRECT:login.php",
+      "edge_type": "redirects_to",
+      "file": "checksession.php",
+      "line": 14
+    },
+    {
+      "from": "checksession.php",
+      "to": "$_SESSION[username]",
+      "edge_type": "reads_input",
+      "file": "checksession.php",
+      "line": 3
+    },
+    {
+      "from": "logout.php",
+      "to": "REDIRECT:login.php",
+      "edge_type": "redirects_to",
+      "file": "logout.php",
+      "line": 5
+    },
+    {
+      "from": "table.php",
+      "to": "dbcreation.php",
+      "edge_type": "includes",
+      "inc_type": "include",
+      "file": "table.php",
+      "line": 2
+    },
+    {
+      "from": "table.php",
+      "to": "TABLE:registerhere",
+      "edge_type": "sql_ddl",
+      "operation": "CREATE",
+      "file": "table.php",
+      "line": 5
+    },
+    {
+      "from": "request.php",
+      "to": "checksession.php",
+      "edge_type": "includes",
+      "inc_type": "include",
+      "file": "request.php",
+      "line": 2
+    },
+    {
+      "from": "request.php",
+      "to": "TABLE:request",
+      "edge_type": "sql_write",
+      "operation": "INSERT",
+      "file": "request.php",
+      "line": 15
+    },
+    {
+      "from": "request.php",
+      "to": "REDIRECT:rent.php",
+      "edge_type": "redirects_to",
+      "file": "request.php",
+      "line": 16
+    },
+    {
+      "from": "request.php",
+      "to": "$_POST[no]",
+      "edge_type": "reads_input",
+      "file": "request.php",
+      "line": 6
+    },
+    {
+      "from": "request.php",
+      "to": "$_POST[cc]",
+      "edge_type": "reads_input",
+      "file": "request.php",
+      "line": 7
+    },
+    {
+      "from": "request.php",
+      "to": "$_POST[dc]",
+      "edge_type": "reads_input",
+      "file": "request.php",
+      "line": 8
+    },
+    {
+      "from": "request.php",
+      "to": "$_POST[doi]",
+      "edge_type": "reads_input",
+      "file": "request.php",
+      "line": 9
+    },
+    {
+      "from": "request.php",
+      "to": "$_POST[dor]",
+      "edge_type": "reads_input",
+      "file": "request.php",
+      "line": 10
+    },
+    {
+      "from": "request.php",
+      "to": "$_POST[distance]",
+      "edge_type": "reads_input",
+      "file": "request.php",
+      "line": 11
+    },
+    {
+      "from": "request.php",
+      "to": "$_POST[carid]",
+      "edge_type": "reads_input",
+      "file": "request.php",
+      "line": 12
+    },
+    {
+      "from": "request.php",
+      "to": "$_POST[dln]",
+      "edge_type": "reads_input",
+      "file": "request.php",
+      "line": 13
+    },
+    {
+      "from": "myorder.php",
+      "to": "checksession.php",
+      "edge_type": "includes",
+      "inc_type": "include",
+      "file": "myorder.php",
+      "line": 3
+    },
+    {
+      "from": "myorder.php",
+      "to": "TABLE:registerhere",
+      "edge_type": "sql_read",
+      "operation": "SELECT",
+      "file": "myorder.php",
+      "line": 9
+    },
+    {
+      "from": "myorder.php",
+      "to": "TABLE:request",
+      "edge_type": "sql_read",
+      "operation": "SELECT",
+      "file": "myorder.php",
+      "line": 48
+    },
+    {
+      "from": "session.php",
+      "to": "TABLE:registerhere",
+      "edge_type": "sql_read",
+      "operation": "SELECT",
+      "file": "session.php",
+      "line": 10
+    },
+    {
+      "from": "session.php",
+      "to": "REDIRECT:rent.php",
+      "edge_type": "redirects_to",
+      "file": "session.php",
+      "line": 16
+    },
+    {
+      "from": "session.php",
+      "to": "REDIRECT:login.php",
+      "edge_type": "redirects_to",
+      "file": "session.php",
+      "line": 19
+    },
+    {
+      "from": "session.php",
+      "to": "$_POST[uname]",
+      "edge_type": "reads_input",
+      "file": "session.php",
+      "line": 3
+    },
+    {
+      "from": "session.php",
+      "to": "$_POST[pwd]",
+      "edge_type": "reads_input",
+      "file": "session.php",
+      "line": 4
+    },
+    {
+      "from": "session.php",
+      "to": "$_SESSION[username]",
+      "edge_type": "reads_input",
+      "file": "session.php",
+      "line": 15
+    },
+    {
+      "from": "dbcreation.php",
+      "to": "TABLE:UNKNOWN",
+      "edge_type": "sql_ddl",
+      "operation": "CREATE",
+      "file": "dbcreation.php",
+      "line": 16
+    }
+  ]
+}

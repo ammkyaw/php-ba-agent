@@ -1,0 +1,215 @@
+{
+  "meta": {
+    "node_count": 16,
+    "edge_count": 13,
+    "node_types": [
+      "function",
+      "include_file",
+      "page",
+      "redirect",
+      "script"
+    ],
+    "edge_types": [
+      "defines",
+      "includes",
+      "redirects_to"
+    ]
+  },
+  "nodes": [
+    {
+      "id": "session.php",
+      "file": "session.php",
+      "type": "page"
+    },
+    {
+      "id": "checksession.php",
+      "file": "checksession.php",
+      "type": "page"
+    },
+    {
+      "id": "table.php",
+      "file": "table.php",
+      "type": "script"
+    },
+    {
+      "id": "logout.php",
+      "file": "logout.php",
+      "type": "page"
+    },
+    {
+      "id": "registration.php",
+      "file": "registration.php",
+      "type": "page"
+    },
+    {
+      "id": "request.php",
+      "file": "request.php",
+      "type": "page"
+    },
+    {
+      "id": "rent.php",
+      "file": "rent.php",
+      "type": "page"
+    },
+    {
+      "id": "myorder.php",
+      "file": "myorder.php",
+      "type": "page"
+    },
+    {
+      "id": "carrental.php",
+      "file": "carrental.php",
+      "type": "page"
+    },
+    {
+      "id": "login.php",
+      "file": "login.php",
+      "type": "page"
+    },
+    {
+      "id": "tarrif.php",
+      "file": "tarrif.php",
+      "type": "page"
+    },
+    {
+      "id": "registration.php::validate_phone_number",
+      "name": "validate_phone_number",
+      "file": "registration.php",
+      "line": 71,
+      "params": [
+        "$phone"
+      ],
+      "return_type": null,
+      "docblock": null,
+      "type": "function"
+    },
+    {
+      "id": "rent.php::validate_phone_number",
+      "name": "validate_phone_number",
+      "file": "rent.php",
+      "line": 94,
+      "params": [
+        "$no"
+      ],
+      "return_type": null,
+      "docblock": null,
+      "type": "function"
+    },
+    {
+      "id": "dbcreation.php",
+      "file": "dbcreation.php",
+      "type": "include_file"
+    },
+    {
+      "id": "REDIRECT:login.php",
+      "name": "login.php",
+      "url": "login.php",
+      "type": "redirect"
+    },
+    {
+      "id": "REDIRECT:rent.php",
+      "name": "rent.php",
+      "url": "rent.php",
+      "type": "redirect"
+    }
+  ],
+  "edges": [
+    {
+      "from": "session.php",
+      "to": "REDIRECT:rent.php",
+      "edge_type": "redirects_to",
+      "file": "session.php",
+      "line": 16
+    },
+    {
+      "from": "session.php",
+      "to": "REDIRECT:login.php",
+      "edge_type": "redirects_to",
+      "file": "session.php",
+      "line": 19
+    },
+    {
+      "from": "checksession.php",
+      "to": "REDIRECT:login.php",
+      "edge_type": "redirects_to",
+      "file": "checksession.php",
+      "line": 14
+    },
+    {
+      "from": "table.php",
+      "to": "dbcreation.php",
+      "edge_type": "includes",
+      "inc_type": "include",
+      "file": "table.php",
+      "line": 2
+    },
+    {
+      "from": "logout.php",
+      "to": "REDIRECT:login.php",
+      "edge_type": "redirects_to",
+      "file": "logout.php",
+      "line": 5
+    },
+    {
+      "from": "registration.php",
+      "to": "registration.php::validate_phone_number",
+      "edge_type": "defines",
+      "file": "registration.php",
+      "line": 71
+    },
+    {
+      "from": "registration.php",
+      "to": "dbcreation.php",
+      "edge_type": "includes",
+      "inc_type": "include",
+      "file": "registration.php",
+      "line": 19
+    },
+    {
+      "from": "request.php",
+      "to": "checksession.php",
+      "edge_type": "includes",
+      "inc_type": "include",
+      "file": "request.php",
+      "line": 2
+    },
+    {
+      "from": "request.php",
+      "to": "REDIRECT:rent.php",
+      "edge_type": "redirects_to",
+      "file": "request.php",
+      "line": 16
+    },
+    {
+      "from": "rent.php",
+      "to": "rent.php::validate_phone_number",
+      "edge_type": "defines",
+      "file": "rent.php",
+      "line": 94
+    },
+    {
+      "from": "rent.php",
+      "to": "checksession.php",
+      "edge_type": "includes",
+      "inc_type": "include",
+      "file": "rent.php",
+      "line": 2
+    },
+    {
+      "from": "rent.php",
+      "to": "dbcreation.php",
+      "edge_type": "includes",
+      "inc_type": "include",
+      "file": "rent.php",
+      "line": 38
+    },
+    {
+      "from": "myorder.php",
+      "to": "checksession.php",
+      "edge_type": "includes",
+      "inc_type": "include",
+      "file": "myorder.php",
+      "line": 3
+    }
+  ]
+}

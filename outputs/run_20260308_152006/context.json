@@ -1,0 +1,119 @@
+{
+  "run_id": "20260308_152006",
+  "php_project_path": "/Users/aungmaungmaungkyaw/Downloads/tree-sitter-test/test-project",
+  "output_dir": "outputs/run_20260308_152006",
+  "created_at": "2026-03-08T15:20:06.664001",
+  "stages": {
+    "stage0_validate": {
+      "status": "completed",
+      "started_at": "2026-03-08T15:20:06.664637",
+      "completed_at": "2026-03-08T15:20:06.803620",
+      "error": null,
+      "output_path": "outputs/run_20260308_152006/validation_report.json"
+    },
+    "stage1_parse": {
+      "status": "failed",
+      "started_at": "2026-03-08T15:20:06.803844",
+      "completed_at": "2026-03-08T15:20:06.959275",
+      "error": "TypeError: CodeMap.__init__() got an unexpected keyword argument 'functions'",
+      "output_path": null
+    },
+    "stage2_graph": {
+      "status": "pending",
+      "started_at": null,
+      "completed_at": null,
+      "error": null,
+      "output_path": null
+    },
+    "stage3_embed": {
+      "status": "pending",
+      "started_at": null,
+      "completed_at": null,
+      "error": null,
+      "output_path": null
+    },
+    "stage35_preflight": {
+      "status": "pending",
+      "started_at": null,
+      "completed_at": null,
+      "error": null,
+      "output_path": null
+    },
+    "stage4_domain": {
+      "status": "pending",
+      "started_at": null,
+      "completed_at": null,
+      "error": null,
+      "output_path": null
+    },
+    "stage45_flows": {
+      "status": "pending",
+      "started_at": null,
+      "completed_at": null,
+      "error": null,
+      "output_path": null
+    },
+    "stage5_brd": {
+      "status": "pending",
+      "started_at": null,
+      "completed_at": null,
+      "error": null,
+      "output_path": null
+    },
+    "stage5_srs": {
+      "status": "pending",
+      "started_at": null,
+      "completed_at": null,
+      "error": null,
+      "output_path": null
+    },
+    "stage5_ac": {
+      "status": "pending",
+      "started_at": null,
+      "completed_at": null,
+      "error": null,
+      "output_path": null
+    },
+    "stage5_userstories": {
+      "status": "pending",
+      "started_at": null,
+      "completed_at": null,
+      "error": null,
+      "output_path": null
+    },
+    "stage6_qa": {
+      "status": "pending",
+      "started_at": null,
+      "completed_at": null,
+      "error": null,
+      "output_path": null
+    },
+    "stage65_postprocess": {
+      "status": "pending",
+      "started_at": null,
+      "completed_at": null,
+      "error": null,
+      "output_path": null
+    }
+  },
+  "code_map": {
+    "framework": "raw_php",
+    "php_version": "8.5.3",
+    "classes": [],
+    "routes": [],
+    "models": [],
+    "controllers": [],
+    "services": [],
+    "db_schema": [],
+    "config_files": [],
+    "total_files": 12,
+    "total_lines": 0
+  },
+  "graph_meta": null,
+  "embedding_meta": null,
+  "preflight": null,
+  "domain_model": null,
+  "business_flows": null,
+  "ba_artifacts": null,
+  "qa_result": null
+}

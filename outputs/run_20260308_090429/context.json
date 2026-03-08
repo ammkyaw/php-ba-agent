@@ -1,0 +1,341 @@
+{
+  "run_id": "20260308_090429",
+  "php_project_path": "/Users/aungmaungmaungkyaw/Downloads/tree-sitter-test/test-project",
+  "output_dir": "outputs/run_20260308_090429",
+  "created_at": "2026-03-08T09:04:29.231659",
+  "stages": {
+    "stage0_validate": {
+      "status": "pending",
+      "started_at": null,
+      "completed_at": null,
+      "error": null,
+      "output_path": null
+    },
+    "stage1_parse": {
+      "status": "completed",
+      "started_at": null,
+      "completed_at": "2026-03-08T09:04:29.425885",
+      "error": null,
+      "output_path": "outputs/run_20260308_090429/code_map.json"
+    },
+    "stage2_graph": {
+      "status": "completed",
+      "started_at": null,
+      "completed_at": "2026-03-08T09:05:04.140939",
+      "error": null,
+      "output_path": "outputs/run_20260308_090429/code_graph.json"
+    },
+    "stage3_embed": {
+      "status": "pending",
+      "started_at": null,
+      "completed_at": null,
+      "error": null,
+      "output_path": null
+    },
+    "stage35_preflight": {
+      "status": "pending",
+      "started_at": null,
+      "completed_at": null,
+      "error": null,
+      "output_path": null
+    },
+    "stage4_domain": {
+      "status": "pending",
+      "started_at": null,
+      "completed_at": null,
+      "error": null,
+      "output_path": null
+    },
+    "stage5_brd": {
+      "status": "pending",
+      "started_at": null,
+      "completed_at": null,
+      "error": null,
+      "output_path": null
+    },
+    "stage5_srs": {
+      "status": "pending",
+      "started_at": null,
+      "completed_at": null,
+      "error": null,
+      "output_path": null
+    },
+    "stage5_ac": {
+      "status": "pending",
+      "started_at": null,
+      "completed_at": null,
+      "error": null,
+      "output_path": null
+    },
+    "stage5_userstories": {
+      "status": "pending",
+      "started_at": null,
+      "completed_at": null,
+      "error": null,
+      "output_path": null
+    },
+    "stage6_qa": {
+      "status": "pending",
+      "started_at": null,
+      "completed_at": null,
+      "error": null,
+      "output_path": null
+    },
+    "stage65_postprocess": {
+      "status": "pending",
+      "started_at": null,
+      "completed_at": null,
+      "error": null,
+      "output_path": null
+    }
+  },
+  "code_map": {
+    "framework": "raw_php",
+    "php_version": "8.1",
+    "classes": [],
+    "routes": [],
+    "models": [],
+    "controllers": [],
+    "services": [],
+    "db_schema": [],
+    "config_files": [],
+    "total_files": 12,
+    "total_lines": 694,
+    "functions": [
+      {
+        "name": "validate_phone_number",
+        "file": "registration.php",
+        "line": 71,
+        "params": [
+          {
+            "name": "$phone",
+            "type": null,
+            "default": null
+          }
+        ],
+        "return_type": null,
+        "docblock": null
+      },
+      {
+        "name": "validate_phone_number",
+        "file": "rent.php",
+        "line": 94,
+        "params": [
+          {
+            "name": "$no",
+            "type": null,
+            "default": null
+          }
+        ],
+        "return_type": null,
+        "docblock": null
+      }
+    ],
+    "includes": [
+      {
+        "type": "include",
+        "target": "checksession.php",
+        "caller": "GLOBAL_SCRIPT",
+        "file": "myorder.php",
+        "line": 3
+      },
+      {
+        "type": "include",
+        "target": "dbcreation.php",
+        "caller": "GLOBAL_SCRIPT",
+        "file": "registration.php",
+        "line": 19
+      },
+      {
+        "type": "include",
+        "target": "checksession.php",
+        "caller": "GLOBAL_SCRIPT",
+        "file": "rent.php",
+        "line": 2
+      },
+      {
+        "type": "include",
+        "target": "dbcreation.php",
+        "caller": "GLOBAL_SCRIPT",
+        "file": "rent.php",
+        "line": 38
+      },
+      {
+        "type": "include",
+        "target": "checksession.php",
+        "caller": "GLOBAL_SCRIPT",
+        "file": "request.php",
+        "line": 2
+      },
+      {
+        "type": "include",
+        "target": "dbcreation.php",
+        "caller": "GLOBAL_SCRIPT",
+        "file": "table.php",
+        "line": 2
+      }
+    ],
+    "sql_queries": [
+      {
+        "operation": "SELECT",
+        "table": "registerhere",
+        "sql": "select uname from registerhere where uname='?'",
+        "caller": "GLOBAL_SCRIPT",
+        "via": "mysqli_query",
+        "file": "checksession.php",
+        "line": 9
+      },
+      {
+        "operation": "CREATE",
+        "table": "UNKNOWN",
+        "sql": "create database UserInformation",
+        "caller": "GLOBAL_SCRIPT",
+        "via": "mysqli_query",
+        "file": "dbcreation.php",
+        "line": 16
+      },
+      {
+        "operation": "SELECT",
+        "table": "registerhere",
+        "sql": "select fname from registerhere where uname='?'",
+        "caller": "GLOBAL_SCRIPT",
+        "via": "mysqli_query",
+        "file": "myorder.php",
+        "line": 9
+      },
+      {
+        "operation": "SELECT",
+        "table": "request",
+        "sql": "select cc,dc,doi,dor from request where uname='?'",
+        "caller": "GLOBAL_SCRIPT",
+        "via": "mysqli_query",
+        "file": "myorder.php",
+        "line": 48
+      },
+      {
+        "operation": "INSERT",
+        "table": "registerhere",
+        "sql": "insert into registerhere values('?','?','?','?','?','?','?','?','?','?','?')",
+        "caller": "GLOBAL_SCRIPT",
+        "via": "mysqli_query",
+        "file": "registration.php",
+        "line": 92
+      },
+      {
+        "operation": "SELECT",
+        "table": "registerhere",
+        "sql": "select fname from registerhere where uname='?'",
+        "caller": "GLOBAL_SCRIPT",
+        "via": "mysqli_query",
+        "file": "rent.php",
+        "line": 8
+      },
+      {
+        "operation": "INSERT",
+        "table": "request",
+        "sql": "INSERT INTO request(uname,no,cc,dc,doi,dor,distance,carid,dln) values('?','?','?','?','?','?','?','?','?')",
+        "caller": "GLOBAL_SCRIPT",
+        "via": "mysqli_query",
+        "file": "rent.php",
+        "line": 123
+      },
+      {
+        "operation": "INSERT",
+        "table": "request",
+        "sql": "INSERT INTO request(uname,no,cc,dc,doi,dor,distance,carid,dln) values('?','?','?','?','?','?','?','?','?')",
+        "caller": "GLOBAL_SCRIPT",
+        "via": "mysqli_query",
+        "file": "request.php",
+        "line": 15
+      },
+      {
+        "operation": "SELECT",
+        "table": "registerhere",
+        "sql": "select uname from registerhere where uname='?' and pwd='?'",
+        "caller": "GLOBAL_SCRIPT",
+        "via": "mysqli_query",
+        "file": "session.php",
+        "line": 10
+      },
+      {
+        "operation": "CREATE",
+        "table": "registerhere",
+        "sql": "create table registerhere(fname varchar(10),lname varchar(10),phone int(10),gender varchar(2),dob DATE,email varchar(10),uname varchar(10) primary key,pwd varchar(10),city varchar(10),country varchar(...",
+        "caller": "GLOBAL_SCRIPT",
+        "via": "mysqli_query",
+        "file": "table.php",
+        "line": 5
+      }
+    ],
+    "redirects": [
+      {
+        "target": "login.php",
+        "caller": "GLOBAL_SCRIPT",
+        "file": "checksession.php",
+        "line": 14
+      },
+      {
+        "target": "login.php",
+        "caller": "GLOBAL_SCRIPT",
+        "file": "logout.php",
+        "line": 5
+      },
+      {
+        "target": "rent.php",
+        "caller": "GLOBAL_SCRIPT",
+        "file": "request.php",
+        "line": 16
+      },
+      {
+        "target": "rent.php",
+        "caller": "GLOBAL_SCRIPT",
+        "file": "session.php",
+        "line": 16
+      },
+      {
+        "target": "login.php",
+        "caller": "GLOBAL_SCRIPT",
+        "file": "session.php",
+        "line": 19
+      }
+    ],
+    "globals": [],
+    "html_pages": [
+      "carrental.php",
+      "checksession.php",
+      "login.php",
+      "logout.php",
+      "myorder.php",
+      "registration.php",
+      "rent.php",
+      "request.php",
+      "session.php",
+      "tarrif.php"
+    ]
+  },
+  "graph_meta": {
+    "graph_path": "outputs/run_20260308_090429/code_graph.gpickle",
+    "node_count": 19,
+    "edge_count": 23,
+    "node_types": [
+      "db_table",
+      "function",
+      "page",
+      "redirect",
+      "script"
+    ],
+    "edge_types": [
+      "defines",
+      "includes",
+      "redirects_to",
+      "sql_ddl",
+      "sql_read",
+      "sql_write"
+    ]
+  },
+  "embedding_meta": null,
+  "preflight": null,
+  "domain_model": null,
+  "ba_artifacts": null,
+  "qa_result": null
+}
