@@ -504,6 +504,10 @@ def _call_gemini(
                 system_instruction = system_prompt,
                 max_output_tokens  = max_tokens,
                 temperature        = temperature,
+                thinking_config = genai_types.ThinkingConfig(
+                    include_thoughts = False,
+                    thinking_budget  = 0
+                )
             ),
         )
     except Exception as exc:
