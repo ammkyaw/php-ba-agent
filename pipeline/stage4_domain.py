@@ -56,8 +56,7 @@ from typing import Any
 from context import DomainModel, PipelineContext
 
 # ── Configuration ──────────────────────────────────────────────────────────────
-CLAUDE_MODEL     = "claude-sonnet-4-20250514"
-MAX_TOKENS       = 8192
+MAX_TOKENS       = 16000  # raised from 8192 — large codebases need room for workflows
 DOMAIN_FILE      = "domain_model.json"
 
 # Retrieval: queries × top-k chunks each
@@ -112,7 +111,8 @@ def run(ctx: PipelineContext) -> None:
     system_prompt = _build_system_prompt(quality_score)
     user_prompt   = _build_user_prompt(ctx, chunks)
 
-    print(f"  [stage4] Calling Claude ({CLAUDE_MODEL}) ...")
+    from pipeline.llm_client import get_provider, get_model
+    print(f"  [stage4] Calling LLM ({get_provider()} / {get_model()}) ...")
     print(f"  [stage4] Context: {len(user_prompt)} chars, "
           f"quality_score={quality_score}")
 
@@ -232,14 +232,16 @@ structured domain model in JSON format.
 
 {evidence_instruction}
 
-Rules:
-- Output ONLY valid JSON — no markdown fences, no preamble, no explanation
+CRITICAL OUTPUT RULES — you MUST follow these exactly:
+- Output ONLY the raw JSON object — no markdown fences (no ```json), no headings, no explanation
+- Start your response with {{ and end with }} — nothing before or after
+- Use EXACTLY the field names shown below — do NOT rename, restructure, or add wrapper keys
+- Do NOT use "entities", "attributes", "components" — use the field names shown
 - Use the actual names from the codebase (table names, page names, field names)
 - Every feature must reference the pages and tables that implement it
-- Workflows must describe real user journeys evidenced in the code
 - Be concrete and specific, not generic
 
-Output this exact JSON structure:
+Output this exact JSON structure (copy the field names precisely):
 {{
   "domain_name": "Short descriptive system name (e.g. 'Car Rental Management System')",
   "description": "2-3 sentence plain-English overview of what the system does and who uses it",
@@ -252,17 +254,6 @@ Output this exact JSON structure:
   ],
   "key_entities": ["Entity1", "Entity2"],
   "bounded_contexts": ["Context1", "Context2"],  // Use the STRUCTURALLY DETECTED MODULES as the primary source for these. Rename for clarity, merge near-empty ones, but anchor to detected module names.
-  "features": [
-    {{
-      "name": "Feature name (e.g. User Registration)",
-      "description": "What this feature does from a business perspective",
-      "pages": ["registration.php"],
-      "tables": ["users"],
-      "inputs": ["field1", "field2"],
-      "outputs": "What the user gets after completing this feature",
-      "business_rules": ["Rule 1", "Rule 2"]
-    }}
-  ],
   "workflows": [
     {{
       "name": "Workflow name (e.g. Rental Booking Flow)",
@@ -272,7 +263,17 @@ Output this exact JSON structure:
         {{"step": 2, "action": "User submits credentials", "page": "login.php"}}
       ],
       "preconditions": ["User must have an account"],
-      "postconditions": ["Booking is saved in request table"]
+      "postconditions": ["Booking is saved in request table"]}}
+  ],
+  "features": [
+    {{
+      "name": "Feature name (e.g. User Registration)",
+      "description": "What this feature does from a business perspective",
+      "pages": ["registration.php"],
+      "tables": ["users"],
+      "inputs": ["field1", "field2"],
+      "outputs": "What the user gets after completing this feature",
+      "business_rules": ["Rule 1", "Rule 2"]
     }}
   ]
 }}"""
@@ -455,7 +456,7 @@ def _build_user_prompt(ctx: PipelineContext, chunks: list[dict]) -> str:
             tname   = tbl.get("table", "?")
             source  = tbl.get("source", "?")
             cols    = tbl.get("columns", [])
-            col_str = ", ".join(c.get("name", "?") for c in cols[:12])
+            col_str = ", ".join(c.get("name") or "?" for c in cols[:12] if isinstance(c, dict))
             if len(cols) > 12:
                 col_str += f" ... +{len(cols) - 12} more"
             parts.append(f"  {tname} ({source}): {col_str}")
@@ -613,15 +614,27 @@ def _parse_response(raw: str) -> DomainModel:
         RuntimeError: If the response cannot be parsed as valid JSON
                       or is missing required fields.
     """
-    # Strip any accidental markdown fences
+    # ── Strip markdown / prose wrapping ─────────────────────────────────────
+    # Local models often return prose + fenced JSON, e.g.:
+    #   "# Domain Model JSON" followed by a ```json block
+    #   "Here is the result:" followed by a ```json block
+    # Strategy: find the first { and last } and extract just that span.
     text = raw.strip()
-    if text.startswith("```"):
-        lines = text.splitlines()
-        # Remove first and last fence lines
-        text = "\n".join(
-            line for line in lines
-            if not line.strip().startswith("```")
-        )
+
+    # Fast path: if it already looks like raw JSON, skip extraction
+    if not text.startswith("{"):
+        # Find the outermost { ... } block
+        start = text.find("{")
+        end   = text.rfind("}")
+        if start != -1 and end != -1 and end > start:
+            text = text[start : end + 1]
+        else:
+            # Fallback: strip fence lines and hope for the best
+            text = "\n".join(
+                line for line in text.splitlines()
+                if not line.strip().startswith("```")
+                and not line.strip().startswith("#")
+            ).strip()
 
     try:
         data = json.loads(text)
@@ -637,15 +650,101 @@ def _parse_response(raw: str) -> DomainModel:
                 f"Raw response (first 500 chars):\n{raw[:500]}"
             )
 
-    # Validate required top-level keys
-    required = {"domain_name", "description", "features", "user_roles",
-                "key_entities", "bounded_contexts", "workflows"}
-    missing = required - set(data.keys())
-    if missing:
-        raise RuntimeError(
-            f"[stage4] Claude response missing required fields: {missing}\n"
-            f"Got keys: {list(data.keys())}"
+    # ── Unwrap envelope ───────────────────────────────────────────────────────
+    # Local models often wrap in {"domain_model": {...}}, {"result": {...}}, etc.
+    # Unwrap whenever we have exactly one top-level key whose value is a dict.
+    # The threshold check is intentionally removed — even if the inner dict has
+    # a wrong schema we still want to unwrap and let the field remapper below
+    # handle it.
+    _ENVELOPE_KEYS = {"domain_model", "result", "response", "output", "data",
+                      "domain", "model", "json", "answer"}
+    if (isinstance(data, dict)
+            and len(data) == 1
+            and isinstance(list(data.values())[0], dict)):
+        wrapper_key = list(data.keys())[0]
+        print(f"  [stage4] Unwrapping envelope key '{wrapper_key}' from response.")
+        data = list(data.values())[0]
+
+    # ── Field remapping ───────────────────────────────────────────────────────
+    # Small local models (≤7B) sometimes use different field names despite the
+    # prompt.  Map known aliases onto the expected names so the rest of the
+    # pipeline doesn't break.
+    #   "name" / "system_name" / "title"  → domain_name
+    #   "summary" / "overview"            → description
+    #   "roles" / "actors" / "users"      → user_roles
+    #   "entities" / "models"             → key_entities (extract names)
+    #   "modules" / "contexts"            → bounded_contexts
+    #   "use_cases" / "flows"             → workflows
+    _ALIASES: dict[str, list[str]] = {
+        "domain_name":      ["name", "system_name", "title", "domain", "project_name",
+                             "application_name", "app_name", "project", "system"],
+        "description":      ["summary", "overview", "desc", "purpose", "about",
+                             "context", "background", "introduction"],
+        "user_roles":       ["roles", "actors", "users", "user_types", "stakeholders",
+                             "personas"],
+        "key_entities":     ["entities", "models", "objects", "core_entities", "nodes",
+                             "classes", "tables", "resources"],
+        "bounded_contexts": ["modules", "contexts", "domains", "subsystems",
+                             "components", "packages", "namespaces", "services"],
+        "workflows":        ["use_cases", "flows", "processes", "user_flows",
+                             "journeys", "scenarios", "interactions", "edges"],
+        "features":         ["capabilities", "functionality", "functions",
+                             "requirements", "stories", "tasks"],
+    }
+    remapped: list[str] = []
+    for target, aliases in _ALIASES.items():
+        if target not in data:
+            for alias in aliases:
+                if alias in data:
+                    val = data[alias]
+                    # key_entities may be a list of dicts — extract "name" field
+                    if target == "key_entities" and val and isinstance(val[0], dict):
+                        val = [e.get("name") or e.get("title") or str(e)
+                               for e in val if isinstance(e, dict)]
+                    data[target] = val
+                    remapped.append(f"{alias}→{target}")
+                    break
+    if remapped:
+        print(f"  [stage4] Field remapping applied: {', '.join(remapped)}")
+
+    # ── Synthesize missing critical fields ───────────────────────────────────
+    # Small local models often omit domain_name / description entirely.
+    # Rather than crashing, synthesize reasonable defaults from what we have
+    # so the pipeline can continue.
+    if "domain_name" not in data:
+        # Try to infer from any string value in the response
+        guessed = (
+            data.get("title") or data.get("name") or data.get("system") or
+            data.get("project") or data.get("app") or "Unknown System"
         )
+        if isinstance(guessed, str) and guessed:
+            data["domain_name"] = guessed
+        else:
+            data["domain_name"] = "Unknown System"
+        print(f"  [stage4] ⚠️  domain_name missing — synthesized: '{data['domain_name']}'")
+
+    if "description" not in data:
+        # Build a generic description from entities + contexts if available
+        entities  = data.get("key_entities", [])[:3]
+        contexts  = data.get("bounded_contexts", [])[:3]
+        entity_str  = ", ".join(str(e) for e in entities)  if entities  else ""
+        context_str = ", ".join(str(c) for c in contexts) if contexts else ""
+        parts = []
+        if entity_str:  parts.append(f"Core entities: {entity_str}")
+        if context_str: parts.append(f"Bounded contexts: {context_str}")
+        data["description"] = (
+            ". ".join(parts) + "." if parts
+            else "PHP web application (description not available from model response)."
+        )
+        print(f"  [stage4] ⚠️  description missing — synthesized from available fields.")
+
+    # Validate — now only warn on non-critical missing fields
+    required_warn = {"features", "user_roles", "key_entities",
+                     "bounded_contexts", "workflows"}
+    missing_warn  = required_warn - set(data.keys())
+    if missing_warn:
+        print(f"  [stage4] ⚠️  Truncated response — defaulting missing fields to []: "
+              f"{sorted(missing_warn)}")
 
     return DomainModel(
         domain_name      = data.get("domain_name", "Unknown System"),

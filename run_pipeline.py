@@ -1,6 +1,24 @@
 """
 run_pipeline.py — PHP-BA Agent Pipeline Entry Point
 
+Stages (in execution order):
+    Stage 0    validate       — input validation
+    Stage 1    parse          — PHP parsing (tree-sitter)
+    Stage 1.5  paths          — execution-path / branch extraction
+    Stage 2    graph          — knowledge graph (NetworkX)
+    Stage 3    embed          — vector index (ChromaDB)
+    Stage 3.5  preflight      — context pre-flight checks
+    Stage 4    domain         — DomainAnalystAgent (LLM)
+    Stage 4.5  flows          — BusinessFlowExtractor (LLM)
+    Stage 5    brd/srs/ac/us  — parallel BA document agents (LLM)
+    Stage 6    qa             — QAReviewAgent (LLM)
+    Stage 6.2  architecture   — ArchitectureReconstructionAgent (LLM)
+    Stage 6.5  postprocess    — DOCX formatting
+    Stage 6.7  diagrams       — Mermaid diagram generation (algorithmic)
+    Stage 7    pdf            — DOCX → PDF delivery bundle
+    Stage 8    tests          — Test Case Generator (Gherkin + Playwright + pytest)
+    Stage 9    knowledge_graph — System Knowledge Graph (cross-domain JSON)
+
 Usage:
     # Full run
     python run_pipeline.py --project /path/to/php-project
@@ -27,33 +45,45 @@ from typing import Optional
 from context import PipelineContext, StageStatus
 
 # Stage imports (each is a self-contained module)
-from pipeline.stage0_validate     import run as stage0
-from pipeline.stage1_parse        import run as stage1
-from pipeline.stage2_graph        import run as stage2
-from pipeline.stage3_embed        import run as stage3
-from pipeline.stage35_preflight   import run as stage35
-from pipeline.stage4_domain       import run as stage4
-from pipeline.stage45_flows       import run as stage45
-from pipeline.stage5_workers      import run as stage5
-from pipeline.stage6_qa           import run as stage6
-from pipeline.stage65_postprocess import run as stage65
+from pipeline.stage0_validate      import run as stage0
+from pipeline.stage1_parse         import run as stage1
+from pipeline.stage15_paths        import run as stage15
+from pipeline.stage2_graph         import run as stage2
+from pipeline.stage3_embed         import run as stage3
+from pipeline.stage35_preflight    import run as stage35
+from pipeline.stage4_domain        import run as stage4
+from pipeline.stage45_flows        import run as stage45
+from pipeline.stage5_workers       import run as stage5
+from pipeline.stage6_qa            import run as stage6
+from pipeline.stage62_architecture import run as stage62
+from pipeline.stage65_postprocess  import run as stage65
+from pipeline.stage67_diagrams     import run as stage67
+from pipeline.stage7_pdf           import run as stage7
+from pipeline.stage8_tests         import run as stage8
+from pipeline.stage9_knowledge_graph import run as stage9
 
 
 # Stage registry — defines execution order
 STAGES: list[tuple[str, any]] = [
-    ("stage0_validate",     stage0),
-    ("stage1_parse",        stage1),
-    ("stage2_graph",        stage2),
-    ("stage3_embed",        stage3),
-    ("stage35_preflight",   stage35),
-    ("stage4_domain",       stage4),
-    ("stage45_flows",       stage45),
-    ("stage5_brd",          None),
-    ("stage5_srs",          None),
-    ("stage5_ac",           None),
-    ("stage5_userstories",  None),
-    ("stage6_qa",           stage6),
-    ("stage65_postprocess", stage65),
+    ("stage0_validate",      stage0),
+    ("stage1_parse",         stage1),
+    ("stage15_paths",        stage15),  # execution-path extraction (feeds stage45 + stage5)
+    ("stage2_graph",         stage2),
+    ("stage3_embed",         stage3),
+    ("stage35_preflight",    stage35),
+    ("stage4_domain",        stage4),
+    ("stage45_flows",        stage45),  # business flow extraction (feeds stage62 + stage67)
+    ("stage5_brd",           None),     # ← parallel group handled below
+    ("stage5_srs",           None),
+    ("stage5_ac",            None),
+    ("stage5_userstories",   None),
+    ("stage6_qa",            stage6),
+    ("stage62_architecture", stage62),  # architecture reconstruction (feeds stage65 + stage67)
+    ("stage65_postprocess",  stage65),
+    ("stage67_diagrams",     stage67),  # diagram generation (needs stage45 flows + stage62 arch)
+    ("stage7_pdf",           stage7),   # DOCX → PDF delivery bundle
+    ("stage8_tests",         stage8),   # test case generator (Gherkin + Playwright + pytest)
+    ("stage9_knowledge_graph", stage9), # system knowledge graph (cross-domain JSON)
 ]
 
 STAGE5_NAMES = {"stage5_brd", "stage5_srs", "stage5_ac", "stage5_userstories"}

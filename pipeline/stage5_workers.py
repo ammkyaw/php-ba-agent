@@ -169,7 +169,7 @@ def _run_brd_agent(domain: DomainModel, ctx: PipelineContext) -> str:
     rule_lines = "\n".join(
         f"  - {rule}"
         for f in domain.features
-        for rule in f.get("business_rules", [])
+        for rule in _to_str_list(f.get("business_rules", []))
     ) or "  - None explicitly defined"
 
     from pipeline.framework_hints import get_hints
@@ -196,8 +196,8 @@ User Roles:
 Features:
 {feature_lines}
 
-Entities: {", ".join(domain.key_entities)}
-Bounded Contexts: {", ".join(domain.bounded_contexts)}
+Entities: {", ".join(_to_str_list(domain.key_entities))}
+Bounded Contexts: {", ".join(_to_str_list(domain.bounded_contexts))}
 
 Business Rules:
 {rule_lines}
@@ -577,6 +577,33 @@ def _format_execution_paths_for_prompt(ctx: PipelineContext) -> str:
     return "\n".join(lines)
 
 
+def _to_str_list(items: list) -> list[str]:
+    """
+    Coerce a list that may contain dicts (LLM over-structured output) to list[str].
+
+    Stage 4's LLM sometimes returns lists of dicts instead of lists of plain
+    strings — e.g. business_rules as [{"rule": "...", "severity": "high"}]
+    instead of ["..."].  Every join() in this module must go through this
+    helper to avoid TypeError: sequence item 0: expected str instance, dict found.
+
+    Coercion strategy:
+      str   → kept as-is
+      dict  → use the first string value found, falling back to str(dict)
+      other → str(item)
+    """
+    result = []
+    for item in items:
+        if isinstance(item, str):
+            result.append(item)
+        elif isinstance(item, dict):
+            # Pick the first string value; common keys: "rule", "step", "name", "text"
+            val = next((v for v in item.values() if isinstance(v, str)), None)
+            result.append(val if val is not None else str(item))
+        else:
+            result.append(str(item))
+    return result
+
+
 def _format_domain_for_prompt(domain: DomainModel) -> str:
     """
     Format DomainModel as structured prose for LLM consumption.
@@ -613,11 +640,11 @@ def _format_domain_for_prompt(domain: DomainModel) -> str:
         lines.append("  • none defined")
 
     # ── Key Entities ──────────────────────────────────────────────────────────
-    entities_str = ", ".join(domain.key_entities) if domain.key_entities else "none"
+    entities_str = ", ".join(_to_str_list(domain.key_entities)) if domain.key_entities else "none"
     lines.append(f"\nKEY ENTITIES: {entities_str}")
 
     # ── Bounded Contexts ──────────────────────────────────────────────────────
-    contexts_str = ", ".join(domain.bounded_contexts) if domain.bounded_contexts else "none"
+    contexts_str = ", ".join(_to_str_list(domain.bounded_contexts)) if domain.bounded_contexts else "none"
     lines.append(f"BOUNDED CONTEXTS: {contexts_str}")
 
     # ── Features ─────────────────────────────────────────────────────────────
@@ -625,9 +652,9 @@ def _format_domain_for_prompt(domain: DomainModel) -> str:
     for i, f in enumerate(domain.features, 1):
         name  = f.get("name", f"Feature {i}")
         desc  = f.get("description", "")
-        pages = ", ".join(f.get("pages", [])) or "none"
-        tbls  = ", ".join(f.get("tables", [])) or "none"
-        rules = f.get("business_rules", [])
+        pages = ", ".join(_to_str_list(f.get("pages", []))) or "none"
+        tbls  = ", ".join(_to_str_list(f.get("tables", []))) or "none"
+        rules = _to_str_list(f.get("business_rules", []))
         wfs   = f.get("workflows", [])
 
         lines.append(f"\n  [{i}] {name}")
@@ -640,7 +667,7 @@ def _format_domain_for_prompt(domain: DomainModel) -> str:
 
         for wf in wfs:
             wf_name  = wf.get("name", "workflow")
-            wf_steps = wf.get("steps", [])
+            wf_steps = _to_str_list(wf.get("steps", []))
             if wf_steps:
                 lines.append(f"       Flow ({wf_name}): {' → '.join(wf_steps)}")
 
@@ -649,7 +676,7 @@ def _format_domain_for_prompt(domain: DomainModel) -> str:
         lines.append(f"\nWORKFLOWS ({len(domain.workflows)} total):")
         for wf in domain.workflows:
             wf_name  = wf.get("name", "?")
-            wf_steps = wf.get("steps", [])
+            wf_steps = _to_str_list(wf.get("steps", []))
             step_str = " → ".join(wf_steps) if wf_steps else "no steps"
             lines.append(f"  • {wf_name}: {step_str}")
 

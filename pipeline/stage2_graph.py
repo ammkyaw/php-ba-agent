@@ -1432,12 +1432,20 @@ def _save_png(G: nx.DiGraph, path: str) -> None:
     ax.set_facecolor("#1A1A2E")
     fig.patch.set_facecolor("#1A1A2E")
 
-    # ── Node colours ──────────────────────────────────────────────────────────
+    # ── Restrict drawing to nodes that have a layout position ────────────────
+    # G.nodes() may contain phantom nodes (added implicitly as edge endpoints
+    # without an explicit G.add_node() call).  _shell_layout_by_type and the
+    # standard NetworkX layout functions only assign positions to nodes they
+    # discover via G.nodes() at the time of the call — but if any node was
+    # added to the graph *after* the layout ran, or if the layout silently
+    # skipped zero-degree nodes, pos will be missing those entries.
+    # Deriving every draw list from pos.keys() guarantees consistency.
+    drawable_nodes = [n for n in G.nodes() if n in pos]
     node_color_list = [
         NODE_COLORS.get(G.nodes[n].get("type", "unknown"), NODE_COLORS["unknown"])
-        for n in G.nodes()
+        for n in drawable_nodes
     ]
-    node_sizes = [_node_size(G, n) for n in G.nodes()]
+    node_sizes = [_node_size(G, n) for n in drawable_nodes]
 
     # ── Edge colours by type ──────────────────────────────────────────────────
     edge_color_map = {
@@ -1467,11 +1475,27 @@ def _save_png(G: nx.DiGraph, path: str) -> None:
         etype = data.get("edge_type", "unknown")
         edge_groups[etype].append((src, dst))
 
+    # Guard: filter out edges where either endpoint is missing from pos.
+    # NetworkX allows edges to reference nodes that were never formally added
+    # with G.add_node() — these phantom nodes have no layout coordinate and
+    # cause a KeyError inside draw_networkx_edges.  This is common in large
+    # Laravel/Symfony codebases where class-dependency edges reference fully-
+    # qualified class names that were never parsed as source files.
+    phantom_nodes = set(G.nodes()) - set(pos.keys())
+    if phantom_nodes:
+        print(f"  [stage2] PNG: skipping {len(phantom_nodes)} node(s) "
+              f"absent from layout (e.g. {next(iter(phantom_nodes))!r})")
+
     for etype, edge_list in edge_groups.items():
         color = edge_color_map.get(etype, "#555555")
+        # Drop any edge whose src or dst has no position
+        safe_edges = [(s, d) for s, d in edge_list
+                      if s in pos and d in pos]
+        if not safe_edges:
+            continue
         nx.draw_networkx_edges(
             G, pos,
-            edgelist   = edge_list,
+            edgelist   = safe_edges,
             edge_color = color,
             alpha      = 0.65,
             arrows     = True,
@@ -1484,6 +1508,7 @@ def _save_png(G: nx.DiGraph, path: str) -> None:
     # ── Nodes ─────────────────────────────────────────────────────────────────
     nx.draw_networkx_nodes(
         G, pos,
+        nodelist   = drawable_nodes,
         node_color = node_color_list,
         node_size  = node_sizes,
         alpha      = 0.92,
@@ -1491,7 +1516,7 @@ def _save_png(G: nx.DiGraph, path: str) -> None:
     )
 
     # ── Labels — shorten long node IDs ───────────────────────────────────────
-    labels = {n: _short_label(n) for n in G.nodes()}
+    labels = {n: _short_label(n) for n in drawable_nodes}
     nx.draw_networkx_labels(
         G, pos,
         labels      = labels,

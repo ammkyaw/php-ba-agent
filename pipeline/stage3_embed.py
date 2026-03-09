@@ -1228,17 +1228,34 @@ def _upsert_chunks(
     """
     Upsert all chunks into ChromaDB in batches.
     Returns total number of documents stored.
+
+    Deduplicates by ID before batching — ChromaDB raises DuplicateIDError if
+    any batch contains two entries with the same ID, even on upsert.  Dupes
+    can arise when multiple code-map entries produce identical text for the
+    same source file and chunk type.  Last-writer-wins (we keep the last seen
+    chunk for each ID so no content is silently dropped).
     """
+    # ── Deduplicate by ID (last-writer-wins) ──────────────────────────────────
+    seen: dict[str, dict] = {}
+    for chunk in chunks:
+        seen[chunk["id"]] = chunk
+    unique_chunks = list(seen.values())
+
+    n_dupes = len(chunks) - len(unique_chunks)
+    if n_dupes:
+        print(f"  [stage3] ⚠️  Deduplicated {n_dupes} chunk(s) with colliding IDs "
+              f"({len(unique_chunks)} unique chunks remain)")
+
     total = 0
-    for i in range(0, len(chunks), CHUNK_BATCH_SIZE):
-        batch = chunks[i : i + CHUNK_BATCH_SIZE]
+    for i in range(0, len(unique_chunks), CHUNK_BATCH_SIZE):
+        batch = unique_chunks[i : i + CHUNK_BATCH_SIZE]
         collection.upsert(
             ids        = [c["id"]       for c in batch],
             documents  = [c["text"]     for c in batch],
             metadatas  = [c["metadata"] for c in batch],
         )
         total += len(batch)
-        print(f"  [stage3] Upserted {total}/{len(chunks)} chunks ...", end="\r")
+        print(f"  [stage3] Upserted {total}/{len(unique_chunks)} chunks ...", end="\r")
 
     print()  # newline after progress
     return total
@@ -1293,8 +1310,12 @@ def _make_chunk(
     ID is derived from chunk_type + source_file + first 80 chars of text,
     so re-running the pipeline produces the same IDs (enabling upsert idempotency).
     """
-    # Stable ID: hash the type+file+text_prefix
-    id_seed  = f"{chunk_type}::{source_file}::{text[:80]}"
+    # Stable ID: hash type + file + full text.
+    # Using text[:80] caused collisions when multiple chunks of the same type
+    # came from the same file with identical openings (e.g. repeated SQL ops,
+    # form fields, or class summaries that all start with the same boilerplate).
+    # Hashing the full text guarantees uniqueness as long as content differs.
+    id_seed  = f"{chunk_type}::{source_file}::{text}"
     chunk_id = str(uuid.uuid5(uuid.NAMESPACE_DNS, id_seed))
 
     # Ensure all metadata values are strings (ChromaDB requirement)

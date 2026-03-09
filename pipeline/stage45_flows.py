@@ -68,13 +68,286 @@ MAX_DEPTH      = 8    # max hops from an entry-point node
 MAX_PATHS      = 40   # cap on candidate paths before dedup
 MAX_PATH_LEN   = 12   # max steps in a single flow
 
-# BFS edge types to follow (in priority order)
-FOLLOW_EDGES   = {"redirect", "handles", "entry_point", "calls", "defines"}
+# BFS edge types to follow — must match edge_type values written by stage2_graph.py
+# stage2 writes: "redirects_to", "submits_to", "handles", "entry_point",
+#                "calls", "defines", "includes"
+# NOTE: only navigation edges belong here. "includes" and "defines" are code-
+# structure edges (require/include, class→method) — following them pulls in
+# helper files like session.php, db.php that are not user-facing pages and
+# would appear as phantom participants in flow/sequence diagrams.
+FOLLOW_EDGES   = {"redirects_to", "submits_to", "handles", "entry_point",
+                  "calls",
+                  # Legacy alias kept for backward compat with older graph pickles
+                  "redirect"}
 # Edge types that represent a meaningful "user moves to next page" transition
-PAGE_EDGES     = {"redirect", "entry_point"}
+PAGE_EDGES     = {"redirects_to", "submits_to", "entry_point", "redirect"}
 
 # Minimum path length (in page-type nodes) to be worth reporting
 MIN_PAGE_STEPS = 2
+
+
+# ─── Flow Pattern Definitions ─────────────────────────────────────────────────
+#
+# Each FlowPattern is a named template that Stage 4.5 Pass F.5 matches against
+# a flow skeleton algorithmically — no LLM call needed.  The match result is
+# passed to the LLM in Pass G so it can name, describe, and set the actor /
+# termination more accurately.
+#
+# Detection signals used (all available on skeleton + FlowStep objects):
+#   files         — list of PHP filenames/stems in the flow
+#   inputs        — all form field names across all steps
+#   db_ops        — all SQL fragments across all steps
+#   http_methods  — set of HTTP verbs used
+#   auth_steps    — count of steps with auth_required=True
+#   step_count    — total number of steps
+#   outputs       — all session keys + redirect targets
+#
+# Scoring: each matched rule scores +1.  A pattern is "matched" when its score
+# reaches or exceeds its threshold.  The highest-scoring pattern wins.
+# Ties are broken by pattern priority (lower index in _PATTERNS wins).
+
+from dataclasses import dataclass as _dc, field as _field
+from typing import Callable as _Callable
+
+@_dc
+class FlowPattern:
+    """
+    Named business flow template used for algorithmic pattern matching.
+
+    Attributes:
+        name        Human-readable pattern name, e.g. "Login Flow"
+        description Short phrase describing the pattern for the LLM prompt
+        rules       List of (signal_name, callable) — each callable receives
+                    the pre-computed signal dict and returns True/False
+        threshold   Minimum number of rules that must match to classify
+        actor_hint  Suggested actor override (None = keep LLM inference)
+        term_hint   Suggested termination phrase template (None = keep LLM)
+    """
+    name:        str
+    description: str
+    rules:       list[tuple[str, _Callable[[dict], bool]]]
+    threshold:   int
+    actor_hint:  str | None = None
+    term_hint:   str | None = None
+
+
+# Helper predicates — keep lambdas readable
+def _any_file(*kws):
+    """Return True if any file stem contains any of the given keywords."""
+    return lambda s: any(
+        kw in stem
+        for stem in s["file_stems"]
+        for kw in kws
+    )
+
+def _any_input(*kws):
+    """Return True if any input field name contains any keyword."""
+    return lambda s: any(kw in inp.lower() for inp in s["inputs"] for kw in kws)
+
+def _any_db(*kws):
+    """Return True if any db_op fragment contains any keyword."""
+    return lambda s: any(kw in op.lower() for op in s["db_ops"] for kw in kws)
+
+def _has_method(method: str):
+    return lambda s: method.upper() in s["http_methods"]
+
+def _step_count_gte(n: int):
+    return lambda s: s["step_count"] >= n
+
+def _auth_steps_gte(n: int):
+    return lambda s: s["auth_steps"] >= n
+
+def _any_output(*kws):
+    return lambda s: any(kw in out.lower() for out in s["outputs"] for kw in kws)
+
+def _any_session_write(*kws):
+    return lambda s: any(
+        kw in out.lower()
+        for out in s["outputs"]
+        if out.startswith("$_SESSION")
+        for kw in kws
+    )
+
+
+# Registry — ordered by priority (first match wins on equal score)
+_PATTERNS: list[FlowPattern] = [
+
+    FlowPattern(
+        name        = "Login Flow",
+        description = "User authentication: credential entry, validation, session creation",
+        rules       = [
+            ("login/signin filename",    _any_file("login", "signin", "sign_in", "auth")),
+            ("password input field",     _any_input("password", "passwd")),
+            ("username/email input",     _any_input("username", "email", "user")),
+            ("POST method used",         _has_method("POST")),
+            ("session write on success", _any_session_write("user", "id", "role", "logged")),
+            ("redirect after login",     _any_output("→ ")),
+        ],
+        threshold   = 3,
+        actor_hint  = None,   # LLM infers (could be Guest or any role)
+        term_hint   = "User is authenticated and redirected to the application",
+    ),
+
+    FlowPattern(
+        name        = "Registration Flow",
+        description = "New user account creation: form submission, validation, account persistence",
+        rules       = [
+            ("register/signup filename", _any_file("register", "signup", "sign_up",
+                                                    "create_account", "newuser", "new_user")),
+            ("email input field",        _any_input("email")),
+            ("password input field",     _any_input("password", "passwd")),
+            ("INSERT db operation",      _any_db("insert")),
+            ("POST method used",         _has_method("POST")),
+        ],
+        threshold   = 3,
+        actor_hint  = "New User",
+        term_hint   = "New user account is created and user is redirected",
+    ),
+
+    FlowPattern(
+        name        = "Password Reset Flow",
+        description = "Forgotten password recovery via email token or security question",
+        rules       = [
+            ("reset/forgot filename",    _any_file("reset", "forgot", "recover",
+                                                    "change_password", "changepass")),
+            ("email or token input",     _any_input("email", "token", "code")),
+            ("password input field",     _any_input("password", "passwd", "newpass")),
+            ("UPDATE db operation",      _any_db("update")),
+        ],
+        threshold   = 2,
+        term_hint   = "User password is updated and user can log in with new credentials",
+    ),
+
+    FlowPattern(
+        name        = "Checkout Flow",
+        description = "E-commerce or booking purchase: cart review, payment entry, order creation",
+        rules       = [
+            ("cart/checkout filename",   _any_file("cart", "checkout", "payment",
+                                                    "order", "purchase", "pay")),
+            ("multi-step (3+ pages)",    _step_count_gte(3)),
+            ("INSERT order db op",       _any_db("insert")),
+            ("payment/total input",      _any_input("total", "amount", "price",
+                                                     "payment", "card")),
+            ("POST method",              _has_method("POST")),
+        ],
+        threshold   = 3,
+        term_hint   = "Order is confirmed and user receives confirmation",
+    ),
+
+    FlowPattern(
+        name        = "Approval Flow",
+        description = "Request review and decision: submission, manager review, approve/reject",
+        rules       = [
+            ("approve/review filename",  _any_file("approv", "review", "reject",
+                                                    "confirm", "authoris", "authorize")),
+            ("status input or db op",    _any_input("status", "decision", "action")),
+            ("UPDATE status db op",      _any_db("update")),
+            ("auth required throughout", _auth_steps_gte(2)),
+            ("POST method",              _has_method("POST")),
+        ],
+        threshold   = 3,
+        term_hint   = "Request is approved or rejected and requester is notified",
+    ),
+
+    FlowPattern(
+        name        = "CRUD Flow",
+        description = "Standard create/read/update/delete data management for an entity",
+        rules       = [
+            ("list/add/edit/delete filename", _any_file("list", "add", "edit", "delete",
+                                                         "manage", "index", "view")),
+            ("write db operation",       _any_db("insert", "update", "delete")),
+            ("read db operation",        _any_db("select")),
+            ("form inputs present",      lambda s: len(s["inputs"]) >= 2),
+            ("GET and POST both used",   lambda s: {"GET", "POST"}.issubset(s["http_methods"])),
+        ],
+        threshold   = 3,
+        term_hint   = "Data record is created, updated, or deleted successfully",
+    ),
+
+    FlowPattern(
+        name        = "Multi-step Wizard",
+        description = "Sequential multi-page form where each step collects different data",
+        rules       = [
+            ("step/wizard/form filename", _any_file("step", "wizard", "form",
+                                                     "page", "stage")),
+            ("4+ steps in flow",          _step_count_gte(4)),
+            ("inputs on multiple steps",  lambda s: s["steps_with_inputs"] >= 3),
+            ("POST method",               _has_method("POST")),
+            ("session or redirect chain", lambda s: len(s["outputs"]) >= 3),
+        ],
+        threshold   = 3,
+        term_hint   = "All wizard steps are completed and final submission is processed",
+    ),
+
+    FlowPattern(
+        name        = "Search / Filter Flow",
+        description = "Query-driven list retrieval: search form, filter params, results display",
+        rules       = [
+            ("search/filter/list filename", _any_file("search", "filter", "find",
+                                                       "list", "browse", "results")),
+            ("SELECT db operation",          _any_db("select")),
+            ("GET method used",              _has_method("GET")),
+            ("search/query input",           _any_input("search", "query", "q",
+                                                         "keyword", "filter")),
+            ("no INSERT/UPDATE/DELETE",      lambda s: not any(
+                kw in op.lower() for op in s["db_ops"]
+                for kw in ("insert", "update", "delete")
+            )),
+        ],
+        threshold   = 3,
+        term_hint   = "Matching records are displayed to the user",
+    ),
+
+    FlowPattern(
+        name        = "File Upload Flow",
+        description = "Binary file or document upload: selection, validation, storage",
+        rules       = [
+            ("upload/import filename",  _any_file("upload", "import", "attach",
+                                                   "file", "document")),
+            ("file input field",        _any_input("file", "attachment", "upload",
+                                                    "document", "image")),
+            ("POST method",             _has_method("POST")),
+            ("INSERT db operation",     _any_db("insert")),
+        ],
+        threshold   = 2,
+        term_hint   = "File is uploaded and stored; metadata is persisted",
+    ),
+
+    FlowPattern(
+        name        = "Report / Export Flow",
+        description = "Data aggregation and export: parameter selection, query, download",
+        rules       = [
+            ("report/export filename",  _any_file("report", "export", "download",
+                                                   "print", "generate", "summary")),
+            ("SELECT db operation",     _any_db("select")),
+            ("GET method",              _has_method("GET")),
+            ("no form writes",          lambda s: not any(
+                kw in op.lower() for op in s["db_ops"]
+                for kw in ("insert", "update", "delete")
+            )),
+        ],
+        threshold   = 2,
+        term_hint   = "Report data is retrieved and presented or downloaded",
+    ),
+
+    FlowPattern(
+        name        = "Logout Flow",
+        description = "Session termination: session destruction and redirect to public page",
+        rules       = [
+            ("logout/signout filename", _any_file("logout", "signout", "sign_out",
+                                                   "logoff", "log_out")),
+            ("session destroy output",  lambda s: any(
+                "session" in o.lower() or "destroy" in o.lower()
+                for o in s["outputs"]
+            )),
+        ],
+        threshold   = 1,
+        term_hint   = "User session is destroyed and user is redirected to the login page",
+    ),
+]
+
+# Pattern name → FlowPattern for fast lookup
+_PATTERN_BY_NAME: dict[str, FlowPattern] = {p.name: p for p in _PATTERNS}
 
 
 # ─── Public Entry Point ────────────────────────────────────────────────────────
@@ -114,6 +387,18 @@ def run(ctx: PipelineContext) -> None:
 
     print("  [stage45] Pass F: Grouping by bounded context ...")
     context_groups = _group_by_context(flow_skeletons, ctx)
+
+    print(f"  [stage45] Pass F.5: Flow pattern mining ...")
+    patterns_found = _classify_patterns(flow_skeletons)
+    pattern_counts: dict[str, int] = {}
+    for p in patterns_found:
+        if p:
+            pattern_counts[p] = pattern_counts.get(p, 0) + 1
+    if pattern_counts:
+        for pname, cnt in sorted(pattern_counts.items(), key=lambda x: -x[1]):
+            print(f"  [stage45]   {pname}: {cnt} flow(s)")
+    else:
+        print(f"  [stage45]   No patterns matched (will rely on LLM naming)")
 
     print(f"  [stage45] Pass G–H: LLM enrichment "
           f"({len(context_groups)} context group(s)) ...")
@@ -170,22 +455,76 @@ def _traverse_graph(G, ctx: PipelineContext) -> list[list[str]]:
     Pass C: Deduplicate — keep the longest path for each unique file sequence.
 
     Returns a list of node-ID paths (each path is a list[str]).
+
+    Entry-point discovery (three tiers, most-specific first):
+      Tier 1 — index: http_endpoints + entry_points + routes  (framework apps)
+      Tier 2 — node attr: any node with is_entry_point=True or type=http_endpoint
+      Tier 3 — raw PHP fallback: page/script nodes that have at least one
+               outgoing edge in FOLLOW_EDGES (redirects_to, submits_to, handles).
+               These are interactive files that redirect/submit to other pages,
+               which is the defining characteristic of a flow entry-point in a
+               raw PHP app with no framework routing.
     """
     import networkx as nx
 
-    # Use the graph index built by Stage 2 Pass 14 when available
+    # ── Tier 1: use the index built by Stage 2 Pass 14 ────────────────────────
     idx = G.graph.get("index", {})
     entry_nodes: list[str] = list({
         *idx.get("http_endpoints", []),
         *idx.get("entry_points", []),
-        # Also include route nodes so framework-routed apps are covered
         *idx.get("routes", []),
     })
 
+    # ── Tier 2: node attribute scan ───────────────────────────────────────────
     if not entry_nodes:
-        # Fallback: any node tagged is_entry_point
         entry_nodes = [n for n, d in G.nodes(data=True)
                        if d.get("is_entry_point") or d.get("type") == "http_endpoint"]
+
+    # ── Tier 3: raw PHP fallback — page/script nodes with outbound navigation edges
+    if not entry_nodes:
+        _page_types = {"page", "script"}
+        _flow_edges = {"redirects_to", "submits_to", "handles", "redirect"}
+        entry_nodes = [
+            n for n, d in G.nodes(data=True)
+            if d.get("type") in _page_types
+            and any(
+                G.edges[n, dst].get("edge_type", "") in _flow_edges
+                for dst in G.successors(n)
+            )
+        ]
+        if entry_nodes:
+            print(f"  [stage45]   Tier-3 fallback: using {len(entry_nodes)} "
+                  f"page/script nodes as flow entry-points (raw PHP project)")
+
+    # ── REDIRECT: node → target page resolution map ───────────────────────────
+    # Stage 2 creates  page_node --[redirects_to]--> REDIRECT:target.php
+    # but never adds a second edge from REDIRECT:target.php back to the actual
+    # target page node.  We build this lookup once so the BFS can hop through
+    # REDIRECT: nodes to reach their target page file node.
+    #
+    # Strategy: match REDIRECT:<name> against every page/script node whose
+    # filename matches the redirect target basename.
+    _redirect_target: dict[str, str] = {}   # REDIRECT:x → page_node_id
+    _page_nodes_by_file: dict[str, str] = {}  # filename (lower, no ext) → node_id
+    for _nid, _d in G.nodes(data=True):
+        if _d.get("type") in ("page", "script"):
+            _stem = Path(_d.get("file", _nid)).name.lower()
+            _page_nodes_by_file[_stem] = _nid
+            # also index without extension for loose matching
+            _page_nodes_by_file[Path(_stem).stem] = _nid
+
+    for _nid, _d in G.nodes(data=True):
+        if _d.get("type") == "redirect":
+            _target_url = _d.get("url", _d.get("name", ""))
+            # Extract filename from URL: "login.php", "dashboard.php", "../login.php"
+            _target_file = Path(_target_url).name.lower()
+            _target_stem = Path(_target_file).stem
+            _resolved = (
+                _page_nodes_by_file.get(_target_file) or
+                _page_nodes_by_file.get(_target_stem)
+            )
+            if _resolved:
+                _redirect_target[_nid] = _resolved
 
     candidate_paths: list[list[str]] = []
 
@@ -212,6 +551,22 @@ def _traverse_graph(G, ctx: PipelineContext) -> list[list[str]]:
                 # Skip EXTCALL nodes — they're not pages
                 if str(dst).startswith("EXTCALL:"):
                     continue
+
+                # ── REDIRECT: pass-through ────────────────────────────────────
+                # If dst is a REDIRECT: node, replace it with the actual target
+                # page node so the BFS continues through to real PHP files.
+                # Include the REDIRECT: node in the path so _file_fingerprint
+                # can still see it (it will skip it because it has no "file").
+                if str(dst).startswith("REDIRECT:"):
+                    visited_from_start.add(dst)
+                    resolved_page = _redirect_target.get(dst)
+                    if resolved_page and resolved_page not in visited_from_start:
+                        visited_from_start.add(resolved_page)
+                        queue.append(path + [dst, resolved_page])
+                        extended = True
+                    # If unresolvable, still record path so far (dead-end branch)
+                    continue
+
                 visited_from_start.add(dst)
                 queue.append(path + [dst])
                 extended = True
@@ -221,9 +576,12 @@ def _traverse_graph(G, ctx: PipelineContext) -> list[list[str]]:
 
     # Pass C: deduplicate by file sequence fingerprint — keep longest per fingerprint
     def _file_fingerprint(path: list[str]) -> tuple[str, ...]:
-        """Collapse a node-ID path to the sequence of distinct PHP files it touches."""
+        """Collapse a node-ID path to the sequence of distinct PHP files it touches.
+        REDIRECT: intermediate nodes are skipped — they carry no file attribute."""
         seen: list[str] = []
         for n in path:
+            if str(n).startswith("REDIRECT:"):
+                continue   # pass-through node — no file to record
             ndata = G.nodes[n]
             f = ndata.get("file", "")
             if f and (not seen or seen[-1] != f):
@@ -494,6 +852,94 @@ def _group_by_context(
     return dict(groups_kw)
 
 
+# ─── Pass F.5: Flow Pattern Mining ───────────────────────────────────────────
+
+def _classify_patterns(
+    skeletons: list[dict[str, Any]],
+) -> list[str | None]:
+    """
+    Pass F.5 — Algorithmic pattern mining.  No LLM required.
+
+    For each skeleton, extract a signal dict from its files, steps, inputs,
+    db_ops and HTTP methods, then score it against every entry in _PATTERNS.
+    Returns a list (parallel to skeletons) of matched pattern names or None.
+
+    The result is attached to each skeleton as skeleton["pattern"] and is
+    passed to the LLM in Pass G so it can use the pattern as a naming hint.
+
+    Signal dict schema
+    ------------------
+    file_stems        : list[str]   — lowercased stem of each PHP file
+    inputs            : list[str]   — all input field names across all steps
+    db_ops            : list[str]   — all db_op strings across all steps
+    http_methods      : set[str]    — distinct HTTP verbs seen
+    auth_steps        : int         — number of steps with auth_required=True
+    step_count        : int         — total number of steps
+    outputs           : list[str]   — all output strings across all steps
+    steps_with_inputs : int         — number of steps that have at least one input
+    """
+    results: list[str | None] = []
+
+    for sk in skeletons:
+        signals = _extract_signals(sk)
+        best_name:  str | None = None
+        best_score: int        = 0
+
+        for pattern in _PATTERNS:
+            score = sum(
+                1 for _rule_name, rule_fn in pattern.rules
+                if rule_fn(signals)
+            )
+            if score >= pattern.threshold and score > best_score:
+                best_score = score
+                best_name  = pattern.name
+
+        sk["pattern"]       = best_name
+        sk["pattern_score"] = best_score
+        results.append(best_name)
+
+    return results
+
+
+def _extract_signals(sk: dict[str, Any]) -> dict[str, Any]:
+    """Build the signal dict used by FlowPattern rule functions."""
+    steps: list[FlowStep] = sk.get("steps", [])
+
+    all_inputs:  list[str] = []
+    all_db_ops:  list[str] = []
+    all_outputs: list[str] = []
+    http_methods: set[str] = set()
+    auth_steps  = 0
+    steps_with_inputs = 0
+
+    for step in steps:
+        all_inputs.extend(step.inputs or [])
+        all_db_ops.extend(step.db_ops or [])
+        all_outputs.extend(step.outputs or [])
+        if step.http_method:
+            http_methods.add(step.http_method.upper())
+        if step.auth_required:
+            auth_steps += 1
+        if step.inputs:
+            steps_with_inputs += 1
+
+    file_stems = [
+        Path(f).stem.lower().replace("-", "_")
+        for f in sk.get("files", [])
+    ]
+
+    return {
+        "file_stems":        file_stems,
+        "inputs":            [i.lower() for i in all_inputs],
+        "db_ops":            all_db_ops,
+        "http_methods":      http_methods,
+        "auth_steps":        auth_steps,
+        "step_count":        len(steps),
+        "outputs":           all_outputs,
+        "steps_with_inputs": steps_with_inputs,
+    }
+
+
 # ─── Pass G–H: LLM Enrichment ─────────────────────────────────────────────────
 
 def _enrich_with_llm(
@@ -534,17 +980,40 @@ def _enrich_with_llm(
             flow_id = f"flow_{flow_counter:03d}"
             flow_counter += 1
 
+            # Pattern hint: if LLM didn't supply a termination, fall back to
+            # the pattern's term_hint before the generic _infer_termination()
+            pattern      = sk.get("pattern")
+            pattern_obj  = _PATTERN_BY_NAME.get(pattern) if pattern else None
+            termination  = (
+                enr.get("termination")
+                or (pattern_obj.term_hint if pattern_obj else None)
+                or _infer_termination(sk)
+            )
+            # Actor: pattern actor_hint overrides inferred actor only when LLM
+            # didn't supply one (preserves LLM judgement when available)
+            actor = (
+                enr.get("actor")
+                or (pattern_obj.actor_hint if pattern_obj else None)
+                or _infer_actor(sk, domain)
+            )
+            # Pattern match adds a small confidence bonus (already partially
+            # rewarded by LLM success via _final_confidence)
+            pattern_bonus = 0.05 if (pattern and not enr) else 0.0
+
             flows.append(BusinessFlow(
                 flow_id          = flow_id,
                 name             = enr.get("name") or _fallback_name(sk),
-                actor            = enr.get("actor") or _infer_actor(sk, domain),
+                actor            = actor,
                 bounded_context  = context_name,
                 trigger          = enr.get("trigger") or _infer_trigger(sk),
                 steps            = sk["steps"],
                 branches         = sk["branches"],
-                termination      = enr.get("termination") or _infer_termination(sk),
+                termination      = termination,
                 evidence_files   = sk["evidence_files"],
-                confidence       = _final_confidence(sk["raw_confidence"], bool(enr)),
+                confidence       = _final_confidence(
+                                       sk["raw_confidence"] + pattern_bonus,
+                                       bool(enr),
+                                   ),
                 replaces_workflow= enr.get("replaces_workflow"),
             ))
 
@@ -583,6 +1052,14 @@ def _build_llm_user_prompt(
 
     for i, sk in enumerate(skeletons):
         parts.append(f"\nSkeleton {i+1}:")
+        # Include pattern hint if mining found a match — helps LLM name accurately
+        pattern = sk.get("pattern")
+        if pattern:
+            pattern_obj = _PATTERN_BY_NAME.get(pattern)
+            desc = pattern_obj.description if pattern_obj else ""
+            parts.append(f"  Pattern match: {pattern}" + (f" — {desc}" if desc else ""))
+            if pattern_obj and pattern_obj.term_hint:
+                parts.append(f"  Suggested termination: {pattern_obj.term_hint}")
         parts.append(f"  Files visited: {' → '.join(Path(f).name for f in sk['files'])}")
         for step in sk["steps"]:
             auth_tag = " [AUTH]" if step.auth_required else ""
