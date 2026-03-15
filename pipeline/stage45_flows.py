@@ -692,20 +692,43 @@ def _traverse_graph(G, ctx: PipelineContext) -> list[list[str]]:
                        if d.get("is_entry_point") or d.get("type") == "http_endpoint"]
 
     # ── Tier 3: raw PHP fallback — page/script nodes with outbound navigation edges
-    if not entry_nodes:
+    #
+    # Runs when:
+    #   (a) no entry nodes found at all (original condition), OR
+    #   (b) Tier-1/2 found nodes but NONE of them have real navigation edges
+    #       (redirects_to / submits_to / handles / redirect).
+    #
+    # Case (b) covers projects like SugarCRM / raw PHP apps where stage2 indexes
+    # controller-method EP: nodes and ROUTE: nodes that have zero outgoing edges,
+    # causing BFS to produce 0 valid paths even though 300+ page nodes with
+    # redirects_to edges exist in the graph.
+    #
+    # When Tier-3 triggers in case (b), its nav-page nodes are MERGED with the
+    # existing entry_nodes so framework-level EP: paths are still explored.
+    _NAV_EDGES = {"redirects_to", "submits_to", "handles", "redirect"}
+    _tier_has_nav = entry_nodes and any(
+        any(G.edges[n, dst].get("edge_type", "") in _NAV_EDGES
+            for dst in G.successors(n))
+        for n in entry_nodes
+        if n in G
+    )
+    if not entry_nodes or not _tier_has_nav:
         _page_types = {"page", "script"}
-        _flow_edges = {"redirects_to", "submits_to", "handles", "redirect"}
-        entry_nodes = [
+        _nav_pages = [
             n for n, d in G.nodes(data=True)
             if d.get("type") in _page_types
             and any(
-                G.edges[n, dst].get("edge_type", "") in _flow_edges
+                G.edges[n, dst].get("edge_type", "") in _NAV_EDGES
                 for dst in G.successors(n)
             )
         ]
-        if entry_nodes:
-            print(f"  [stage45]   Tier-3 fallback: using {len(entry_nodes)} "
-                  f"page/script nodes as flow entry-points (raw PHP project)")
+        if _nav_pages:
+            _prev = len(entry_nodes)
+            entry_nodes = list({*entry_nodes, *_nav_pages})
+            added = len(entry_nodes) - _prev
+            label = "as only entry-points" if _prev == 0 else f"+{added} to existing {_prev}"
+            print(f"  [stage45]   Tier-3: {len(_nav_pages)} page/script nav nodes "
+                  f"({label}) — raw PHP project fallback")
 
     # ── REDIRECT: node → target page resolution map ───────────────────────────
     # Stage 2 creates  page_node --[redirects_to]--> REDIRECT:target.php
