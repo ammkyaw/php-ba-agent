@@ -1005,7 +1005,10 @@ def _group_by_context(
     if file_to_module:
         # Assign each skeleton to its plurality module
         groups: dict[str, list[int]] = defaultdict(list)
-        _domain_contexts = set(ctx.domain_model.bounded_contexts or [])
+        _raw_contexts = ctx.domain_model.bounded_contexts or []
+        _domain_contexts = set(
+            c["name"] if isinstance(c, dict) else c for c in _raw_contexts
+        )
 
         for i, sk in enumerate(skeletons):
             mod_counts: _Counter = _Counter()
@@ -1026,7 +1029,8 @@ def _group_by_context(
                 best = mod_counts.most_common(1)[0][0]
             else:
                 # No file matched any module — use the first domain context
-                best = (ctx.domain_model.bounded_contexts or ["General"])[0]
+                _first = (_raw_contexts or [{"name": "General"}])[0]
+                best = _first["name"] if isinstance(_first, dict) else _first
 
             # If domain_model already has a matching context name, preserve it
             # (handles case where Stage 4 renamed a module slightly)

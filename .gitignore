@@ -214,3 +214,4 @@ pipeline/__pycache__/
 
 composer.*
 .continue
+vendor
