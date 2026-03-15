@@ -42,7 +42,7 @@ from context import CodeMap, Framework, PipelineContext
 PHP_BIN: str = os.environ.get("PHPBA_PHP_BIN", "php")
 
 # Override with PHPBA_PARSER_SCRIPT=/absolute/path/to/parse_project.php
-_DEFAULT_SCRIPT = Path(__file__).parent.parent / "parse_project.php"
+_DEFAULT_SCRIPT = Path(__file__).parent.parent / "parsers" / "parse_project.php"
 PARSER_SCRIPT: str = os.environ.get("PHPBA_PARSER_SCRIPT", str(_DEFAULT_SCRIPT))
 
 # Subprocess timeout in seconds (large projects can take a while)

@@ -79,8 +79,8 @@ def run(ctx: PipelineContext) -> None:
         anthropic.APIError: On LLM API failures (propagated to pipeline).
         ValueError: If the LLM response cannot be parsed as valid JSON.
     """
-    json_path = Path(ctx.output_dir) / "architecture.json"
-    md_path   = Path(ctx.output_dir) / "architecture.md"
+    json_path = Path(ctx.output_path("architecture.json"))
+    md_path   = Path(ctx.output_path("architecture.md"))
 
     # ── Resumability check ──────────────────────────────────────────────────
     if (
