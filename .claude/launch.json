@@ -1,0 +1,23 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "Ollama (local LLM)",
+      "runtimeExecutable": "ollama",
+      "runtimeArgs": ["serve"],
+      "port": 11434
+    },
+    {
+      "name": "Neo4j (graph DB)",
+      "runtimeExecutable": "docker",
+      "runtimeArgs": [
+        "run", "-d", "--name", "neo4j",
+        "-p", "7474:7474",
+        "-p", "7687:7687",
+        "-e", "NEO4J_AUTH=neo4j/your-password",
+        "neo4j:5"
+      ],
+      "port": 7474
+    }
+  ]
+}

@@ -239,8 +239,9 @@ def _load_graph(ctx: PipelineContext) -> Any | None:
                     return pickle.load(fh)
             except Exception:
                 pass
-    # Fallback: search for gpickle in output_dir
-    for candidate in Path(ctx.output_dir).glob("*.gpickle"):
+    # Fallback: search for gpickle in the graph stage subdir
+    graph_dir = Path(ctx.output_path("code_graph.gpickle")).parent
+    for candidate in graph_dir.glob("*.gpickle"):
         try:
             with open(candidate, "rb") as fh:
                 return pickle.load(fh)
@@ -263,8 +264,8 @@ def _load_architecture_json(ctx: PipelineContext) -> dict[str, Any] | None:
     if ctx.architecture_meta and ctx.architecture_meta.json_path:
         candidates.append(Path(ctx.architecture_meta.json_path))
 
-    # Fallback: well-known location
-    candidates.append(Path(ctx.output_dir) / "architecture.json")
+    # Fallback: well-known location (routed via output_path)
+    candidates.append(Path(ctx.output_path("architecture.json")))
 
     for path in candidates:
         if path.exists():
