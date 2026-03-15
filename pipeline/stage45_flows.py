@@ -377,12 +377,27 @@ def run(ctx: PipelineContext) -> None:
     print("  [stage45] Loading knowledge graph ...")
     G = _load_graph(ctx)
 
+    # ── Tier-0: Laravel route-based flows ────────────────────────────────────────
+    # For Laravel projects, build flows directly from route→controller data
+    # BEFORE the generic graph BFS — produces multi-step flows with real
+    # inputs/db_ops/confidence rather than 2-step conf=0.20 stubs.
+    from context import Framework as _Framework
+    laravel_skeletons: list[dict] = []
+    if ctx.code_map and ctx.code_map.framework == _Framework.LARAVEL:
+        laravel_skeletons = _traverse_laravel_routes(G, ctx)
+        if laravel_skeletons:
+            print(f"  [stage45]   Tier-0 Laravel: "
+                  f"{len(laravel_skeletons)} route-based skeleton(s)")
+
     print("  [stage45] Pass A–C: Graph traversal + path deduplication ...")
     raw_paths = _traverse_graph(G, ctx)
     print(f"  [stage45]   {len(raw_paths)} candidate path(s) found")
 
+    # Laravel skeletons first (higher quality); graph paths fill the rest
+    all_raw: list = laravel_skeletons + raw_paths
+
     print("  [stage45] Pass D–E: Stitching execution_paths onto graph paths ...")
-    flow_skeletons = _stitch_execution_paths(raw_paths, ctx, G)
+    flow_skeletons = _stitch_execution_paths(all_raw, ctx, G)
     print(f"  [stage45]   {len(flow_skeletons)} flow skeleton(s) built")
 
     print("  [stage45] Pass F: Grouping by bounded context ...")
@@ -438,6 +453,202 @@ def _assert_prerequisites(ctx: PipelineContext) -> None:
         raise RuntimeError(
             f"[stage45] Graph file not found: {gpickle} — run Stage 2 first."
         )
+
+
+
+# --- Tier-0: Laravel Route-Based Flow Traversal ---
+
+def _traverse_laravel_routes(G, ctx) -> list:
+    """
+    Build multi-step flow skeletons from Laravel route->controller data.
+    Called as Tier-0 BEFORE the generic graph BFS in _traverse_graph().
+    Produces 3-step flows: route_entry -> controller_action -> model_operation.
+    Results are pre-built dicts passed through _stitch_execution_paths unchanged.
+    """
+    from collections import defaultdict
+    from context import FlowStep
+
+    if not ctx.code_map or not ctx.code_map.routes:
+        return []
+
+    # Index Stage 1.5 execution_paths by file and by controller stem name
+    ep_by_ctrl_name: dict = {}
+    exec_paths = getattr(ctx.code_map, "execution_paths", None) or []
+    for ep in exec_paths:
+        fname = ep.get("file", "")
+        if ep.get("type") == "controller" and fname:
+            stem = Path(fname).stem
+            ep_by_ctrl_name[stem] = ep
+
+    # Group routes by controller short name.
+    # Actual route schema: {method, path, handler, file, line, source}
+    # handler examples:
+    #   "App\\Http\\Controllers\\V1\\Admin\\InvoicesController@index"
+    #   "(closure)"  <- skip these
+    ctrl_routes: dict = defaultdict(list)
+    for route in ctx.code_map.routes:
+        handler = route.get("handler", "") or ""
+        # Skip closures, group markers, and empty handlers
+        if not handler or handler in ("(closure)", "(group)", ""):
+            continue
+        # Parse "Namespace\\ClassName@method" -> short class name
+        if "@" in handler:
+            ctrl_fqn = handler.split("@")[0]
+        elif "::" in handler:
+            ctrl_fqn = handler.split("::")[0]
+        else:
+            ctrl_fqn = handler
+        ctrl_short = ctrl_fqn.split("\\")[-1].split("/")[-1]
+        if ctrl_short and ctrl_short != "(closure)":
+            ctrl_routes[ctrl_short].append(route)
+
+    skeletons = []
+
+    for ctrl_name, routes in ctrl_routes.items():
+        ctrl_ep = ep_by_ctrl_name.get(ctrl_name, {})
+        ctrl_flows_by_method: dict = {}
+        for cf in ctrl_ep.get("controller_flows", []):
+            ctrl_flows_by_method[cf.get("method", "")] = cf
+
+        for route in routes:
+            # Use actual Stage 1 field names: method / path / handler
+            http_verb   = (route.get("method") or "GET").upper()
+            # Skip GROUP/middleware-only entries
+            if http_verb in ("GROUP", "MIDDLEWARE", "PREFIX"):
+                continue
+            uri         = route.get("path") or route.get("uri") or "?"
+            handler_str = route.get("handler", "")
+            method_name = (
+                handler_str.split("@")[-1] if "@" in handler_str
+                else handler_str.split("::")[-1] if "::" in handler_str
+                else "index"
+            )
+            middleware = route.get("middleware", [])
+            if isinstance(middleware, str):
+                middleware = [middleware]
+            auth_required = any(
+                mw in ("auth", "auth:sanctum", "auth:api", "verified")
+                for mw in middleware
+            )
+
+            cf               = ctrl_flows_by_method.get(method_name, {})
+            inputs           = cf.get("inputs", [])
+            validation_rules = cf.get("validation_rules", [])
+            db_ops           = cf.get("db_ops", [])
+            return_type      = cf.get("return_type", "unknown")
+            outputs          = cf.get("outputs", [])
+            auth_required    = auth_required or cf.get("auth_required", False)
+
+            db_op_strs = [
+                f"{op.get('operation','?')}:{op.get('model','?')}"
+                for op in (db_ops if isinstance(db_ops, list) else [])
+                if isinstance(op, dict)
+            ]
+
+            step1 = FlowStep(
+                step_num=1, page=uri, action=f"{http_verb} {uri}",
+                http_method=http_verb, auth_required=auth_required,
+                db_ops=[], inputs=[], outputs=[],
+            )
+            step2 = FlowStep(
+                step_num=2, page=f"{ctrl_name}::{method_name}",
+                action=(
+                    f"Validate [{', '.join(str(v) for v in validation_rules[:3])}]"
+                    if validation_rules else f"Process {method_name}"
+                ),
+                http_method=http_verb, auth_required=auth_required,
+                db_ops=db_op_strs,
+                inputs=[str(i) for i in inputs[:8]],
+                outputs=[str(o) for o in outputs[:4]],
+            )
+            steps = [step1, step2]
+
+            # Build step 3 from db_ops — handles both string and dict formats.
+            # String format (Stage 1.5 output): "Eloquent create: Customer"
+            # Dict format (hypothetical):       {"operation": "create", "model": "Customer"}
+            _step3_model = ""
+            _step3_action = ""
+            if db_ops and isinstance(db_ops, list):
+                _first = db_ops[0]
+                if isinstance(_first, dict):
+                    _step3_model  = _first.get("model", "?")
+                    _step3_action = f"Eloquent {_first.get('operation', '?')}"  
+                elif isinstance(_first, str) and _first.strip():
+                    # Parse "Eloquent create: Customer" or "Eloquent where: Invoice"
+                    _parts = _first.replace("Eloquent", "").strip().split(":")
+                    _step3_action = f"Eloquent {_parts[0].strip()}" if _parts else _first
+                    _step3_model  = _parts[1].strip() if len(_parts) > 1 else _first
+            if _step3_model or _step3_action:
+                step3 = FlowStep(
+                    step_num=3, page=_step3_model or "Model",
+                    action=_step3_action or f"Eloquent op on {_step3_model}",
+                    http_method=None, auth_required=False,
+                    db_ops=db_op_strs, inputs=[],
+                    outputs=[str(o) for o in outputs[:4]],
+                )
+                steps.append(step3)
+
+            confidence = _laravel_route_confidence(
+                has_controller_ep=bool(ctrl_ep),
+                has_inputs=bool(inputs),
+                has_db_ops=bool(db_ops),
+                has_validation=bool(validation_rules),
+                has_middleware=bool(middleware),
+                step_count=len(steps),
+            )
+
+            skeletons.append({
+                "path_nodes":     [],
+                "files":          [ctrl_ep.get("file", f"{ctrl_name}.php")],
+                "steps":          steps,
+                "branches":       [],
+                "evidence_files": [ctrl_ep.get("file", "")] if ctrl_ep else [],
+                "raw_confidence": confidence,
+                "_laravel_meta": {
+                    "http_verb": http_verb, "uri": uri,
+                    "controller": ctrl_name, "method": method_name,
+                    "middleware": middleware, "inputs": inputs,
+                    "validation_rules": validation_rules,
+                    "db_ops": db_op_strs, "return_type": return_type,
+                },
+            })
+
+    return skeletons
+
+
+def _laravel_route_confidence(
+    has_controller_ep, has_inputs, has_db_ops,
+    has_validation, has_middleware, step_count,
+) -> float:
+    """Score a Laravel route skeleton 0.20-0.80 based on evidence quality."""
+    score = 0.20
+    if has_controller_ep: score += 0.15
+    if has_inputs:        score += 0.10
+    if has_db_ops:        score += 0.15
+    if has_validation:    score += 0.10
+    if has_middleware:    score += 0.05
+    if step_count >= 3:   score += 0.05
+    return round(min(0.80, score), 2)
+
+
+def _build_laravel_flow_skeleton(sk: dict) -> str:
+    """Render a Tier-0 skeleton as a description for LLM enrichment prompts."""
+    meta = sk.get("_laravel_meta", {})
+    if not meta:
+        return ""
+    lines = [f"HTTP {meta['http_verb']} {meta['uri']}",
+             f"  Controller: {meta['controller']}::{meta['method']}"]
+    if meta.get("middleware"):
+        lines.append(f"  Middleware: {', '.join(meta['middleware'])}")
+    if meta.get("inputs"):
+        lines.append(f"  Inputs: {', '.join(str(i) for i in meta['inputs'][:6])}")
+    if meta.get("validation_rules"):
+        lines.append(f"  Validates: {', '.join(str(v) for v in meta['validation_rules'][:6])}")
+    if meta.get("db_ops"):
+        lines.append(f"  DB ops: {', '.join(meta['db_ops'][:4])}")
+    if meta.get("return_type") and meta["return_type"] != "unknown":
+        lines.append(f"  Returns: {meta['return_type']}")
+    return "\n".join(lines)
 
 
 # ─── Pass A–C: Graph Traversal ────────────────────────────────────────────────
@@ -630,6 +841,14 @@ def _stitch_execution_paths(
     skeletons: list[dict[str, Any]] = []
 
     for path_nodes in raw_paths:
+        # ── Tier-0 pass-through ────────────────────────────────────────────────
+        # Pre-built skeletons from _traverse_laravel_routes() arrive as dicts
+        # (not lists of node IDs). Pass them through unchanged — they already
+        # have steps, files, raw_confidence, etc. fully populated.
+        if isinstance(path_nodes, dict) and "steps" in path_nodes:
+            skeletons.append(path_nodes)
+            continue
+
         # Ordered unique files this path visits
         files: list[str] = []
         file_set: set[str] = set()
@@ -961,19 +1180,29 @@ def _enrich_with_llm(
     flow_counter = 1
     domain = ctx.domain_model
 
+    # Cap: send at most MAX_LLM_BATCH skeletons per LLM call to avoid
+    # max_tokens truncation on large context groups (e.g. Routes with 80+).
+    MAX_LLM_BATCH = 20
+
     for context_name, indices in context_groups.items():
         group_skeletons = [skeletons[i] for i in indices]
 
+        # Split into sub-batches if needed
+        enrichments: list[dict] = []
         system = _build_llm_system_prompt(domain)
-        user   = _build_llm_user_prompt(context_name, group_skeletons, domain)
-
-        try:
-            raw = call_llm(system, user, max_tokens=MAX_TOKENS,
-                           label=f"stage45_{context_name[:20]}")
-            enrichments = _parse_llm_response(raw, len(group_skeletons))
-        except Exception as e:
-            print(f"  [stage45] Warning: LLM call failed for '{context_name}': {e}")
-            enrichments = [{}] * len(group_skeletons)
+        for batch_start in range(0, len(group_skeletons), MAX_LLM_BATCH):
+            batch = group_skeletons[batch_start:batch_start + MAX_LLM_BATCH]
+            batch_label = f"stage45_{context_name[:15]}_{batch_start//MAX_LLM_BATCH+1}"
+            user = _build_llm_user_prompt(context_name, batch, domain)
+            try:
+                raw = call_llm(system, user, max_tokens=MAX_TOKENS,
+                               label=batch_label)
+                batch_enr = _parse_llm_response(raw, len(batch))
+            except Exception as e:
+                print(f"  [stage45] Warning: LLM call failed for '{context_name}' "
+                      f"batch {batch_start//MAX_LLM_BATCH+1}: {e}")
+                batch_enr = [{}] * len(batch)
+            enrichments.extend(batch_enr)
 
         # Merge enrichments onto skeletons
         for sk, enr in zip(group_skeletons, enrichments):

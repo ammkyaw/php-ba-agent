@@ -134,16 +134,59 @@ def run(ctx: PipelineContext) -> None:
         details["parse_errors"]   = getattr(ctx.code_map, "errors", [])
 
     # B2: Some DB signal must exist
-    sql_count  = len(ctx.code_map.sql_queries) if ctx.code_map else 0
-    table_count = 0
-    if ctx.graph_meta:
-        table_count = ctx.graph_meta.node_types.count("db_table") if ctx.graph_meta.node_types else 0
-    # Also count from code_map directly
+    # Laravel uses Eloquent ORM — raw SQL is rare. Collect table names from
+    # four sources and use the union set for accurate table_count.
+    sql_count = len(ctx.code_map.sql_queries) if ctx.code_map else 0
+    unique_tables: set[str] = set()
+
     if ctx.code_map:
-        unique_tables = {q.get("table", "") for q in ctx.code_map.sql_queries
-                         if q.get("table") and q["table"] != "UNKNOWN"}
-        table_count = max(table_count, len(unique_tables))
-        details["unique_tables"] = sorted(unique_tables)
+        # Source 1: raw SQL query strings (works for procedural PHP)
+        for q in ctx.code_map.sql_queries:
+            t = q.get("table", "")
+            if t and t != "UNKNOWN":
+                unique_tables.add(t)
+
+        # Source 2: table_columns extracted by Stage 1 (works for Laravel)
+        # code_map.table_columns is a list[dict] with a "table" key.
+        for col in (ctx.code_map.table_columns or []):
+            t = col.get("table", "") if isinstance(col, dict) else str(col)
+            if t and t != "UNKNOWN":
+                unique_tables.add(t)
+
+        # Source 3: migration files — parse create_table / Schema::create calls
+        # Stage 1 stores migrations as list[str] (file paths) or list[dict].
+        import re as _re
+        _CREATE_PAT = _re.compile(
+            r'''Schema::create\s*\(\s*['"]([\w]+)['"]|'''
+            r'''createTable\s*\(\s*['"]([\w]+)['"]|'''
+            r'''\$table\s*=\s*['"]([\w]+)['"]''',
+            _re.IGNORECASE,
+        )
+        for mig in (getattr(ctx.code_map, "migrations", None) or []):
+            # migrations may be file-path strings or dicts with "table" key
+            if isinstance(mig, dict):
+                t = mig.get("table", "") or mig.get("name", "")
+                if t and t != "UNKNOWN":
+                    unique_tables.add(t)
+            elif isinstance(mig, str):
+                # Derive table name from migration filename as a cheap heuristic:
+                # "2023_01_create_invoices_table.php" → "invoices"
+                fname = _re.sub(r'^\d{4}_\d{2}_\d{2}_\d{6}_', '', mig)
+                fname = _re.sub(r'_(table)?\.php$', '', fname)
+                fname = _re.sub(r'^create_|^add_\w+_to_|^drop_', '', fname)
+                if fname and len(fname) > 2:
+                    unique_tables.add(fname)
+
+    # Source 4: graph db_table nodes (Stage 2)
+    graph_table_count = 0
+    if ctx.graph_meta:
+        graph_table_count = (
+            ctx.graph_meta.node_types.count("db_table")
+            if ctx.graph_meta.node_types else 0
+        )
+
+    table_count = max(len(unique_tables), graph_table_count)
+    details["unique_tables"] = sorted(unique_tables)
 
     if sql_count == 0 and table_count == 0:
         blockers.append(
@@ -210,30 +253,76 @@ def run(ctx: PipelineContext) -> None:
             signals["has_sql"]    = sql_count > 0
             signals["has_tables"] = table_count > 0
 
-        # W2: No form inputs
+        # W2: No form inputs (Laravel-aware)
         post_reads = [s for s in ctx.code_map.superglobals
                       if s.get("var") in ("$_POST", "$_GET", "$_REQUEST")]
-        if not post_reads:
-            warnings.append(
-                "W2: No $_POST or $_GET reads found. "
-                "SRS functional requirements sections will lack form field details."
+        # For Laravel count controller inputs from Stage 1.5 and POST endpoints.
+        _laravel_inputs = 0
+        from context import Framework as _FwW2
+        if ctx.code_map.framework == _FwW2.LARAVEL:
+            for _ep in (getattr(ctx.code_map, "execution_paths", []) or []):
+                for _cf in _ep.get("controller_flows", []):
+                    _laravel_inputs += len(_cf.get("inputs", []))
+            _laravel_inputs += sum(
+                1 for e in ctx.code_map.http_endpoints
+                if e.get("method", "").upper() in ("POST", "PUT", "PATCH", "DELETE")
             )
-        else:
+        if post_reads or _laravel_inputs > 0:
             signals["has_forms"] = True
-            details["form_field_count"] = len({s.get("key") for s in post_reads if s.get("key")})
-
-        # W3: No redirects
-        if not ctx.code_map.redirects:
-            warnings.append(
-                "W3: No header() redirect patterns found. "
-                "Navigation flow diagrams will be absent from BA docs."
+            details["form_field_count"] = (
+                len({s.get("key") for s in post_reads if s.get("key")})
+                + _laravel_inputs
             )
         else:
+            from context import Framework as _FwW2b
+            if ctx.code_map.framework == _FwW2b.LARAVEL:
+                warnings.append(
+                    "W2 (INFO): No $_POST/$_GET reads found (expected for Laravel — "
+                    "uses $request->input()). Re-run Stage 1.5 if execution_paths is empty."
+                )
+            else:
+                warnings.append(
+                    "W2: No $_POST or $_GET reads found. "
+                    "SRS functional requirements sections will lack form field details."
+                )
+
+        # W3: No redirects (Laravel-aware)
+        # Laravel uses return redirect()/view()/response() not header().
+        # Count any controller method with a non-null return_type as navigation
+        # evidence; only "redirect"/"redirect_back" imply auth-relevant flows.
+        _REDIRECT_TYPES = {"redirect", "redirect_back"}
+        _laravel_return_count = 0
+        _laravel_redirects = 0
+        from context import Framework as _FwW3
+        if ctx.code_map.framework == _FwW3.LARAVEL:
+            for _ep in (getattr(ctx.code_map, "execution_paths", []) or []):
+                for _cf in _ep.get("controller_flows", []):
+                    rt = _cf.get("return_type") or ""
+                    if rt:
+                        _laravel_return_count += 1
+                    if rt in _REDIRECT_TYPES:
+                        _laravel_redirects += 1
+        if ctx.code_map.redirects:
             signals["has_auth"] = any(
                 r.get("target", "").endswith("login.php") or
                 r.get("target", "").endswith("session.php")
                 for r in ctx.code_map.redirects
             )
+        elif _laravel_return_count > 0:
+            # Any controller return type (json/view/redirect) means navigation exists
+            signals["has_auth"] = _laravel_redirects > 0
+        else:
+            from context import Framework as _FwW3b
+            if ctx.code_map.framework == _FwW3b.LARAVEL:
+                warnings.append(
+                    "W3 (INFO): No header() redirects found (expected for Laravel). "
+                    "Re-run Stage 1.5 to populate controller return types."
+                )
+            else:
+                warnings.append(
+                    "W3: No header() redirect patterns found. "
+                    "Navigation flow diagrams will be absent from BA docs."
+                )
 
         # W4: No user-defined functions
         if not ctx.code_map.functions:
@@ -331,8 +420,42 @@ def _run_sanity_query(ctx: PipelineContext) -> tuple[bool, str, float]:
         return False, f"Exception during query: {e}", 1.0
 
 
+# Candidate metadata keys tried in priority order.
+# Stage 3 versions differ on which key they write.
+_CHUNK_TYPE_KEYS = ("chunk_type", "type", "source_type", "doc_type", "category")
+
+
 def _get_chunk_types(ctx: PipelineContext) -> list[str]:
-    """Query ChromaDB for the set of chunk types present in the collection."""
+    """
+    Return the distinct chunk types present in this run.
+
+    Strategy (two-tier):
+      1. Read chunks_manifest.json written by Stage 3 — it always carries a
+         "chunk_type" field and is fast to parse. This is the reliable path
+         because Stage 3 does NOT write chunk_type into ChromaDB metadata.
+      2. Fall back to querying ChromaDB metadata if the manifest is missing,
+         trying multiple candidate key names.
+    """
+    import json as _json
+    from pathlib import Path as _Path
+
+    # ── Tier 1: manifest file (preferred) ────────────────────────────────────
+    # chunks_manifest.json lives next to the chromadb/ folder
+    manifest_path = _Path(ctx.embedding_meta.chroma_path).parent / "chunks_manifest.json"
+    if manifest_path.exists():
+        try:
+            manifest = _json.loads(manifest_path.read_text(encoding="utf-8"))
+            types = sorted({
+                c.get("chunk_type", "")
+                for c in manifest
+                if c.get("chunk_type", "") not in ("", None)
+            })
+            if types:
+                return types
+        except Exception:
+            pass  # fall through to ChromaDB
+
+    # ── Tier 2: ChromaDB metadata (fallback) ─────────────────────────────────
     try:
         from pipeline.stage3_embed import _try_load_collection, COLLECTION_NAME
         collection = _try_load_collection(
@@ -341,11 +464,34 @@ def _get_chunk_types(ctx: PipelineContext) -> list[str]:
         )
         if collection is None:
             return []
-        # Fetch a sample of metadata to see what chunk types are present
-        results = collection.get(limit=200, include=["metadatas"])
-        types = {m.get("chunk_type", "unknown") for m in results["metadatas"]}
-        return sorted(types)
-    except Exception:
+
+        sample_size = min(500, ctx.embedding_meta.total_chunks)
+        results = collection.get(limit=sample_size, include=["metadatas"])
+        metadatas: list[dict] = results.get("metadatas") or []
+        if not metadatas:
+            return []
+
+        # Try each candidate key; keep the result with the most distinct values
+        best: list[str] = []
+        for key in _CHUNK_TYPE_KEYS:
+            found = sorted({
+                m.get(key, "")
+                for m in metadatas
+                if m.get(key, "") not in ("", None)
+            })
+            if len(found) > len(best):
+                best = found
+
+        if not best:
+            all_keys: set[str] = set()
+            for m in metadatas[:20]:
+                all_keys.update(m.keys())
+            print(f"  [stage35] W5 debug: no type key found in ChromaDB. "
+                  f"Available metadata keys: {sorted(all_keys)}")
+
+        return best
+    except Exception as exc:
+        print(f"  [stage35] W5: chunk type lookup failed — {exc}")
         return []
 
 

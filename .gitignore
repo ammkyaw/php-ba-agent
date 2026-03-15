@@ -210,4 +210,9 @@ outputs/
 __pycache__/
 pipeline/__pycache__/
 
-.DS_Store
+**/.DS_Store
+
+
+composer.*
+
+vendor/.DS_Store
