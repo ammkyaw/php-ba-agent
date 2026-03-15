@@ -61,7 +61,12 @@ from context import DomainModel, PipelineContext
 MAX_TOKENS_META     = 4_000   # Call A: domain_name, description, key_entities, bounded_contexts
 MAX_TOKENS_FEATURES = 8_000   # Call B: features list (largest field)
 MAX_TOKENS_ROLES_WF = 8_000   # Call C: user_roles + workflows
+MAX_TOKENS_GAP_FILL = 6_000   # Call D: gap-fill features for uncovered pages
 DOMAIN_FILE      = "domain_model.json"
+COVERAGE_FILE    = "coverage_report.json"
+
+# Gap-fill: maximum uncovered pages to send in a single gap-fill call
+GAP_FILL_MAX_PAGES = 15
 
 # Retrieval: queries × top-k chunks each
 RETRIEVAL_QUERIES = [
@@ -143,6 +148,14 @@ def run(ctx: PipelineContext) -> None:
 
     # ── Hydrate DomainModel ───────────────────────────────────────────────────
     domain_model = _hydrate_domain_model(merged)
+
+    # ── Coverage metrics (Thing 1) ────────────────────────────────────────────
+    coverage_report = _compute_coverage(ctx, domain_model, debug_dir)
+
+    # ── Gap-fill pass (Thing 2) ───────────────────────────────────────────────
+    domain_model = _gap_fill_pass(
+        ctx, domain_model, coverage_report, user_prompt, quality_score, debug_dir
+    )
 
     # ── Save ──────────────────────────────────────────────────────────────────
     _save_domain_model(domain_model, output_path)
@@ -330,6 +343,42 @@ Output ONLY this JSON (no other fields):
 }}
 
 Now produce the JSON for user_roles and workflows only:"""
+
+
+def _system_gap_fill(quality_score: int, uncovered_pages: list[str],
+                     existing_feature_names: list[str]) -> str:
+    """Call D — gap-fill features for pages not yet covered by known features."""
+    existing_str = ", ".join(f'"{n}"' for n in existing_feature_names[:20])
+    pages_str    = ", ".join(f'"{p}"' for p in uncovered_pages)
+    return f"""{_SYSTEM_PREAMBLE}
+{_evidence_instruction(quality_score)}
+
+The following PHP pages are NOT yet covered by any existing feature in the domain model:
+{pages_str}
+
+Existing features already extracted (do NOT duplicate or re-list these):
+{existing_str}
+
+For each uncovered page, determine what business feature it represents based on the
+codebase evidence. Group multiple uncovered pages under one feature if they implement
+the same business function.
+
+Output ONLY this JSON (no other fields):
+{{
+  "features": [
+    {{
+      "name": "Feature name",
+      "description": "What this feature does from a business perspective",
+      "pages": ["the_uncovered_page.php"],
+      "tables": ["relevant_table"],
+      "inputs": ["field1", "field2"],
+      "outputs": "What the user gets after completing this feature",
+      "business_rules": []
+    }}
+  ]
+}}
+
+Now produce the JSON for new features covering the uncovered pages:"""
 
 
 def _build_user_prompt(ctx: PipelineContext, chunks: list[dict]) -> str:
@@ -624,6 +673,160 @@ def _call_part(system_prompt: str, user_prompt: str,
         label         = label,
         json_mode     = True,
     )
+
+
+# ─── Coverage Metrics ──────────────────────────────────────────────────────────
+
+
+def _compute_coverage(
+    ctx: PipelineContext,
+    domain_model: "DomainModel",
+    debug_dir: str | None = None,
+) -> dict:
+    """
+    Compute three coverage metrics after domain model extraction:
+
+      page_coverage   — fraction of cm.html_pages mentioned in any feature's 'pages'
+      table_coverage  — fraction of unique SQL tables in any feature's 'tables'
+      field_coverage  — fraction of POST fields in any feature's 'inputs'
+
+    Saves coverage_report.json to debug_dir and prints a summary line.
+    Returns the report dict (used by the gap-fill pass to find uncovered pages).
+    """
+    cm = ctx.code_map
+
+    # ── Collect everything the features claim to cover ────────────────────────
+    covered_pages  : set[str] = set()
+    covered_tables : set[str] = set()
+    covered_inputs : set[str] = set()
+    for feat in domain_model.features:
+        for p in feat.get("pages", []):
+            covered_pages.add(Path(p).name.lower())
+        for t in feat.get("tables", []):
+            covered_tables.add(t.lower())
+        for inp in feat.get("inputs", []):
+            covered_inputs.add(inp.lower())
+
+    # ── Page coverage ─────────────────────────────────────────────────────────
+    all_pages       = [Path(p).name for p in (cm.html_pages or [])]
+    pages_covered   = [p for p in all_pages if p.lower() in covered_pages]
+    pages_uncovered = [p for p in all_pages if p.lower() not in covered_pages]
+    page_cov        = len(pages_covered) / len(all_pages) if all_pages else 1.0
+
+    # ── Table coverage ────────────────────────────────────────────────────────
+    all_tables = sorted({
+        q.get("table", "") for q in (cm.sql_queries or [])
+        if q.get("table") and q["table"] not in ("UNKNOWN", "")
+    })
+    tables_covered   = [t for t in all_tables if t.lower() in covered_tables]
+    tables_uncovered = [t for t in all_tables if t.lower() not in covered_tables]
+    table_cov        = len(tables_covered) / len(all_tables) if all_tables else 1.0
+
+    # ── Field coverage ────────────────────────────────────────────────────────
+    all_fields = sorted({
+        s["key"] for s in (cm.superglobals or [])
+        if s.get("var") == "$_POST" and s.get("key")
+    })
+    fields_covered   = [f for f in all_fields if f.lower() in covered_inputs]
+    fields_uncovered = [f for f in all_fields if f.lower() not in covered_inputs]
+    field_cov        = len(fields_covered) / len(all_fields) if all_fields else 1.0
+
+    report = {
+        "page_coverage":     round(page_cov,  3),
+        "table_coverage":    round(table_cov, 3),
+        "field_coverage":    round(field_cov, 3),
+        "pages_covered":     pages_covered,
+        "pages_uncovered":   pages_uncovered,
+        "tables_covered":    tables_covered,
+        "tables_uncovered":  tables_uncovered,
+        "fields_covered":    fields_covered,
+        "fields_uncovered":  fields_uncovered,
+    }
+
+    # ── Persist ───────────────────────────────────────────────────────────────
+    if debug_dir:
+        try:
+            Path(debug_dir).mkdir(parents=True, exist_ok=True)
+            cov_path = Path(debug_dir, COVERAGE_FILE)
+            with open(cov_path, "w", encoding="utf-8") as fh:
+                json.dump(report, fh, indent=2, ensure_ascii=False)
+        except Exception as e:
+            print(f"  [stage4] Warning: could not save {COVERAGE_FILE}: {e}")
+
+    # ── Print summary ─────────────────────────────────────────────────────────
+    print(
+        f"  [stage4] Coverage — "
+        f"pages: {page_cov:.0%} ({len(pages_covered)}/{len(all_pages)}), "
+        f"tables: {table_cov:.0%} ({len(tables_covered)}/{len(all_tables)}), "
+        f"fields: {field_cov:.0%} ({len(fields_covered)}/{len(all_fields)})"
+    )
+    if pages_uncovered:
+        sample = pages_uncovered[:8]
+        suffix = f" ... +{len(pages_uncovered) - 8} more" if len(pages_uncovered) > 8 else ""
+        print(f"  [stage4]   Uncovered pages : {sample}{suffix}")
+    if tables_uncovered:
+        sample = tables_uncovered[:8]
+        suffix = f" ... +{len(tables_uncovered) - 8} more" if len(tables_uncovered) > 8 else ""
+        print(f"  [stage4]   Uncovered tables: {sample}{suffix}")
+
+    return report
+
+
+def _gap_fill_pass(
+    ctx: PipelineContext,
+    domain_model: "DomainModel",
+    coverage_report: dict,
+    user_prompt: str,
+    quality_score: int,
+    debug_dir: str | None = None,
+) -> "DomainModel":
+    """
+    If page_coverage < 1.0, make an additional LLM call (Call D) to extract
+    features for uncovered entry points and merge them into the domain model.
+
+    Returns the (possibly enriched) DomainModel.
+    """
+    uncovered = coverage_report.get("pages_uncovered", [])
+    if not uncovered:
+        return domain_model
+
+    gap_pages = uncovered[:GAP_FILL_MAX_PAGES]
+    print(
+        f"  [stage4] Call 4 — gap-fill for {len(gap_pages)} uncovered page(s): "
+        f"{gap_pages[:5]}{'...' if len(gap_pages) > 5 else ''}"
+    )
+
+    existing_names = [f["name"] for f in domain_model.features]
+    gap_system     = _system_gap_fill(quality_score, gap_pages, existing_names)
+    raw_d          = _call_part(gap_system, user_prompt, MAX_TOKENS_GAP_FILL, "stage4-D")
+    data_d         = _parse_partial(raw_d, "D", debug_dir)
+
+    # Normalise: some models return a bare list
+    new_features: list = data_d.get("features", [])
+    if not new_features and isinstance(data_d, list):
+        new_features = data_d
+
+    if not new_features:
+        print(f"  [stage4] Gap-fill returned no new features.")
+        return domain_model
+
+    # Merge — skip duplicates by name (case-insensitive)
+    existing_lower = {f["name"].lower() for f in domain_model.features}
+    added: list[str] = []
+    for feat in new_features:
+        if isinstance(feat, dict) and feat.get("name"):
+            if feat["name"].lower() not in existing_lower:
+                domain_model.features.append(feat)
+                existing_lower.add(feat["name"].lower())
+                added.append(feat["name"])
+
+    if added:
+        suffix = f" ... +{len(added) - 5} more" if len(added) > 5 else ""
+        print(f"  [stage4] Gap-fill added {len(added)} feature(s): {added[:5]}{suffix}")
+    else:
+        print(f"  [stage4] Gap-fill: all returned features already present — nothing added.")
+
+    return domain_model
 
 
 # ─── Response Parsing ──────────────────────────────────────────────────────────
