@@ -186,6 +186,17 @@ Framework context: {hints.brd_note}"""
     all_feature_names = ", ".join(f['name'] for f in domain.features)
     n_features = len(domain.features)
 
+    # Pre-build the BR scaffold — numbered ### headings force the model to use
+    # the EXACT feature names from the domain model. Using ### (not bold) ensures
+    # _extract_headings() in stage6 can find them for coverage scoring.
+    br_scaffold = "\n\n".join(
+        f"### BR-{i:02d}: {f['name']}\n"
+        f"- Description: {f.get('description', 'see domain model')}\n"
+        f"- Priority: High/Medium/Low\n"
+        f"- Acceptance: [write 1 criterion]"
+        for i, f in enumerate(domain.features, 1)
+    )
+
     user = f"""Write a BRD for: {domain.domain_name}
 
 System description: {domain.description}
@@ -202,9 +213,8 @@ Bounded Contexts: {", ".join(_to_str_list(domain.bounded_contexts))}
 Business Rules:
 {rule_lines}
 
-CRITICAL: Section 5 MUST contain exactly {n_features} BR entries, one per feature:
-{all_feature_names}
-Do not merge, skip, or omit ANY feature — even trivial ones like logout or static pages.
+CRITICAL: Section 5 MUST use EXACTLY these {n_features} subsection headings in order.
+Do NOT rename, merge, skip, or reorder them. Fill in the Priority and Acceptance fields.
 For trivial features write Priority: Low and a brief 1-line acceptance criterion.
 
 Write these sections (keep each section concise — 3-8 bullet points or rows):
@@ -226,11 +236,8 @@ List every feature by name: {all_feature_names}
 Markdown table: Role | Description | Key Interests
 
 ## 5. Business Requirements
-MUST have exactly {n_features} entries — one per feature listed above.
-**BR-XXX: [Feature Name]**
-- Description: what the business needs
-- Priority: High/Medium/Low
-- Acceptance: how we verify it is met
+
+{br_scaffold}
 
 ## 6. Data Requirements
 One paragraph per DB table describing purpose and key fields.
@@ -337,6 +344,26 @@ and table names. Output clean Markdown only.
     ep_section     = _format_execution_paths_for_prompt(ctx)
     flows_section  = _format_business_flows_for_prompt(ctx)
 
+    # Pre-build the AC scaffold with exact feature names as ## headings.
+    # This guarantees _extract_headings() in stage6 can match domain feature names.
+    # Model must fill in the criteria content — it MUST NOT rename these headings.
+    ac_scaffold = "\n\n---\n\n".join(
+        f"## AC-{i:02d}: {f['name']}\n"
+        f"**Feature:** {f.get('description', 'see domain model')}\n"
+        f"**Pages:** {', '.join(_to_str_list(f.get('pages', []))) or 'see domain model'}\n"
+        f"**Tables:** {', '.join(_to_str_list(f.get('tables', []))) or 'see domain model'}\n\n"
+        f"### Acceptance Criteria:\n\n"
+        f"**AC-{i:02d}-01: Happy path**\n"
+        f"- Given: [precondition]\n"
+        f"- When: [action]\n"
+        f"- Then: [expected result]\n\n"
+        f"**AC-{i:02d}-02: Validation failure**\n"
+        f"- Given: [precondition]\n"
+        f"- When: [invalid or edge action]\n"
+        f"- Then: [expected error/rejection]"
+        for i, f in enumerate(domain.features, 1)
+    )
+
     user = f"""Using the domain model below, write complete Acceptance Criteria for '{domain.domain_name}'.
 
 DOMAIN MODEL:
@@ -344,14 +371,10 @@ DOMAIN MODEL:
 {flows_section}
 {ep_section}
 
-IMPORTANT COVERAGE RULE:
-Every feature in the domain model MUST have an AC section — even trivial ones
-(e.g., logout, static display pages). For features with minimal logic:
-  - Write 1-2 criteria instead of the usual 3
-  - Mark them explicitly: "**Complexity: Low — single operation**"
-  - Do NOT skip them — omission causes QA coverage failures
-
-Write one section per feature:
+CRITICAL HEADING RULE: The section headings below are FIXED. You MUST use them verbatim —
+do NOT rename, merge, reorder, or replace them. Each "## AC-XX: [Feature Name]" line
+must appear EXACTLY as written. Only fill in the criteria content under each heading.
+Omitting or renaming any heading causes QA coverage failures.
 
 # Acceptance Criteria — {domain.domain_name}
 
@@ -360,26 +383,7 @@ Brief description of how acceptance testing should be approached for this system
 
 ---
 
-For EACH feature in the domain model, write a section:
-
-## AC-XX: [Feature Name]
-**Feature:** [One-line description]
-**Pages:** [Relevant pages]
-**Tables:** [Relevant tables]
-
-### Acceptance Criteria:
-
-**AC-XX-01: [Criteria name]**
-- Given: [precondition]
-- When: [action]
-- Then: [expected result]
-
-**AC-XX-02: [Criteria name — negative/edge case]**
-- Given: [precondition]
-- When: [invalid or edge action]
-- Then: [expected error/rejection]
-
-[At least 3 criteria per feature: happy path, validation failure, and one edge case]
+{ac_scaffold}
 
 ---
 
@@ -409,6 +413,35 @@ Output clean Markdown only.
     ep_section     = _format_execution_paths_for_prompt(ctx)
     flows_section  = _format_business_flows_for_prompt(ctx)
 
+    # Pre-build one Epic scaffold per feature so the exact feature names appear
+    # as ## headings. This ensures stage6 Pass A can match them for coverage.
+    # Model fills in the story content — must NOT rename the ## Epic: lines.
+    us_counter = [1]  # mutable counter shared across generator
+    def _epic_block(f: dict) -> str:
+        feat_name = f['name']
+        desc = f.get('description', '')
+        pages = ', '.join(_to_str_list(f.get('pages', []))) or 'see domain model'
+        tables = ', '.join(_to_str_list(f.get('tables', []))) or 'see domain model'
+        idx = us_counter[0]
+        us_counter[0] += 1
+        return (
+            f"## Epic: {feat_name}\n\n"
+            f"### US-{idx:03d}: [Story title for {feat_name}]\n"
+            f"**As a** [role]\n"
+            f"**I want to** [action using pages={pages}]\n"
+            f"**So that** [benefit]\n\n"
+            f"**Priority:** Must Have / Should Have / Could Have / Won't Have\n"
+            f"**Story Points:** [1 | 2 | 3 | 5 | 8 | 13]\n"
+            f"**Pages:** {pages}\n"
+            f"**Tables:** {tables}\n\n"
+            f"**Acceptance Criteria:**\n"
+            f"- [ ] [criterion 1]\n"
+            f"- [ ] [criterion 2 — negative case]\n\n"
+            f"**Notes:** {desc}"
+        )
+
+    epic_scaffold = "\n\n---\n\n".join(_epic_block(f) for f in domain.features)
+
     user = f"""Using the domain model below, write a complete User Story backlog for '{domain.domain_name}'.
 
 DOMAIN MODEL:
@@ -416,42 +449,19 @@ DOMAIN MODEL:
 {flows_section}
 {ep_section}
 
-IMPORTANT COVERAGE RULE:
-Every feature in the domain model MUST appear in the backlog — even trivial ones
-(e.g., logout, static pages). For features with no business logic:
-  - Write a single micro-story (1 story point, Could Have priority)
-  - Keep AC to 1-2 criteria max
-  - Do NOT skip them — omission causes QA coverage failures
-
-Structure the output as follows:
+CRITICAL HEADING RULE: The "## Epic: [Feature Name]" headings below are FIXED.
+You MUST use them verbatim — do NOT rename, merge, reorder, or replace them.
+Only fill in the story content (title, As a / I want / So that, criteria, notes).
+Omitting or renaming any Epic heading causes QA coverage failures.
 
 # User Story Backlog — {domain.domain_name}
 
 ## Epic Summary
-List all epics (one per bounded context) with a one-line description each.
+One-line description per epic listed below.
 
 ---
 
-For each bounded context, create an Epic with its User Stories:
-
-## Epic: [Bounded Context Name]
-
-### US-XXX: [Story Title]
-**As a** [role from domain model]
-**I want to** [specific action using actual page/field names]
-**So that** [business benefit]
-
-**Priority:** Must Have / Should Have / Could Have / Won't Have
-**Story Points:** [1 | 2 | 3 | 5 | 8 | 13]
-**Pages:** [actual PHP pages]
-**Tables:** [actual DB tables]
-
-**Acceptance Criteria:**
-- [ ] [Specific, testable criterion using actual field/page names]
-- [ ] [Negative case or validation rule]
-- [ ] [Edge case or non-functional requirement]
-
-**Notes:** [Any technical notes, dependencies, or assumptions]
+{epic_scaffold}
 
 ---
 
