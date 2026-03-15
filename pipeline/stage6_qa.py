@@ -99,7 +99,16 @@ def run(ctx: PipelineContext) -> None:
           f"{', '.join(artefacts.keys())}")
 
     from pipeline.llm_client import call_llm
+    from pipeline.consistency_check import run_checks as _run_consistency_checks
+    from pipeline.consistency_check import format_summary as _consistency_summary
     system_prompt = _build_system_prompt(ctx)
+
+    # ── Pass D: Deterministic Consistency Checks (no LLM) ─────────────────────
+    # Runs BEFORE the LLM passes so findings appear at the top of the report
+    # and can be referenced in the Pass B consistency prompt.
+    print("  [stage6] Pass D — deterministic consistency checks ...")
+    pass_d_issues = _run_consistency_checks(ctx, artefacts)
+    print(f"  [stage6] Pass D — {_consistency_summary(pass_d_issues)}")
 
     # ── Pass A: Coverage ──────────────────────────────────────────────────────
     pass_a_prompt = _build_coverage_prompt(ctx, artefacts)
@@ -109,7 +118,7 @@ def run(ctx: PipelineContext) -> None:
     pass_a_data = _parse_response(raw_a, pass_label="A")
 
     # ── Pass B: Consistency & Issues ─────────────────────────────────────────
-    pass_b_prompt = _build_consistency_prompt(ctx, artefacts)
+    pass_b_prompt = _build_consistency_prompt(ctx, artefacts, pass_d_issues)
     print(f"  [stage6] Pass B — consistency + issues ({len(pass_b_prompt):,} chars) ...")
     raw_b     = call_llm(system_prompt, pass_b_prompt,
                          max_tokens=MAX_TOKENS, label="stage6_passB")
@@ -133,7 +142,7 @@ def run(ctx: PipelineContext) -> None:
         print(f"  [stage6] Pass C — skipped (no entry-point pages found).")
 
     # ── Merge ─────────────────────────────────────────────────────────────────
-    qa_data = _merge_passes(pass_a_data, pass_b_data, pass_c_data, ctx)
+    qa_data = _merge_passes(pass_a_data, pass_b_data, pass_c_data, pass_d_issues, ctx)
 
     # ── Build QAResult ────────────────────────────────────────────────────────
     coverage    = float(qa_data.get("coverage_score",    0.0))
@@ -238,13 +247,20 @@ count if in even one artefact.""")
 
 # ─── Pass B: Consistency + Issues Prompt ──────────────────────────────────────
 
-def _build_consistency_prompt(ctx: PipelineContext, artefacts: dict[str, str]) -> str:
+def _build_consistency_prompt(
+    ctx: PipelineContext,
+    artefacts: dict[str, str],
+    pass_d_issues: list[dict] | None = None,
+) -> str:
     """
     Build the Pass B prompt.
 
     Sends the first ARTEFACT_PREVIEW_CHARS of each artefact — enough to spot
     naming mismatches, missing sections, and cross-doc contradictions without
     overflowing the token budget.
+
+    pass_d_issues: deterministic issues already found by Pass D so the LLM
+    can focus on novel issues rather than re-reporting the same ones.
     """
     domain = ctx.domain_model
     parts  = ["=== DOMAIN MODEL (ground truth) ==="]
@@ -255,6 +271,17 @@ def _build_consistency_prompt(ctx: PipelineContext, artefacts: dict[str, str]) -
         parts.append(f"Tables: {all_tables}")
     parts.append(f"Entities: " + ", ".join(domain.key_entities))
     parts.append(f"Roles: "    + ", ".join(r["role"] for r in domain.user_roles))
+
+    # Inject already-known deterministic issues so the LLM doesn't duplicate them
+    if pass_d_issues:
+        parts.append(
+            "\n=== ALREADY IDENTIFIED ISSUES (do NOT duplicate these) ==="
+        )
+        for iss in pass_d_issues:
+            parts.append(
+                f"  [{iss['severity'].upper()}] {iss['artefact']}: "
+                f"{iss['description'][:120]}"
+            )
 
     for name, content in artefacts.items():
         preview   = content[:ARTEFACT_PREVIEW_CHARS]
@@ -400,21 +427,24 @@ def _extract_headings(content: str) -> list[str]:
 # ─── Result Merging ────────────────────────────────────────────────────────────
 
 def _merge_passes(
-    pass_a: dict[str, Any],
-    pass_b: dict[str, Any],
-    pass_c: dict[str, Any],
-    ctx:    PipelineContext,
+    pass_a:        dict[str, Any],
+    pass_b:        dict[str, Any],
+    pass_c:        dict[str, Any],
+    pass_d_issues: list[dict],
+    ctx:           PipelineContext,
 ) -> dict[str, Any]:
     """
-    Merge Pass A (coverage) + Pass B (consistency+issues) + Pass C (reverse audit)
-    into a single qa_data dict that matches the output schema.
+    Merge Pass A (coverage) + Pass B (consistency+issues) + Pass C (reverse
+    audit) + Pass D (deterministic consistency) into a single qa_data dict.
 
-    Defaults are provided for all keys so that partial/failed passes produce a
+    Pass D issues are prepended so deterministic findings appear first.
+    Defaults are provided for all keys so partial/failed passes produce a
     graceful fallback rather than a crash.
     """
     coverage_score    = float(pass_a.get("coverage_score",    0.5))
     consistency_score = float(pass_b.get("consistency_score", 0.9))
-    issues            = pass_b.get("issues", [])
+    # Prepend deterministic Pass D issues — they're always reliable
+    issues            = list(pass_d_issues) + pass_b.get("issues", [])
     n_critical        = sum(1 for i in issues if i.get("severity") == "critical")
     n_major           = sum(1 for i in issues if i.get("severity") == "major")
     passed            = n_critical == 0 and n_major == 0 and coverage_score >= 0.8
@@ -491,6 +521,28 @@ def _build_report_md(qa_data: dict, ctx: PipelineContext) -> str:
         lines.append(f"\n**Missing ({len(missing)}):** "
                      + ", ".join(f"`{f}`" for f in missing))
     lines.append("")
+
+    # ── Consistency Validation section (Pass D deterministic issues) ────────────
+    det_issues = [i for i in issues if i.get("category")]
+    if det_issues:
+        lines += ["## Consistency Validation (Deterministic)", ""]
+        # Group by category
+        cats: dict[str, list] = {}
+        for iss in det_issues:
+            cats.setdefault(iss["category"], []).append(iss)
+        for cat, cat_issues in cats.items():
+            lines.append(f"### {cat}")
+            for iss in cat_issues:
+                sev_icon = {"critical": "🔴", "major": "🟠", "minor": "🟡"}.get(
+                    iss.get("severity", ""), "•"
+                )
+                lines += [
+                    "",
+                    f"{sev_icon} **[{iss.get('severity','?').upper()}]** "
+                    f"{iss.get('description','')}",
+                    f"*Fix:* {iss.get('recommendation','')}",
+                ]
+            lines.append("")
 
     if issues:
         lines += ["## Issues", ""]
