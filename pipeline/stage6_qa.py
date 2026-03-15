@@ -60,6 +60,12 @@ MAX_TOKENS     = 8192
 # 3000 × 4 = 12k + ~2k domain model = ~14k total — safe for a 4k response.
 ARTEFACT_PREVIEW_CHARS = 3000
 
+# Pass C — Reverse Audit
+# Sample this many random PHP entry-point files and ask the LLM which domain
+# model feature covers each (or "MISSING" if none does).
+AUDIT_SAMPLE_SIZE  = 6
+MAX_TOKENS_AUDIT   = 2_000
+
 
 # ─── Public Entry Point ────────────────────────────────────────────────────────
 
@@ -109,8 +115,25 @@ def run(ctx: PipelineContext) -> None:
                          max_tokens=MAX_TOKENS, label="stage6_passB")
     pass_b_data = _parse_response(raw_b, pass_label="B")
 
+    # ── Pass C: Reverse Audit ─────────────────────────────────────────────────
+    pass_c_data: dict[str, Any] = {}
+    pass_c_prompt = _build_reverse_audit_prompt(ctx)
+    if pass_c_prompt:
+        print(f"  [stage6] Pass C — reverse audit ({len(pass_c_prompt):,} chars) ...")
+        raw_c       = call_llm(system_prompt, pass_c_prompt,
+                               max_tokens=MAX_TOKENS_AUDIT, label="stage6_passC")
+        pass_c_data = _parse_response(raw_c, pass_label="C")
+        n_missing   = sum(
+            1 for e in pass_c_data.get("audit", [])
+            if str(e.get("feature", "")).upper() == "MISSING"
+        )
+        print(f"  [stage6] Pass C — {len(pass_c_data.get('audit', []))} files audited, "
+              f"{n_missing} MISSING from domain model.")
+    else:
+        print(f"  [stage6] Pass C — skipped (no entry-point pages found).")
+
     # ── Merge ─────────────────────────────────────────────────────────────────
-    qa_data = _merge_passes(pass_a_data, pass_b_data, ctx)
+    qa_data = _merge_passes(pass_a_data, pass_b_data, pass_c_data, ctx)
 
     # ── Build QAResult ────────────────────────────────────────────────────────
     coverage    = float(qa_data.get("coverage_score",    0.0))
@@ -273,6 +296,62 @@ Scoring: consistency_score starts at 1.0.
     return "\n".join(parts)
 
 
+# ─── Pass C: Reverse Audit Prompt ─────────────────────────────────────────────
+
+def _build_reverse_audit_prompt(ctx: PipelineContext) -> str | None:
+    """
+    Build the Pass C prompt.
+
+    Samples AUDIT_SAMPLE_SIZE random PHP entry-point files and asks the LLM
+    to name the domain model feature that covers each file, or "MISSING" if none
+    does. Uses a deterministic random seed so reruns produce consistent samples.
+
+    Returns None if no entry-point pages are available.
+    """
+    import random
+
+    cm        = ctx.code_map
+    all_pages = list(cm.html_pages or []) if cm else []
+    if not all_pages:
+        return None
+
+    sample_size = min(AUDIT_SAMPLE_SIZE, len(all_pages))
+    sampled     = random.Random(42).sample(all_pages, sample_size)
+
+    domain         = ctx.domain_model
+    feature_names  = [f["name"] for f in domain.features] if domain else []
+    features_str   = "\n".join(f'  - "{n}"' for n in feature_names)
+    files_str      = "\n".join(f'  - "{Path(p).name}"' for p in sampled)
+
+    return f"""=== DOMAIN MODEL FEATURES ===
+The domain model has {len(feature_names)} feature(s):
+{features_str}
+
+=== FILES TO AUDIT ===
+The following {sample_size} PHP files were randomly sampled from the codebase:
+{files_str}
+
+=== TASK ===
+For each file listed, identify which domain model feature (use the EXACT feature name
+from the list above) best covers it. If no feature covers the file at all, answer
+"MISSING".
+
+Return ONLY this JSON:
+
+{{
+  "audit": [
+    {{
+      "file": "filename.php",
+      "feature": "Exact Feature Name or MISSING",
+      "confidence": "high | medium | low",
+      "note": "optional 1-line explanation"
+    }}
+  ],
+  "uncovered_count": 0,
+  "audit_summary": "1-2 sentence summary of what the audit found"
+}}"""
+
+
 # ─── Response Parsing ──────────────────────────────────────────────────────────
 
 def _parse_response(raw: str, pass_label: str = "") -> dict[str, Any]:
@@ -323,11 +402,12 @@ def _extract_headings(content: str) -> list[str]:
 def _merge_passes(
     pass_a: dict[str, Any],
     pass_b: dict[str, Any],
+    pass_c: dict[str, Any],
     ctx:    PipelineContext,
 ) -> dict[str, Any]:
     """
-    Merge Pass A (coverage) + Pass B (consistency+issues) into a single qa_data
-    dict that matches the original single-pass output schema.
+    Merge Pass A (coverage) + Pass B (consistency+issues) + Pass C (reverse audit)
+    into a single qa_data dict that matches the output schema.
 
     Defaults are provided for all keys so that partial/failed passes produce a
     graceful fallback rather than a crash.
@@ -339,9 +419,10 @@ def _merge_passes(
     n_major           = sum(1 for i in issues if i.get("severity") == "major")
     passed            = n_critical == 0 and n_major == 0 and coverage_score >= 0.8
 
-    summary_a = pass_a.get("summary", "")
-    summary_b = pass_b.get("summary", "")  # Pass B may not include a summary
-    combined  = " ".join(filter(None, [summary_a, summary_b])) or (
+    summary_a     = pass_a.get("summary", "")
+    summary_b     = pass_b.get("summary", "")
+    audit_summary = pass_c.get("audit_summary", "")
+    combined      = " ".join(filter(None, [summary_a, summary_b, audit_summary])) or (
         f"Coverage: {coverage_score:.0%}. "
         f"Consistency: {consistency_score:.0%}. "
         f"{len(issues)} issue(s) found."
@@ -359,6 +440,10 @@ def _merge_passes(
         }),
         "strengths":         pass_b.get("strengths", []),
         "recommendations":   pass_b.get("recommendations", []),
+        # Pass C — Reverse Audit
+        "audit":             pass_c.get("audit", []),
+        "audit_summary":     audit_summary,
+        "audit_uncovered":   int(pass_c.get("uncovered_count", 0)),
     }
 
 
@@ -366,15 +451,17 @@ def _merge_passes(
 
 def _build_report_md(qa_data: dict, ctx: PipelineContext) -> str:
     """Render the QA result as a human-readable Markdown report."""
-    domain   = ctx.domain_model
-    passed   = qa_data.get("passed", False)
-    cov      = qa_data.get("coverage_score", 0.0)
-    con      = qa_data.get("consistency_score", 0.0)
-    summary  = qa_data.get("summary", "")
-    issues   = qa_data.get("issues", [])
-    coverage = qa_data.get("coverage", {})
-    strengths= qa_data.get("strengths", [])
-    recs     = qa_data.get("recommendations", [])
+    domain        = ctx.domain_model
+    passed        = qa_data.get("passed", False)
+    cov           = qa_data.get("coverage_score", 0.0)
+    con           = qa_data.get("consistency_score", 0.0)
+    summary       = qa_data.get("summary", "")
+    issues        = qa_data.get("issues", [])
+    coverage      = qa_data.get("coverage", {})
+    strengths     = qa_data.get("strengths", [])
+    recs          = qa_data.get("recommendations", [])
+    audit_entries = qa_data.get("audit", [])
+    audit_summary = qa_data.get("audit_summary", "")
 
     critical = [i for i in issues if i.get("severity") == "critical"]
     major    = [i for i in issues if i.get("severity") == "major"]
@@ -431,6 +518,33 @@ def _build_report_md(qa_data: dict, ctx: PipelineContext) -> str:
         lines += ["## Recommendations", ""]
         for r in recs:
             lines.append(f"- {r}")
+        lines.append("")
+
+    if audit_entries:
+        lines += ["## Reverse Audit (Spot-Check)", ""]
+        if audit_summary:
+            lines.append(audit_summary)
+            lines.append("")
+        missing_files = [e for e in audit_entries
+                         if str(e.get("feature", "")).upper() == "MISSING"]
+        covered_files = [e for e in audit_entries
+                         if str(e.get("feature", "")).upper() != "MISSING"]
+        lines.append(
+            f"**{len(covered_files)} of {len(audit_entries)} sampled file(s) covered** "
+            f"· {len(missing_files)} MISSING from domain model"
+        )
+        lines.append("")
+        lines.append("| File | Feature | Confidence | Note |")
+        lines.append("|------|---------|-----------|------|")
+        for entry in audit_entries:
+            feat = entry.get("feature", "?")
+            icon = "✅" if feat.upper() != "MISSING" else "❌"
+            lines.append(
+                f"| `{entry.get('file', '?')}` "
+                f"| {icon} {feat} "
+                f"| {entry.get('confidence', '?')} "
+                f"| {entry.get('note', '')} |"
+            )
         lines.append("")
 
     if ctx.ba_artifacts:
