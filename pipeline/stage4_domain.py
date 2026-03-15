@@ -611,13 +611,18 @@ def _build_user_prompt(ctx: PipelineContext, chunks: list[dict]) -> str:
 
 def _call_part(system_prompt: str, user_prompt: str,
                max_tokens: int, label: str) -> str:
-    """Call the configured LLM and return the raw response string."""
+    """Call the configured LLM and return the raw response string.
+
+    json_mode=True forces local models (Ollama etc.) to output valid JSON
+    via response_format, preventing Qwen3 / DeepSeek-R1 from writing prose.
+    """
     from pipeline.llm_client import call_llm
     return call_llm(
         system_prompt = system_prompt,
         user_prompt   = user_prompt,
         max_tokens    = max_tokens,
         label         = label,
+        json_mode     = True,
     )
 
 

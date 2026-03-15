@@ -175,6 +175,7 @@ def call_llm(
     max_tokens:    int = 8192,
     temperature:   float = 0.2,
     label:         str = "",        # e.g. "stage4" — used in log messages
+    json_mode:     bool = False,    # force JSON output (local provider only)
 ) -> str:
     """
     Call the configured LLM provider and return the response text.
@@ -213,6 +214,9 @@ def call_llm(
 
     for attempt in range(MAX_RETRIES + 1):   # attempt 0 = first try
         try:
+            if provider == "local":
+                return _call_local(system_prompt, user_prompt, max_tokens,
+                                   temperature, model, json_mode=json_mode)
             return call_fn(system_prompt, user_prompt, max_tokens, temperature, model)
 
         except _NonRetryableError:
@@ -258,6 +262,7 @@ def _call_local(
     max_tokens:    int,
     temperature:   float,
     model:         str,
+    json_mode:     bool = False,
 ) -> str:
     """
     Call a local LLM server via its OpenAI-compatible /v1/chat/completions endpoint.
@@ -295,6 +300,10 @@ def _call_local(
         "temperature": temperature,
         "stream":      False,
     }
+    if json_mode:
+        # Forces Ollama / LM Studio / llama.cpp to output valid JSON.
+        # Supported by Ollama ≥ 0.1.14 and LM Studio ≥ 0.2.
+        payload["response_format"] = {"type": "json_object"}
 
     body    = json.dumps(payload).encode("utf-8")
     headers = {"Content-Type": "application/json"}
@@ -352,6 +361,11 @@ def _call_local(
     # it so the pipeline can continue without the caller needing to know.
     if not content:
         content = message.get("reasoning", "") or ""
+
+    # Strip <think>...</think> blocks that Qwen3 and DeepSeek-R1 prepend to
+    # their final answer — the pipeline only wants the answer, not the scratchpad.
+    import re as _re
+    content = _re.sub(r"<think>.*?</think>", "", content, flags=_re.DOTALL).strip()
 
     if not content:
         raise _NonRetryableError(
