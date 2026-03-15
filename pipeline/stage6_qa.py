@@ -54,7 +54,7 @@ from context import PipelineContext, QAResult
 
 QA_REPORT_FILE = "qa_report.md"
 QA_JSON_FILE   = "qa_result.json"
-MAX_TOKENS     = 4096
+MAX_TOKENS     = 8192
 
 # Characters of each artefact sent to Pass B.
 # 3000 × 4 = 12k + ~2k domain model = ~14k total — safe for a 4k response.
