@@ -1,34 +1,35 @@
 """
-run_stage6.py — Standalone runner for Stage 6 (QA Review)
+run_stage65.py — Standalone runner for Stage 6.5 (Post-Processing)
 
 Usage:
-    python run_stage6.py outputs/run_<timestamp>/context.json
-    python run_stage6.py /path/to/php-project
+    python run_stage65.py outputs/run_<timestamp>/context.json
+    python run_stage65.py /path/to/php-project
 """
 
 from __future__ import annotations
 
 import sys
 from pathlib import Path
+sys.path.insert(0, str(Path(__file__).parent.parent))  # locate project root
 
 
 def main() -> None:
     if len(sys.argv) < 2:
-        print("Usage: python run_stage6.py <context.json | project-path>")
+        print("Usage: python run_stage65.py <context.json | project-path>")
         sys.exit(1)
 
     from context import PipelineContext
-    from pipeline.stage6_qa import run as stage6_run
+    from pipeline.stage65_postprocess import run as stage65_run
 
     ctx = _load_or_create(sys.argv[1])
 
     print(f"Run ID : {ctx.run_id}")
     print(f"Project: {ctx.php_project_path}")
 
-    stage6_run(ctx)
+    stage65_run(ctx)
 
-    print(f"\nRun Stage 6.5 next:")
-    print(f"  python run_stage65.py {ctx.context_file}")
+    print(f"\n🎉 Pipeline complete!")
+    print(f"   All outputs in: {ctx.output_dir}")
 
 
 def _load_or_create(arg: str):

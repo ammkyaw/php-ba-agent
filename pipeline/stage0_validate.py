@@ -382,10 +382,12 @@ def _find_parser_script(project_path: Path) -> Optional[str]:
         return env_path
 
     search_dirs = [
-        Path(__file__).parent,           # pipeline/
-        Path(__file__).parent.parent,    # project root
-        project_path,                    # the PHP project itself
-        Path.cwd(),                      # wherever we're running from
+        Path(__file__).parent,                       # pipeline/
+        Path(__file__).parent.parent / "parsers",    # project root/parsers/
+        Path(__file__).parent.parent,                # project root
+        project_path,                                # the PHP project itself
+        Path.cwd() / "parsers",                      # cwd/parsers/
+        Path.cwd(),                                  # wherever we're running from
     ]
     for d in search_dirs:
         candidate = d / "parse_project.php"

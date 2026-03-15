@@ -271,6 +271,65 @@ class ArchitectureMeta:
     tech_stack:       list[str] = field(default_factory=list)  # e.g. ["PHP 8.1", "MySQL 5.7"]
 
 
+# Maps output filenames to their stage subdirectory inside the run output dir.
+# output_path() uses this to keep pipeline outputs organised by stage.
+_STAGE_SUBDIRS: dict[str, str] = {
+    # Stage 0 — Validation
+    "validation_report.json":      "0_validation",
+    # Stage 1 — PHP Parsing
+    "code_map.json":               "1_parse",
+    # Stage 1.5 — Execution Paths
+    "execution_paths.json":        "1.5_paths",
+    "execution_paths_errors.json": "1.5_paths",
+    # Stage 2 — Knowledge Graph
+    "code_graph.gpickle":          "2_graph",
+    "code_graph.json":             "2_graph",
+    "code_graph.png":              "2_graph",
+    # Stage 3 — Vector Embeddings
+    "chromadb":                    "3_embed",
+    "chunks_manifest.json":        "3_embed",
+    # Stage 3.5 — Preflight
+    "preflight_report.json":       "3.5_preflight",
+    # Stage 4 — Domain Model
+    "domain_model.json":           "4_domain",
+    # Stage 4.5 — Business Flows
+    "business_flows.json":         "4.5_flows",
+    # Stage 5 — BA Documents (Markdown)
+    "brd.md":                      "5_documents",
+    "srs.md":                      "5_documents",
+    "ac.md":                       "5_documents",
+    "user_stories.md":             "5_documents",
+    # Stage 6 — QA Review
+    "qa_report.md":                "6_qa",
+    "qa_result.json":              "6_qa",
+    # Stage 6.2 — Architecture
+    "architecture.json":           "6.2_architecture",
+    "architecture.md":             "6.2_architecture",
+    # Stage 6.5 — Formatted Docs (DOCX)
+    "brd.docx":                    "6.5_formatted",
+    "srs.docx":                    "6.5_formatted",
+    "ac.docx":                     "6.5_formatted",
+    "user_stories.docx":           "6.5_formatted",
+    "qa_report.docx":              "6.5_formatted",
+    "pipeline_summary.md":         "6.5_formatted",
+    # Stage 6.7 — Diagrams
+    "diagrams":                    "6.7_diagrams",
+    # Stage 7 — PDF Delivery
+    "brd.pdf":                     "7_delivery",
+    "srs.pdf":                     "7_delivery",
+    "ac.pdf":                      "7_delivery",
+    "user_stories.pdf":            "7_delivery",
+    "qa_report.pdf":               "7_delivery",
+    "delivery":                    "7_delivery",
+    # Stage 8 — Test Cases
+    "tests.feature":               "8_tests",
+    "playwright_tests.js":         "8_tests",
+    "pytest_tests.py":             "8_tests",
+    # Stage 9 — System Knowledge Graph
+    "knowledge_graph.json":        "9_knowledge_graph",
+}
+
+
 @dataclass
 class PipelineContext:
     """
@@ -358,6 +417,11 @@ class PipelineContext:
         return self.stage(name).status == StageStatus.COMPLETED
 
     def output_path(self, filename: str) -> str:
+        stage_subdir = _STAGE_SUBDIRS.get(filename)
+        if stage_subdir:
+            subdir = os.path.join(self.output_dir, stage_subdir)
+            Path(subdir).mkdir(parents=True, exist_ok=True)
+            return os.path.join(subdir, filename)
         return os.path.join(self.output_dir, filename)
 
     def _to_dict(self) -> dict[str, Any]:

@@ -40,6 +40,7 @@ import argparse
 import sys
 import traceback
 from pathlib import Path
+sys.path.insert(0, str(Path(__file__).parent.parent))  # locate project root
 
 from context import PipelineContext, StageStatus
 from pipeline.stage9_knowledge_graph import run as stage9_run, OUTPUT_FILE
