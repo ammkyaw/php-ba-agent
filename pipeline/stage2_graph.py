@@ -1567,10 +1567,16 @@ def _shell_layout_by_type(G: nx.DiGraph) -> dict:
     type_order = ["db_table", "redirect", "superglobal", "external_function",
                   "function", "include_file", "page", "script",
                   "route", "controller", "model", "service", "form",
-                  "http_endpoint", "class_dep", "unknown"]
+                  "http_endpoint", "class_dep", "class", "method", "module",
+                  "interface", "trait", "namespace", "unknown"]
+    known_types = set(type_order)
     shells: dict[str, list] = defaultdict(list)
     for node in G.nodes():
         ntype = G.nodes[node].get("type", "unknown")
+        # Any type not in the known list falls back to "unknown" so it is
+        # always assigned a shell position and never silently dropped from the PNG.
+        if ntype not in known_types:
+            ntype = "unknown"
         shells[ntype].append(node)
 
     shell_list = [shells[t] for t in type_order if shells.get(t)]
