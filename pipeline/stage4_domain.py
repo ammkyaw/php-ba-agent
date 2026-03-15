@@ -125,6 +125,15 @@ def run(ctx: PipelineContext) -> None:
 
     debug_dir = str(Path(output_path).parent)
 
+    # ── Build grounding lists from code_map (anti-hallucination) ─────────────
+    # Injected into Call B so the model cannot invent page/table names.
+    cm = ctx.code_map
+    known_tables: list[str] = sorted({
+        q.get("table", "") for q in (cm.sql_queries or [])
+        if q.get("table") and q["table"] not in ("UNKNOWN", "")
+    })
+    known_pages: list[str] = [Path(p).name for p in sorted(cm.html_pages or [])]
+
     # ── Call A: meta + entities + contexts (fast, ~4K tokens) ────────────────
     print(f"  [stage4] Call 1/3 — domain name, entities, contexts ...")
     raw_a = _call_part(_system_meta(quality_score), user_prompt,
@@ -133,9 +142,18 @@ def run(ctx: PipelineContext) -> None:
 
     # ── Call B: features (largest field, ~8K tokens) ──────────────────────────
     print(f"  [stage4] Call 2/3 — features ...")
-    raw_b = _call_part(_system_features(quality_score), user_prompt,
-                       MAX_TOKENS_FEATURES, "stage4-B")
+    raw_b = _call_part(
+        _system_features(quality_score,
+                         known_tables=known_tables,
+                         known_pages=known_pages),
+        user_prompt, MAX_TOKENS_FEATURES, "stage4-B",
+    )
     data_b = _parse_partial(raw_b, "B", debug_dir)
+
+    # Filter hallucinated page/table names (model sometimes ignores grounding)
+    data_b = _filter_hallucinated_refs(data_b,
+                                       known_pages_lower={p.lower() for p in known_pages},
+                                       known_tables_lower={t.lower() for t in known_tables})
 
     # ── Call C: user roles + workflows (~8K tokens) ───────────────────────────
     print(f"  [stage4] Call 3/3 — user roles, workflows ...")
@@ -154,7 +172,8 @@ def run(ctx: PipelineContext) -> None:
 
     # ── Gap-fill pass (Thing 2) ───────────────────────────────────────────────
     domain_model = _gap_fill_pass(
-        ctx, domain_model, coverage_report, user_prompt, quality_score, debug_dir
+        ctx, domain_model, coverage_report, user_prompt, quality_score, debug_dir,
+        known_tables=known_tables, known_pages_lower={p.lower() for p in known_pages},
     )
 
     # ── Save ──────────────────────────────────────────────────────────────────
@@ -289,27 +308,58 @@ Rename for clarity, merge near-empty ones, but anchor to detected module names.
 Now produce the JSON for domain_name, description, key_entities, and bounded_contexts:"""
 
 
-def _system_features(quality_score: int) -> str:
-    """Call B — features list only."""
+def _system_features(
+    quality_score: int,
+    known_tables: list[str] | None = None,
+    known_pages:  list[str] | None = None,
+) -> str:
+    """Call B — features list only.
+
+    known_tables / known_pages: when provided, injected as mandatory grounding
+    so the model cannot hallucinate filenames or table names that don't exist
+    in the actual codebase.
+    """
+    # ── Build grounding block ────────────────────────────────────────────────
+    grounding_parts: list[str] = []
+    if known_tables:
+        tables_str = ", ".join(known_tables[:100])   # cap to avoid token overflow
+        grounding_parts.append(
+            "MANDATORY GROUNDING — ACTUAL DATABASE TABLES IN THIS CODEBASE:\n"
+            f"{tables_str}\n"
+            "You MUST use ONLY table names from the list above in 'tables' arrays.\n"
+            "Do NOT invent table names like 'products', 'orders', 'cart_items' "
+            "unless they actually appear in this list."
+        )
+    if known_pages:
+        pages_str = ", ".join(known_pages[:120])     # cap to avoid token overflow
+        grounding_parts.append(
+            "MANDATORY GROUNDING — ACTUAL PHP PAGE FILES IN THIS CODEBASE:\n"
+            f"{pages_str}\n"
+            "You MUST use ONLY filenames from the list above in 'pages' arrays.\n"
+            "Do NOT invent filenames like 'registration.php', 'catalog.php', "
+            "'cart.php', 'checkout.php' unless they actually appear in this list."
+        )
+    grounding = ("\n\n" + "\n\n".join(grounding_parts)) if grounding_parts else ""
+
     return f"""{_SYSTEM_PREAMBLE}
-{_evidence_instruction(quality_score)}
+{_evidence_instruction(quality_score)}{grounding}
 
 Output ONLY this JSON (no other fields):
 {{
   "features": [
     {{
-      "name": "Feature name (e.g. User Registration)",
+      "name": "Feature name",
       "description": "What this feature does from a business perspective",
-      "pages": ["registration.php"],
-      "tables": ["users"],
+      "pages": ["actual_page.php"],
+      "tables": ["actual_table"],
       "inputs": ["field1", "field2"],
       "outputs": "What the user gets after completing this feature",
       "business_rules": ["Rule 1", "Rule 2"]
     }}
   ]
 }}
-Every feature must reference the pages and tables that implement it.
-Be concrete and specific — use actual filenames and table names from the evidence.
+Every feature MUST reference pages and tables that ACTUALLY EXIST in the codebase
+(from the grounding lists above). Never use placeholder or invented names.
 
 Now produce the JSON for features only:"""
 
@@ -346,12 +396,20 @@ Now produce the JSON for user_roles and workflows only:"""
 
 
 def _system_gap_fill(quality_score: int, uncovered_pages: list[str],
-                     existing_feature_names: list[str]) -> str:
+                     existing_feature_names: list[str],
+                     known_tables: list[str] | None = None) -> str:
     """Call D — gap-fill features for pages not yet covered by known features."""
     existing_str = ", ".join(f'"{n}"' for n in existing_feature_names[:20])
     pages_str    = ", ".join(f'"{p}"' for p in uncovered_pages)
+    tables_grounding = ""
+    if known_tables:
+        t_str = ", ".join(known_tables[:100])
+        tables_grounding = (
+            f"\nMANDATORY GROUNDING — use ONLY these actual table names in 'tables' arrays:\n"
+            f"{t_str}\n"
+        )
     return f"""{_SYSTEM_PREAMBLE}
-{_evidence_instruction(quality_score)}
+{_evidence_instruction(quality_score)}{tables_grounding}
 
 The following PHP pages are NOT yet covered by any existing feature in the domain model:
 {pages_str}
@@ -675,6 +733,57 @@ def _call_part(system_prompt: str, user_prompt: str,
     )
 
 
+# ─── Hallucination Filter ──────────────────────────────────────────────────────
+
+
+def _filter_hallucinated_refs(
+    data: dict,
+    known_pages_lower:  set[str],
+    known_tables_lower: set[str],
+) -> dict:
+    """
+    Strip page and table references from features that don't exist in the
+    actual codebase (i.e., the model hallucinated them).
+
+    For each feature:
+      - "pages"  → keep only names that appear (case-insensitive) in known_pages_lower
+      - "tables" → keep only names that appear (case-insensitive) in known_tables_lower
+
+    Empty grounding sets mean the code_map had nothing to check against, so
+    we skip filtering for that dimension to avoid falsely removing valid refs.
+    """
+    features = data.get("features", [])
+    if not features:
+        return data
+
+    hallucinated_pages  = 0
+    hallucinated_tables = 0
+
+    for feat in features:
+        if known_pages_lower:
+            orig_pages = feat.get("pages", [])
+            real_pages = [p for p in orig_pages
+                          if Path(p).name.lower() in known_pages_lower]
+            hallucinated_pages += len(orig_pages) - len(real_pages)
+            feat["pages"] = real_pages
+
+        if known_tables_lower:
+            orig_tables = feat.get("tables", [])
+            real_tables = [t for t in orig_tables
+                           if t.lower() in known_tables_lower]
+            hallucinated_tables += len(orig_tables) - len(real_tables)
+            feat["tables"] = real_tables
+
+    if hallucinated_pages or hallucinated_tables:
+        print(
+            f"  [stage4-B] Removed {hallucinated_pages} hallucinated page ref(s) "
+            f"and {hallucinated_tables} hallucinated table ref(s) from features."
+        )
+
+    data["features"] = features
+    return data
+
+
 # ─── Coverage Metrics ──────────────────────────────────────────────────────────
 
 
@@ -779,6 +888,8 @@ def _gap_fill_pass(
     user_prompt: str,
     quality_score: int,
     debug_dir: str | None = None,
+    known_tables: list[str] | None = None,
+    known_pages_lower: set[str] | None = None,
 ) -> "DomainModel":
     """
     If page_coverage < 1.0, make an additional LLM call (Call D) to extract
@@ -797,9 +908,18 @@ def _gap_fill_pass(
     )
 
     existing_names = [f["name"] for f in domain_model.features]
-    gap_system     = _system_gap_fill(quality_score, gap_pages, existing_names)
+    gap_system     = _system_gap_fill(quality_score, gap_pages, existing_names,
+                                      known_tables=known_tables)
     raw_d          = _call_part(gap_system, user_prompt, MAX_TOKENS_GAP_FILL, "stage4-D")
     data_d         = _parse_partial(raw_d, "D", debug_dir)
+
+    # Filter hallucinated refs from gap-fill response
+    if known_pages_lower or known_tables:
+        data_d = _filter_hallucinated_refs(
+            data_d,
+            known_pages_lower  = known_pages_lower  or set(),
+            known_tables_lower = {t.lower() for t in (known_tables or [])},
+        )
 
     # Normalise: some models return a bare list
     new_features: list = data_d.get("features", [])
