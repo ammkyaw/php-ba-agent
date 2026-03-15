@@ -60,7 +60,7 @@ from context import (
 
 # ── Configuration ───────────────────────────────────────────────────────────────
 CLAUDE_MODEL   = "claude-sonnet-4-20250514"
-MAX_TOKENS     = 4096
+MAX_TOKENS     = 8192
 FLOWS_FILE     = "business_flows.json"
 
 # Graph traversal limits
