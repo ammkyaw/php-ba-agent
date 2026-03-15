@@ -314,6 +314,7 @@ _STAGE_SUBDIRS: dict[str, str] = {
     "coverage_report.json":        "4_domain",
     # Stage 4.5 — Business Flows
     "business_flows.json":         "4.5_flows",
+    "flow_coverage.json":          "4.5_flows",
     # Stage 5 — BA Documents (Markdown)
     "brd.md":                      "5_documents",
     "srs.md":                      "5_documents",
