@@ -345,7 +345,13 @@ def _call_local(
         )
 
     message = choices[0].get("message", {})
-    content = message.get("content", "")
+    content = message.get("content", "") or ""
+
+    # Thinking/reasoning models (e.g. Qwen3, DeepSeek-R1) may return an empty
+    # "content" field and put the entire response in "reasoning".  Fall back to
+    # it so the pipeline can continue without the caller needing to know.
+    if not content:
+        content = message.get("reasoning", "") or ""
 
     if not content:
         raise _NonRetryableError(
