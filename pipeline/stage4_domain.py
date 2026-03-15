@@ -56,7 +56,11 @@ from typing import Any
 from context import DomainModel, PipelineContext
 
 # ── Configuration ──────────────────────────────────────────────────────────────
-MAX_TOKENS       = 16000  # raised from 8192 — large codebases need room for workflows
+# Three focused calls instead of one giant call — each produces a small, bounded
+# JSON so local models (Qwen, Mistral, etc.) never hit output-token limits.
+MAX_TOKENS_META     = 4_000   # Call A: domain_name, description, key_entities, bounded_contexts
+MAX_TOKENS_FEATURES = 8_000   # Call B: features list (largest field)
+MAX_TOKENS_ROLES_WF = 8_000   # Call C: user_roles + workflows
 DOMAIN_FILE      = "domain_model.json"
 
 # Retrieval: queries × top-k chunks each
@@ -106,21 +110,37 @@ def run(ctx: PipelineContext) -> None:
     print(f"  [stage4] Retrieved {len(chunks)} unique chunks across "
           f"{len(RETRIEVAL_QUERIES)} query angles")
 
-    # ── Build prompt ──────────────────────────────────────────────────────────
+    # ── Build shared user prompt (same evidence for all 3 calls) ─────────────
     quality_score = _get_quality_score(ctx)
-    system_prompt = _build_system_prompt(quality_score)
     user_prompt   = _build_user_prompt(ctx, chunks)
 
     from pipeline.llm_client import get_provider, get_model
-    print(f"  [stage4] Calling LLM ({get_provider()} / {get_model()}) ...")
-    print(f"  [stage4] Context: {len(user_prompt)} chars, "
-          f"quality_score={quality_score}")
+    print(f"  [stage4] LLM: {get_provider()} / {get_model()} | "
+          f"context={len(user_prompt)} chars | quality={quality_score}")
 
-    # ── Call Claude ───────────────────────────────────────────────────────────
-    raw_response = _call_claude(system_prompt, user_prompt)
+    # ── Call A: meta + entities + contexts (fast, ~4K tokens) ────────────────
+    print(f"  [stage4] Call 1/3 — domain name, entities, contexts ...")
+    raw_a = _call_part(_system_meta(quality_score), user_prompt,
+                       MAX_TOKENS_META, "stage4-A")
+    data_a = _parse_partial(raw_a, "A")
 
-    # ── Parse response ────────────────────────────────────────────────────────
-    domain_model = _parse_response(raw_response)
+    # ── Call B: features (largest field, ~8K tokens) ──────────────────────────
+    print(f"  [stage4] Call 2/3 — features ...")
+    raw_b = _call_part(_system_features(quality_score), user_prompt,
+                       MAX_TOKENS_FEATURES, "stage4-B")
+    data_b = _parse_partial(raw_b, "B")
+
+    # ── Call C: user roles + workflows (~8K tokens) ───────────────────────────
+    print(f"  [stage4] Call 3/3 — user roles, workflows ...")
+    raw_c = _call_part(_system_roles_workflows(quality_score), user_prompt,
+                       MAX_TOKENS_ROLES_WF, "stage4-C")
+    data_c = _parse_partial(raw_c, "C")
+
+    # ── Merge all three dicts (A wins on overlaps, B/C fill in their fields) ──
+    merged = {**data_a, **data_b, **data_c}
+
+    # ── Hydrate DomainModel ───────────────────────────────────────────────────
+    domain_model = _hydrate_domain_model(merged)
 
     # ── Save ──────────────────────────────────────────────────────────────────
     _save_domain_model(domain_model, output_path)
@@ -206,65 +226,59 @@ def _modules_from_graph(ctx: "PipelineContext") -> dict[str, dict]:
 
 # ─── Prompt Building ───────────────────────────────────────────────────────────
 
-def _build_system_prompt(quality_score: int) -> str:
-    """
-    Build the system prompt for the DomainAnalystAgent.
-    Adjusts instruction strictness based on signal quality score.
-    """
+def _evidence_instruction(quality_score: int) -> str:
+    """Return the evidence-strictness instruction based on quality score."""
     if quality_score >= 70:
-        evidence_instruction = (
+        return (
             "Extract the domain model precisely and completely from the evidence provided. "
             "Be specific — use actual table names, field names, page names, and function names "
             "from the codebase evidence."
         )
-    else:
-        evidence_instruction = (
-            "Extract what you can from the evidence, but note where evidence is thin. "
-            "Avoid speculation — if a feature or entity is not evidenced in the codebase "
-            "context, do not invent it. Mark uncertain items with a 'confidence': 'low' field."
-        )
+    return (
+        "Extract what you can from the evidence, but note where evidence is thin. "
+        "Avoid speculation — if a feature or entity is not evidenced in the codebase "
+        "context, do not invent it."
+    )
 
-    return f"""You are a senior Business Analyst and software architect specialising in
+
+_SYSTEM_PREAMBLE = """\
+You are a senior Business Analyst and software architect specialising in
 reverse-engineering legacy PHP applications into structured business domain models.
 
-Your task is to analyse the provided PHP codebase evidence and produce a complete,
-structured domain model in JSON format.
-
-{evidence_instruction}
+Your task is to analyse the provided PHP codebase evidence and extract specific
+parts of the domain model in JSON format.
 
 CRITICAL OUTPUT RULES — you MUST follow these exactly:
 - Output ONLY the raw JSON object — no markdown fences (no ```json), no headings, no explanation
 - Start your response with {{ and end with }} — nothing before or after
-- Use EXACTLY the field names shown below — do NOT rename, restructure, or add wrapper keys
-- Do NOT use "entities", "attributes", "components" — use the field names shown
-- Use the actual names from the codebase (table names, page names, field names)
-- Every feature must reference the pages and tables that implement it
-- Be concrete and specific, not generic
+- Use EXACTLY the field names shown — do NOT rename, restructure, or add wrapper keys
+- Use actual names from the codebase (table names, page names, field names)
+"""
 
-Output this exact JSON structure (copy the field names precisely):
+
+def _system_meta(quality_score: int) -> str:
+    """Call A — domain name, description, key entities, bounded contexts."""
+    return f"""{_SYSTEM_PREAMBLE}
+{_evidence_instruction(quality_score)}
+
+Output ONLY this JSON (no other fields):
 {{
   "domain_name": "Short descriptive system name (e.g. 'Car Rental Management System')",
   "description": "2-3 sentence plain-English overview of what the system does and who uses it",
-  "user_roles": [
-    {{
-      "role": "Role name (e.g. Customer, Admin, Staff)",
-      "description": "What this role can do in the system",
-      "entry_points": ["login.php", "registration.php"]
-    }}
-  ],
   "key_entities": ["Entity1", "Entity2"],
-  "bounded_contexts": ["Context1", "Context2"],  // Use the STRUCTURALLY DETECTED MODULES as the primary source for these. Rename for clarity, merge near-empty ones, but anchor to detected module names.
-  "workflows": [
-    {{
-      "name": "Workflow name (e.g. Rental Booking Flow)",
-      "actor": "Who performs this workflow",
-      "steps": [
-        {{"step": 1, "action": "User navigates to login.php", "page": "login.php"}},
-        {{"step": 2, "action": "User submits credentials", "page": "login.php"}}
-      ],
-      "preconditions": ["User must have an account"],
-      "postconditions": ["Booking is saved in request table"]}}
-  ],
+  "bounded_contexts": ["Context1", "Context2"]
+}}
+For bounded_contexts: use the STRUCTURALLY DETECTED MODULES as the primary source.
+Rename for clarity, merge near-empty ones, but anchor to detected module names."""
+
+
+def _system_features(quality_score: int) -> str:
+    """Call B — features list only."""
+    return f"""{_SYSTEM_PREAMBLE}
+{_evidence_instruction(quality_score)}
+
+Output ONLY this JSON (no other fields):
+{{
   "features": [
     {{
       "name": "Feature name (e.g. User Registration)",
@@ -274,6 +288,37 @@ Output this exact JSON structure (copy the field names precisely):
       "inputs": ["field1", "field2"],
       "outputs": "What the user gets after completing this feature",
       "business_rules": ["Rule 1", "Rule 2"]
+    }}
+  ]
+}}
+Every feature must reference the pages and tables that implement it.
+Be concrete and specific — use actual filenames and table names from the evidence."""
+
+
+def _system_roles_workflows(quality_score: int) -> str:
+    """Call C — user roles and workflows."""
+    return f"""{_SYSTEM_PREAMBLE}
+{_evidence_instruction(quality_score)}
+
+Output ONLY this JSON (no other fields):
+{{
+  "user_roles": [
+    {{
+      "role": "Role name (e.g. Customer, Admin, Staff)",
+      "description": "What this role can do in the system",
+      "entry_points": ["login.php", "registration.php"]
+    }}
+  ],
+  "workflows": [
+    {{
+      "name": "Workflow name (e.g. Rental Booking Flow)",
+      "actor": "Who performs this workflow",
+      "steps": [
+        {{"step": 1, "action": "User navigates to login.php", "page": "login.php"}},
+        {{"step": 2, "action": "User submits credentials", "page": "login.php"}}
+      ],
+      "preconditions": ["User must have an account"],
+      "postconditions": ["Booking is saved in request table"]
     }}
   ]
 }}"""
@@ -555,19 +600,17 @@ def _build_user_prompt(ctx: PipelineContext, chunks: list[dict]) -> str:
     return "\n".join(parts)
 
 
-# ─── Claude API Call ───────────────────────────────────────────────────────────
+# ─── LLM Call Helper ───────────────────────────────────────────────────────────
 
-def _call_claude(system_prompt: str, user_prompt: str) -> str:
-    """
-    Call the configured LLM provider (Claude or Gemini) and return the response.
-    Provider is determined by llm_client.get_provider() — see pipeline/llm_client.py.
-    """
+def _call_part(system_prompt: str, user_prompt: str,
+               max_tokens: int, label: str) -> str:
+    """Call the configured LLM and return the raw response string."""
     from pipeline.llm_client import call_llm
     return call_llm(
         system_prompt = system_prompt,
         user_prompt   = user_prompt,
-        max_tokens    = MAX_TOKENS,
-        label         = "stage4",
+        max_tokens    = max_tokens,
+        label         = label,
     )
 
 
@@ -605,31 +648,21 @@ def _attempt_json_recovery(text: str) -> dict | None:
     return None
 
 
-def _parse_response(raw: str) -> DomainModel:
+def _parse_partial(raw: str, label: str) -> dict:
     """
-    Parse Claude's JSON response into a DomainModel.
-    Handles markdown fences if Claude accidentally includes them.
-
-    Raises:
-        RuntimeError: If the response cannot be parsed as valid JSON
-                      or is missing required fields.
+    Parse one LLM response (for a single call A/B/C) into a plain dict.
+    Handles markdown fences, prose wrappers, and truncated JSON.
+    Returns a (possibly partial) dict — missing keys are just absent.
     """
-    # ── Strip markdown / prose wrapping ─────────────────────────────────────
-    # Local models often return prose + fenced JSON, e.g.:
-    #   "# Domain Model JSON" followed by a ```json block
-    #   "Here is the result:" followed by a ```json block
-    # Strategy: find the first { and last } and extract just that span.
     text = raw.strip()
 
-    # Fast path: if it already looks like raw JSON, skip extraction
+    # Strip markdown / prose — find the outermost { ... } block
     if not text.startswith("{"):
-        # Find the outermost { ... } block
         start = text.find("{")
         end   = text.rfind("}")
         if start != -1 and end != -1 and end > start:
             text = text[start : end + 1]
         else:
-            # Fallback: strip fence lines and hope for the best
             text = "\n".join(
                 line for line in text.splitlines()
                 if not line.strip().startswith("```")
@@ -638,43 +671,32 @@ def _parse_response(raw: str) -> DomainModel:
 
     try:
         data = json.loads(text)
-    except json.JSONDecodeError as e:
-        # Attempt recovery: find the last complete top-level key and truncate
+    except json.JSONDecodeError:
         recovered = _attempt_json_recovery(text)
         if recovered:
-            print(f"  [stage4] Warning: JSON was truncated, recovered partial response.")
+            print(f"  [stage4-{label}] Warning: JSON truncated, recovered partial response.")
             data = recovered
         else:
-            raise RuntimeError(
-                f"[stage4] Failed to parse Claude's response as JSON: {e}\n"
-                f"Raw response (first 500 chars):\n{raw[:500]}"
-            )
+            print(f"  [stage4-{label}] ⚠️  Could not parse JSON — call returned empty dict.")
+            return {}
 
-    # ── Unwrap envelope ───────────────────────────────────────────────────────
-    # Local models often wrap in {"domain_model": {...}}, {"result": {...}}, etc.
-    # Unwrap whenever we have exactly one top-level key whose value is a dict.
-    # The threshold check is intentionally removed — even if the inner dict has
-    # a wrong schema we still want to unwrap and let the field remapper below
-    # handle it.
-    _ENVELOPE_KEYS = {"domain_model", "result", "response", "output", "data",
-                      "domain", "model", "json", "answer"}
+    # Unwrap envelope keys (local models often wrap in {"result": {...}} etc.)
     if (isinstance(data, dict)
             and len(data) == 1
             and isinstance(list(data.values())[0], dict)):
         wrapper_key = list(data.keys())[0]
-        print(f"  [stage4] Unwrapping envelope key '{wrapper_key}' from response.")
+        print(f"  [stage4-{label}] Unwrapping envelope key '{wrapper_key}'.")
         data = list(data.values())[0]
 
+    return data if isinstance(data, dict) else {}
+
+
+def _hydrate_domain_model(data: dict) -> DomainModel:
+    """
+    Apply field remapping, synthesize missing critical fields, and build
+    a DomainModel from the merged dict produced by the three partial calls.
+    """
     # ── Field remapping ───────────────────────────────────────────────────────
-    # Small local models (≤7B) sometimes use different field names despite the
-    # prompt.  Map known aliases onto the expected names so the rest of the
-    # pipeline doesn't break.
-    #   "name" / "system_name" / "title"  → domain_name
-    #   "summary" / "overview"            → description
-    #   "roles" / "actors" / "users"      → user_roles
-    #   "entities" / "models"             → key_entities (extract names)
-    #   "modules" / "contexts"            → bounded_contexts
-    #   "use_cases" / "flows"             → workflows
     _ALIASES: dict[str, list[str]] = {
         "domain_name":      ["name", "system_name", "title", "domain", "project_name",
                              "application_name", "app_name", "project", "system"],
@@ -697,7 +719,6 @@ def _parse_response(raw: str) -> DomainModel:
             for alias in aliases:
                 if alias in data:
                     val = data[alias]
-                    # key_entities may be a list of dicts — extract "name" field
                     if target == "key_entities" and val and isinstance(val[0], dict):
                         val = [e.get("name") or e.get("title") or str(e)
                                for e in val if isinstance(e, dict)]
@@ -708,28 +729,20 @@ def _parse_response(raw: str) -> DomainModel:
         print(f"  [stage4] Field remapping applied: {', '.join(remapped)}")
 
     # ── Synthesize missing critical fields ───────────────────────────────────
-    # Small local models often omit domain_name / description entirely.
-    # Rather than crashing, synthesize reasonable defaults from what we have
-    # so the pipeline can continue.
     if "domain_name" not in data:
-        # Try to infer from any string value in the response
         guessed = (
             data.get("title") or data.get("name") or data.get("system") or
             data.get("project") or data.get("app") or "Unknown System"
         )
-        if isinstance(guessed, str) and guessed:
-            data["domain_name"] = guessed
-        else:
-            data["domain_name"] = "Unknown System"
+        data["domain_name"] = guessed if isinstance(guessed, str) and guessed else "Unknown System"
         print(f"  [stage4] ⚠️  domain_name missing — synthesized: '{data['domain_name']}'")
 
     if "description" not in data:
-        # Build a generic description from entities + contexts if available
-        entities  = data.get("key_entities", [])[:3]
-        contexts  = data.get("bounded_contexts", [])[:3]
+        entities    = data.get("key_entities", [])[:3]
+        contexts    = data.get("bounded_contexts", [])[:3]
         entity_str  = ", ".join(str(e) for e in entities)  if entities  else ""
-        context_str = ", ".join(str(c) for c in contexts) if contexts else ""
-        parts = []
+        context_str = ", ".join(str(c) for c in contexts)  if contexts  else ""
+        parts: list[str] = []
         if entity_str:  parts.append(f"Core entities: {entity_str}")
         if context_str: parts.append(f"Bounded contexts: {context_str}")
         data["description"] = (
@@ -738,13 +751,11 @@ def _parse_response(raw: str) -> DomainModel:
         )
         print(f"  [stage4] ⚠️  description missing — synthesized from available fields.")
 
-    # Validate — now only warn on non-critical missing fields
-    required_warn = {"features", "user_roles", "key_entities",
-                     "bounded_contexts", "workflows"}
+    # Warn on any still-missing non-critical fields
+    required_warn = {"features", "user_roles", "key_entities", "bounded_contexts", "workflows"}
     missing_warn  = required_warn - set(data.keys())
     if missing_warn:
-        print(f"  [stage4] ⚠️  Truncated response — defaulting missing fields to []: "
-              f"{sorted(missing_warn)}")
+        print(f"  [stage4] ⚠️  Missing fields defaulting to []: {sorted(missing_warn)}")
 
     return DomainModel(
         domain_name      = data.get("domain_name", "Unknown System"),
