@@ -35,6 +35,18 @@ Checks implemented
         Acceptance Criteria section in the AC artefact.  Missing AC for a
         flow-backed feature is a direct gap in QA coverage.
 
+  C-06  Route Coverage Gap
+        Every non-GROUP HTTP route registered in the codebase should appear
+        in at least one flow step.  Routes with no corresponding flow represent
+        business behaviour that was not captured in the BA artefacts.
+
+  C-07  SQL Write Operations Not in Flows
+        Every INSERT / UPDATE / DELETE / REPLACE operation found in the
+        codebase should be reachable from at least one flow step (i.e. the
+        source file appears as a flow step page).  Write operations with no
+        corresponding flow indicate missing business flows for data-mutating
+        behaviour — the highest-priority coverage gap.
+
 Output
 ------
   Returns list[dict] — each dict matches the stage6 issue schema:
@@ -84,6 +96,8 @@ def run_checks(ctx: Any, artefacts: dict[str, str] | None = None) -> list[dict]:
     if artefacts:
         issues.extend(_check_feature_heading_presence(ctx, artefacts))
         issues.extend(_check_flow_ac_coverage(ctx, artefacts))
+    issues.extend(_check_routes_not_in_flows(ctx))
+    issues.extend(_check_sql_not_in_flows(ctx))
     return issues
 
 
@@ -403,7 +417,155 @@ def _check_flow_ac_coverage(
     return issues
 
 
+# ─── C-06: Route Coverage Gap ────────────────────────────────────────────────
+
+def _check_routes_not_in_flows(ctx: Any) -> list[dict]:
+    """
+    Every non-GROUP HTTP route should appear in at least one flow step.
+    Routes whose source file has no matching flow step page represent
+    business behaviour missing from the BA artefacts.
+
+    Severity: minor — many framework-internal / utility routes are benign,
+    but the analyst should consciously decide whether each gap matters.
+    """
+    cm    = getattr(ctx, "code_map",       None)
+    flows = getattr(ctx, "business_flows", None)
+    if not cm or not cm.routes:
+        return []
+
+    # Build the set of file basenames that appear in at least one flow step
+    flow_pages = _flow_page_set(flows)
+
+    issues: list[dict] = []
+
+    # De-duplicate by (method, path) — multiple registrations of the same
+    # route endpoint produce only one issue.
+    reported: set[tuple[str, str]] = set()
+
+    for r in cm.routes:
+        method = r.get("method", "")
+        if method in ("GROUP", ""):
+            continue   # skip grouping pseudo-entries
+
+        path  = r.get("path", "")
+        rfile = r.get("file", "")
+        key   = (method.upper(), path)
+        if key in reported:
+            continue
+
+        basename = Path(rfile).name.lower() if rfile else ""
+        if basename and basename not in flow_pages:
+            reported.add(key)
+            issues.append(_issue(
+                severity       = _MINOR,
+                artefact       = "cross-doc",
+                category       = "Route Coverage Gap",
+                description    = (
+                    f"Route `{method} {path}` [{Path(rfile).name}] has no "
+                    f"corresponding business flow. The endpoint is registered "
+                    f"in the codebase but never appears as a flow step page."
+                ),
+                recommendation = (
+                    f"Add a business flow that exercises `{method} {path}`, "
+                    f"or document why this route is intentionally out-of-scope."
+                ),
+            ))
+
+    return issues
+
+
+# ─── C-07: SQL Write Operations Not in Flows ──────────────────────────────────
+
+_SQL_WRITE_OPS = {"INSERT", "UPDATE", "DELETE", "REPLACE"}
+
+
+def _check_sql_not_in_flows(ctx: Any) -> list[dict]:
+    """
+    Every INSERT / UPDATE / DELETE / REPLACE operation should be reachable
+    from at least one flow step.  Write operations not covered by any flow
+    indicate missing or incomplete business flows for data-mutating behaviour.
+
+    Severity:
+      DELETE / REPLACE → critical (irreversible data loss path unrepresented)
+      UPDATE           → major
+      INSERT           → minor (may be seeding / logging — less risky)
+    """
+    cm    = getattr(ctx, "code_map",       None)
+    flows = getattr(ctx, "business_flows", None)
+    if not cm or not cm.sql_queries:
+        return []
+
+    flow_pages = _flow_page_set(flows)
+
+    # De-duplicate by (operation, table) — same write to same table from
+    # multiple files only produces one issue (pick the first file seen).
+    reported: dict[tuple[str, str], str] = {}   # key → file
+
+    for q in cm.sql_queries:
+        op    = (q.get("operation") or "").upper().strip()
+        table = (q.get("table")     or "").strip()
+        qfile =  q.get("file",       "")
+
+        if op not in _SQL_WRITE_OPS:
+            continue
+        if not table or table.upper() in ("", "UNKNOWN"):
+            continue
+
+        basename = Path(qfile).name.lower() if qfile else ""
+        if not basename or basename in flow_pages:
+            continue   # covered — no issue
+
+        key = (op, table.lower())
+        if key not in reported:
+            reported[key] = qfile
+
+    issues: list[dict] = []
+    for (op, table), qfile in reported.items():
+        if op in ("DELETE", "REPLACE"):
+            sev = _CRITICAL
+        elif op == "UPDATE":
+            sev = _MAJOR
+        else:  # INSERT
+            sev = _MINOR
+
+        issues.append(_issue(
+            severity       = sev,
+            artefact       = "cross-doc",
+            category       = "SQL Write Operations Not in Flows",
+            description    = (
+                f"SQL write `{op} {table}` [{Path(qfile).name}] has no "
+                f"corresponding business flow. The data-mutating operation "
+                f"exists in the codebase but is not represented in any BA "
+                f"artefact."
+            ),
+            recommendation = (
+                f"Add a business flow that covers the `{op} {table}` "
+                f"operation, or verify that the operation is framework "
+                f"infrastructure not requiring a user-facing flow."
+            ),
+        ))
+
+    return issues
+
+
 # ─── Helpers ─────────────────────────────────────────────────────────────────
+
+def _flow_page_set(flows: Any) -> set[str]:
+    """
+    Return the set of lower-case file basenames that appear as step pages
+    in the generated business flows.  Re-used by C-06 and C-07.
+    """
+    pages: set[str] = set()
+    if not flows or not flows.flows:
+        return pages
+    for flow in flows.flows:
+        for step in flow.steps:
+            if step.page:
+                raw = step.page.split("?")[0].strip()
+                if raw:
+                    pages.add(Path(raw).name.lower())
+    return pages
+
 
 def _issue(
     severity: str,
