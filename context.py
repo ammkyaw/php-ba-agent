@@ -12,6 +12,25 @@ from datetime import datetime
 from enum import Enum
 from pathlib import Path
 from typing import Any, Optional
+import re
+
+
+def _project_slug(php_project_path: str) -> str:
+    """
+    Derive a filesystem-safe folder name from a project path.
+
+    Examples
+    --------
+    /home/user/SugarCRM-hotfix   →  SugarCRM-hotfix
+    /projects/my project/        →  my-project
+    /var/www/html                →  html
+    """
+    name = Path(php_project_path).resolve().name or "project"
+    # Replace whitespace and non-alphanumeric chars (except - and _) with -
+    slug = re.sub(r"[^\w\-]", "-", name)
+    # Collapse multiple consecutive dashes
+    slug = re.sub(r"-{2,}", "-", slug).strip("-")
+    return slug or "project"
 
 
 class StageStatus(str, Enum):
@@ -381,8 +400,9 @@ class PipelineContext:
 
     @classmethod
     def create(cls, php_project_path: str, output_base: str = "outputs") -> "PipelineContext":
-        run_id     = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
-        output_dir = os.path.join(output_base, f"run_{run_id}")
+        run_id       = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+        project_name = _project_slug(php_project_path)
+        output_dir   = os.path.join(output_base, project_name, f"run_{run_id}")
         Path(output_dir).mkdir(parents=True, exist_ok=True)
         ctx = cls(
             run_id           = run_id,
