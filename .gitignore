@@ -212,7 +212,5 @@ pipeline/__pycache__/
 
 **/.DS_Store
 
-
 composer.*
-
-vendor/.DS_Store
+.continue
