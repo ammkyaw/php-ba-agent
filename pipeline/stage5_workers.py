@@ -156,6 +156,7 @@ async def _run_agent(
 def _run_brd_agent(domain: DomainModel, ctx: PipelineContext) -> str:
     """Generate the Business Requirements Document."""
     from pipeline.llm_client import call_llm
+    from pipeline.evidence_index import build_evidence_index, format_evidence_block
 
     # Compact domain summary — avoids sending the full JSON blob
     feature_lines = "\n".join(
@@ -175,9 +176,14 @@ def _run_brd_agent(domain: DomainModel, ctx: PipelineContext) -> str:
     from pipeline.framework_hints import get_hints
     hints = get_hints(ctx.code_map.framework if ctx.code_map else "unknown")
 
+    # Build evidence index once — maps feature_name → {routes, sql, ...}
+    ev_idx = build_evidence_index(ctx, domain)
+
     system = f"""You are a senior Business Analyst writing a formal Business Requirements Document (BRD).
 Write in professional business language using actual system names from the evidence.
 Use proper Markdown with headers, bullet points, and tables.
+When an Evidence block is provided under a feature, use those routes/SQL/fields to write
+specific, grounded acceptance criteria and descriptions — not generic placeholders.
 Output ONLY the document — no preamble, no commentary after.
 
 Framework context: {hints.brd_note}"""
@@ -186,15 +192,21 @@ Framework context: {hints.brd_note}"""
     all_feature_names = ", ".join(f['name'] for f in domain.features)
     n_features = len(domain.features)
 
-    # Pre-build the BR scaffold — numbered ### headings force the model to use
-    # the EXACT feature names from the domain model. Using ### (not bold) ensures
-    # _extract_headings() in stage6 can find them for coverage scoring.
+    # Pre-build the BR scaffold — numbered ### headings + evidence block per feature.
+    # Using ### (not bold) ensures _extract_headings() in stage6 finds them.
+    def _br_entry(i: int, f: dict) -> str:
+        ev_block = format_evidence_block(ev_idx.get(f["name"], {}))
+        ev_str   = f"\n{ev_block}" if ev_block else ""
+        return (
+            f"### BR-{i:02d}: {f['name']}\n"
+            f"- Description: {f.get('description', 'see domain model')}\n"
+            f"- Priority: High/Medium/Low\n"
+            f"- Acceptance: [write 1 specific criterion using evidence below]"
+            f"{ev_str}"
+        )
+
     br_scaffold = "\n\n".join(
-        f"### BR-{i:02d}: {f['name']}\n"
-        f"- Description: {f.get('description', 'see domain model')}\n"
-        f"- Priority: High/Medium/Low\n"
-        f"- Acceptance: [write 1 criterion]"
-        for i, f in enumerate(domain.features, 1)
+        _br_entry(i, f) for i, f in enumerate(domain.features, 1)
     )
 
     user = f"""Write a BRD for: {domain.domain_name}
@@ -258,28 +270,52 @@ Markdown table: Term | Definition"""
 def _run_srs_agent(domain: DomainModel, ctx: PipelineContext) -> str:
     """Generate the Software Requirements Specification."""
     from pipeline.llm_client import call_llm
+    from pipeline.evidence_index import build_evidence_index, format_evidence_block
 
     from pipeline.framework_hints import get_hints
     hints = get_hints(ctx.code_map.framework if ctx.code_map else "unknown")
 
+    ev_idx = build_evidence_index(ctx, domain)
+
     system = f"""You are a senior software engineer writing a formal Software Requirements Specification (SRS)
-following IEEE 830 conventions. Be precise and technical. Reference actual page names, table names, and
-field names from the evidence. Output clean Markdown only.
+following IEEE 830 conventions. Be precise and technical.
+When an Evidence block is provided under a feature, derive concrete Input/Processing/Output/Tables
+values from it rather than using placeholders — reference actual route paths, table names, and
+form field names. Output clean Markdown only.
 
 {hints.srs_note}"""
 
     all_feature_names = ", ".join(f['name'] for f in domain.features)
     n_features = len(domain.features)
 
+    # Pre-build the FR scaffold for Section 3 with evidence per feature.
+    def _fr_entry(i: int, f: dict) -> str:
+        ev_block = format_evidence_block(ev_idx.get(f["name"], {}))
+        ev_str   = f"\n{ev_block}" if ev_block else ""
+        return (
+            f"### 3.{i} {f['name']}\n"
+            f"FR-{i:03d}: {f.get('description', '[describe requirement]')}\n"
+            f"Input: [form fields / query params]\n"
+            f"Processing: [business logic]\n"
+            f"Output: [result / redirect / data change]\n"
+            f"Pages: {', '.join(_to_str_list(f.get('pages', []))) or 'see domain model'}\n"
+            f"Tables: {', '.join(_to_str_list(f.get('tables', []))) or 'see domain model'}"
+            f"{ev_str}"
+        )
+
+    fr_scaffold = "\n\n".join(
+        _fr_entry(i, f) for i, f in enumerate(domain.features, 1)
+    )
+
     user = f"""Using the domain model below, write a complete SRS for the '{domain.domain_name}'.
 
 DOMAIN MODEL:
 {_format_domain_for_prompt(domain)}
 
-CRITICAL: Section 3 MUST contain exactly {n_features} subsections — one per feature:
-{all_feature_names}
+CRITICAL: Section 3 MUST contain exactly {n_features} subsections — one per feature.
 Do not skip ANY feature. For trivial features (e.g. logout, static pages) write a brief
 FR with: Input=none, Processing=minimal, Output=redirect or display, Tables=none.
+Fill in the bracketed placeholders using the Evidence blocks provided.
 
 Write the SRS with these exact sections:
 
@@ -298,14 +334,8 @@ For each user role: name, technical level, frequency of use, key tasks.
 ### 2.4 Assumptions and Dependencies
 
 ## 3. Functional Requirements
-For each feature, write detailed functional requirements:
-### 3.X [Feature Name]
-FR-XXX: [Requirement ID and description]
-Input: [Fields and their validation rules]
-Processing: [Business logic]
-Output: [Expected result / redirect / data change]
-Pages: [Which PHP pages implement this]
-Tables: [Which DB tables are affected]
+
+{fr_scaffold}
 
 ## 4. Non-Functional Requirements
 ### 4.1 Security Requirements
@@ -330,38 +360,51 @@ Technical and business constraints on the implementation."""
 def _run_ac_agent(domain: DomainModel, ctx: PipelineContext) -> str:
     """Generate Acceptance Criteria for all features."""
     from pipeline.llm_client import call_llm
+    from pipeline.evidence_index import build_evidence_index, format_evidence_block
 
     from pipeline.framework_hints import get_hints
     hints = get_hints(ctx.code_map.framework if ctx.code_map else "unknown")
 
+    ev_idx = build_evidence_index(ctx, domain)
+
     system = f"""You are a QA lead writing Acceptance Criteria for a software system.
 Write criteria in Given/When/Then (Gherkin) format where appropriate, and as clear
-pass/fail statements otherwise. Be specific — reference actual field names, page names,
-and table names. Output clean Markdown only.
+pass/fail statements otherwise.
+When an Evidence block is provided, derive Given/When/Then values directly from it:
+  - Given: reference the auth guard / session precondition from ExecPath
+  - When: reference the actual route, form field names, and HTTP method
+  - Then: reference the SQL operation and table, or the redirect target
+Output clean Markdown only.
 
 {hints.ac_template}"""
 
     ep_section     = _format_execution_paths_for_prompt(ctx)
     flows_section  = _format_business_flows_for_prompt(ctx)
 
-    # Pre-build the AC scaffold with exact feature names as ## headings.
-    # This guarantees _extract_headings() in stage6 can match domain feature names.
-    # Model must fill in the criteria content — it MUST NOT rename these headings.
+    # Pre-build the AC scaffold — exact feature-name ## headings + evidence blocks.
+    # Headings are FIXED; model fills in Given/When/Then using the evidence.
+    def _ac_entry(i: int, f: dict) -> str:
+        ev_block = format_evidence_block(ev_idx.get(f["name"], {}))
+        ev_str   = f"\n{ev_block}\n" if ev_block else ""
+        return (
+            f"## AC-{i:02d}: {f['name']}\n"
+            f"**Feature:** {f.get('description', 'see domain model')}\n"
+            f"**Pages:** {', '.join(_to_str_list(f.get('pages', []))) or 'see domain model'}\n"
+            f"**Tables:** {', '.join(_to_str_list(f.get('tables', []))) or 'see domain model'}\n"
+            f"{ev_str}\n"
+            f"### Acceptance Criteria:\n\n"
+            f"**AC-{i:02d}-01: Happy path**\n"
+            f"- Given: [precondition — use auth/session from evidence]\n"
+            f"- When: [action — use route/form fields from evidence]\n"
+            f"- Then: [result — use SQL table/redirect from evidence]\n\n"
+            f"**AC-{i:02d}-02: Validation failure**\n"
+            f"- Given: [precondition]\n"
+            f"- When: [invalid or edge action]\n"
+            f"- Then: [expected error/rejection]"
+        )
+
     ac_scaffold = "\n\n---\n\n".join(
-        f"## AC-{i:02d}: {f['name']}\n"
-        f"**Feature:** {f.get('description', 'see domain model')}\n"
-        f"**Pages:** {', '.join(_to_str_list(f.get('pages', []))) or 'see domain model'}\n"
-        f"**Tables:** {', '.join(_to_str_list(f.get('tables', []))) or 'see domain model'}\n\n"
-        f"### Acceptance Criteria:\n\n"
-        f"**AC-{i:02d}-01: Happy path**\n"
-        f"- Given: [precondition]\n"
-        f"- When: [action]\n"
-        f"- Then: [expected result]\n\n"
-        f"**AC-{i:02d}-02: Validation failure**\n"
-        f"- Given: [precondition]\n"
-        f"- When: [invalid or edge action]\n"
-        f"- Then: [expected error/rejection]"
-        for i, f in enumerate(domain.features, 1)
+        _ac_entry(i, f) for i, f in enumerate(domain.features, 1)
     )
 
     user = f"""Using the domain model below, write complete Acceptance Criteria for '{domain.domain_name}'.
@@ -400,43 +443,50 @@ def _run_userstories_agent(domain: DomainModel, ctx: PipelineContext) -> str:
     from pipeline.llm_client import call_llm
 
     from pipeline.framework_hints import get_hints
+    from pipeline.evidence_index import build_evidence_index, format_evidence_block
     hints = get_hints(ctx.code_map.framework if ctx.code_map else "unknown")
+
+    ev_idx = build_evidence_index(ctx, domain)
 
     system = f"""You are an Agile product owner writing User Stories for a development team.
 Write stories in standard format: 'As a [role], I want to [action], so that [benefit]'.
 Include story points (Fibonacci: 1,2,3,5,8,13), priority (Must/Should/Could/Won't),
-and detailed acceptance criteria for each story. Reference actual page and field names.
-Output clean Markdown only.
+and detailed acceptance criteria for each story.
+When an Evidence block is provided under an Epic, write the "I want to" and acceptance
+criteria using the actual route paths, form field names, and table names from the evidence
+rather than generic placeholders. Output clean Markdown only.
 
 {hints.story_note}"""
 
     ep_section     = _format_execution_paths_for_prompt(ctx)
     flows_section  = _format_business_flows_for_prompt(ctx)
 
-    # Pre-build one Epic scaffold per feature so the exact feature names appear
-    # as ## headings. This ensures stage6 Pass A can match them for coverage.
+    # Pre-build one Epic scaffold per feature — exact feature-name ## headings + evidence.
     # Model fills in the story content — must NOT rename the ## Epic: lines.
-    us_counter = [1]  # mutable counter shared across generator
+    us_counter = [1]  # mutable counter for story IDs
     def _epic_block(f: dict) -> str:
         feat_name = f['name']
-        desc = f.get('description', '')
-        pages = ', '.join(_to_str_list(f.get('pages', []))) or 'see domain model'
+        desc   = f.get('description', '')
+        pages  = ', '.join(_to_str_list(f.get('pages', []))) or 'see domain model'
         tables = ', '.join(_to_str_list(f.get('tables', []))) or 'see domain model'
-        idx = us_counter[0]
+        idx    = us_counter[0]
         us_counter[0] += 1
+        ev_block = format_evidence_block(ev_idx.get(feat_name, {}))
+        ev_str   = f"\n{ev_block}\n" if ev_block else ""
         return (
             f"## Epic: {feat_name}\n\n"
+            f"{ev_str}"
             f"### US-{idx:03d}: [Story title for {feat_name}]\n"
             f"**As a** [role]\n"
-            f"**I want to** [action using pages={pages}]\n"
+            f"**I want to** [action — derive from route/form fields in evidence]\n"
             f"**So that** [benefit]\n\n"
             f"**Priority:** Must Have / Should Have / Could Have / Won't Have\n"
             f"**Story Points:** [1 | 2 | 3 | 5 | 8 | 13]\n"
             f"**Pages:** {pages}\n"
             f"**Tables:** {tables}\n\n"
             f"**Acceptance Criteria:**\n"
-            f"- [ ] [criterion 1]\n"
-            f"- [ ] [criterion 2 — negative case]\n\n"
+            f"- [ ] [criterion 1 — reference actual field/table from evidence]\n"
+            f"- [ ] [criterion 2 — negative/edge case]\n\n"
             f"**Notes:** {desc}"
         )
 
