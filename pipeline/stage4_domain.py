@@ -118,23 +118,25 @@ def run(ctx: PipelineContext) -> None:
     print(f"  [stage4] LLM: {get_provider()} / {get_model()} | "
           f"context={len(user_prompt)} chars | quality={quality_score}")
 
+    debug_dir = str(Path(output_path).parent)
+
     # ── Call A: meta + entities + contexts (fast, ~4K tokens) ────────────────
     print(f"  [stage4] Call 1/3 — domain name, entities, contexts ...")
     raw_a = _call_part(_system_meta(quality_score), user_prompt,
                        MAX_TOKENS_META, "stage4-A")
-    data_a = _parse_partial(raw_a, "A")
+    data_a = _parse_partial(raw_a, "A", debug_dir)
 
     # ── Call B: features (largest field, ~8K tokens) ──────────────────────────
     print(f"  [stage4] Call 2/3 — features ...")
     raw_b = _call_part(_system_features(quality_score), user_prompt,
                        MAX_TOKENS_FEATURES, "stage4-B")
-    data_b = _parse_partial(raw_b, "B")
+    data_b = _parse_partial(raw_b, "B", debug_dir)
 
     # ── Call C: user roles + workflows (~8K tokens) ───────────────────────────
     print(f"  [stage4] Call 3/3 — user roles, workflows ...")
     raw_c = _call_part(_system_roles_workflows(quality_score), user_prompt,
                        MAX_TOKENS_ROLES_WF, "stage4-C")
-    data_c = _parse_partial(raw_c, "C")
+    data_c = _parse_partial(raw_c, "C", debug_dir)
 
     # ── Merge all three dicts (A wins on overlaps, B/C fill in their fields) ──
     merged = {**data_a, **data_b, **data_c}
@@ -269,7 +271,9 @@ Output ONLY this JSON (no other fields):
   "bounded_contexts": ["Context1", "Context2"]
 }}
 For bounded_contexts: use the STRUCTURALLY DETECTED MODULES as the primary source.
-Rename for clarity, merge near-empty ones, but anchor to detected module names."""
+Rename for clarity, merge near-empty ones, but anchor to detected module names.
+
+Now produce the JSON for domain_name, description, key_entities, and bounded_contexts:"""
 
 
 def _system_features(quality_score: int) -> str:
@@ -292,7 +296,9 @@ Output ONLY this JSON (no other fields):
   ]
 }}
 Every feature must reference the pages and tables that implement it.
-Be concrete and specific — use actual filenames and table names from the evidence."""
+Be concrete and specific — use actual filenames and table names from the evidence.
+
+Now produce the JSON for features only:"""
 
 
 def _system_roles_workflows(quality_score: int) -> str:
@@ -321,7 +327,9 @@ Output ONLY this JSON (no other fields):
       "postconditions": ["Booking is saved in request table"]
     }}
   ]
-}}"""
+}}
+
+Now produce the JSON for user_roles and workflows only:"""
 
 
 def _build_user_prompt(ctx: PipelineContext, chunks: list[dict]) -> str:
@@ -595,7 +603,6 @@ def _build_user_prompt(ctx: PipelineContext, chunks: list[dict]) -> str:
         parts.append(chunk["text"])
 
     parts.append("\n=== END OF CODEBASE EVIDENCE ===")
-    parts.append("\nNow produce the domain model JSON:")
 
     return "\n".join(parts)
 
@@ -648,18 +655,43 @@ def _attempt_json_recovery(text: str) -> dict | None:
     return None
 
 
-def _parse_partial(raw: str, label: str) -> dict:
+def _parse_partial(raw: str, label: str, debug_dir: str | None = None) -> dict:
     """
     Parse one LLM response (for a single call A/B/C) into a plain dict.
-    Handles markdown fences, prose wrappers, and truncated JSON.
+    Handles markdown fences, prose wrappers, top-level arrays, and truncated JSON.
     Returns a (possibly partial) dict — missing keys are just absent.
+
+    If debug_dir is provided, the raw response is saved to
+    {debug_dir}/stage4_raw_{label}.txt before parsing so failures can be inspected.
     """
+    # ── Save raw response for debugging ──────────────────────────────────────
+    if debug_dir:
+        try:
+            Path(debug_dir).mkdir(parents=True, exist_ok=True)
+            Path(debug_dir, f"stage4_raw_{label}.txt").write_text(raw, encoding="utf-8")
+        except Exception:
+            pass  # never let debug I/O crash the pipeline
+
     text = raw.strip()
 
-    # Strip markdown / prose — find the outermost { ... } block
-    if not text.startswith("{"):
-        start = text.find("{")
-        end   = text.rfind("}")
+    # Strip markdown / prose — find the outermost { or [ block
+    if not text.startswith("{") and not text.startswith("["):
+        start_brace   = text.find("{")
+        start_bracket = text.find("[")
+        # Pick whichever comes first (and exists)
+        if start_brace == -1:
+            start = start_bracket
+            end   = text.rfind("]")
+        elif start_bracket == -1:
+            start = start_brace
+            end   = text.rfind("}")
+        else:
+            if start_brace < start_bracket:
+                start = start_brace
+                end   = text.rfind("}")
+            else:
+                start = start_bracket
+                end   = text.rfind("]")
         if start != -1 and end != -1 and end > start:
             text = text[start : end + 1]
         else:
@@ -680,7 +712,19 @@ def _parse_partial(raw: str, label: str) -> dict:
             print(f"  [stage4-{label}] ⚠️  Could not parse JSON — call returned empty dict.")
             return {}
 
-    # Unwrap envelope keys (local models often wrap in {"result": {...}} etc.)
+    # ── Handle top-level array (model returned [...] instead of {{...}}) ─────
+    # This happens with some local models when asked for a list field.
+    _LABEL_KEY = {"A": None, "B": "features", "C": "user_roles"}
+    if isinstance(data, list):
+        wrap_key = _LABEL_KEY.get(label)
+        if wrap_key:
+            print(f"  [stage4-{label}] Top-level array — wrapping as '{wrap_key}'.")
+            data = {wrap_key: data}
+        else:
+            print(f"  [stage4-{label}] ⚠️  Unexpected top-level array — discarding.")
+            return {}
+
+    # ── Unwrap envelope keys (local models often wrap in {{"result": {{...}}}} etc.) ──
     if (isinstance(data, dict)
             and len(data) == 1
             and isinstance(list(data.values())[0], dict)):
@@ -703,15 +747,18 @@ def _hydrate_domain_model(data: dict) -> DomainModel:
         "description":      ["summary", "overview", "desc", "purpose", "about",
                              "context", "background", "introduction"],
         "user_roles":       ["roles", "actors", "users", "user_types", "stakeholders",
-                             "personas"],
+                             "personas", "role_list", "role", "user_list",
+                             "groups", "access_levels", "user_groups", "actor_list"],
         "key_entities":     ["entities", "models", "objects", "core_entities", "nodes",
                              "classes", "tables", "resources"],
         "bounded_contexts": ["modules", "contexts", "domains", "subsystems",
                              "components", "packages", "namespaces", "services"],
-        "workflows":        ["use_cases", "flows", "processes", "user_flows",
+        "workflows":        ["flows", "processes", "user_flows",
                              "journeys", "scenarios", "interactions", "edges"],
         "features":         ["capabilities", "functionality", "functions",
-                             "requirements", "stories", "tasks"],
+                             "requirements", "stories", "tasks", "use_cases",
+                             "feature_list", "feature", "business_features",
+                             "modules_features", "epics", "operations"],
     }
     remapped: list[str] = []
     for target, aliases in _ALIASES.items():
