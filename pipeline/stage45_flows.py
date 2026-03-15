@@ -370,6 +370,15 @@ def run(ctx: PipelineContext) -> None:
         n = ctx.business_flows.total
         print(f"  [stage45] Already completed — {n} flow(s) loaded.")
         _patch_domain_workflows(ctx)
+        # Re-print coverage from saved report (or recompute if missing)
+        cov_path = ctx.output_path("flow_coverage.json")
+        if Path(cov_path).exists():
+            import json as _json
+            from pipeline.flow_coverage import _print_summary
+            _print_summary(_json.load(open(cov_path)))
+        else:
+            from pipeline.flow_coverage import compute_and_save as _flow_coverage
+            _flow_coverage(ctx)
         return
 
     _assert_prerequisites(ctx)
@@ -434,6 +443,10 @@ def run(ctx: PipelineContext) -> None:
         print(f"  [stage45]   [{f.flow_id}] {f.name} "
               f"({len(f.steps)} steps, actor={f.actor}, "
               f"ctx={f.bounded_context}, conf={f.confidence:.2f})")
+
+    # ── Coverage metrics ──────────────────────────────────────────────────────
+    from pipeline.flow_coverage import compute_and_save as _flow_coverage
+    _flow_coverage(ctx)
 
 
 # ─── Prerequisites ─────────────────────────────────────────────────────────────
