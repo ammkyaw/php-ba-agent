@@ -68,11 +68,13 @@ def _module_expand(exec_paths: list[dict], flow_pages: set[str]) -> set[str]:
     Expand *flow_pages* to include all sibling files of any file whose module
     directory is already represented in *flow_pages*.
 
-    This lets a flow that references ``ACLController.php`` also count
-    ``ACLAction.php``, ``ACLRole.php``, etc. as covered — they all live in
-    the same ``modules/ACL/`` directory.
+    Also applies directory-level expansion for non-module files: if any file
+    in ``include/CalendarProvider/`` is referenced, all siblings in that
+    directory are counted as covered.
     """
     module_files: dict[str, list[str]] = defaultdict(list)
+    dir_files: dict[str, list[str]] = defaultdict(list)
+
     for ep in exec_paths:
         f = ep.get("file", "")
         if not f:
@@ -80,15 +82,25 @@ def _module_expand(exec_paths: list[dict], flow_pages: set[str]) -> set[str]:
         mod = _extract_module_name(f)
         if mod:
             module_files[mod].append(Path(f).name.lower())
+        else:
+            parent = str(Path(f).parent)
+            dir_files[parent].append(Path(f).name.lower())
 
     covered_modules: set[str] = set()
     for mod, files in module_files.items():
         if any(f in flow_pages for f in files):
             covered_modules.add(mod)
 
+    covered_dirs: set[str] = set()
+    for parent, files in dir_files.items():
+        if any(f in flow_pages for f in files):
+            covered_dirs.add(parent)
+
     expanded: set[str] = set(flow_pages)
     for mod in covered_modules:
         expanded.update(module_files[mod])
+    for parent in covered_dirs:
+        expanded.update(dir_files[parent])
     return expanded
 
 # ── Thresholds ────────────────────────────────────────────────────────────────

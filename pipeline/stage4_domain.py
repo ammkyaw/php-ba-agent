@@ -979,11 +979,17 @@ def _build_module_expansion(
     If any file in a module directory is already covered, expand coverage to
     ALL files in that module directory (module-level coverage).
 
+    Also applies directory-level expansion for non-module files: if any file
+    in a directory like include/CalendarProvider/ is covered, all siblings
+    in that directory are counted as covered.
+
     Returns an expanded set of covered page basenames (lowercase).
     """
     from collections import defaultdict
 
     module_files: dict[str, list[str]] = defaultdict(list)
+    dir_files: dict[str, list[str]] = defaultdict(list)  # parent_dir → [basename, ...]
+
     for ep in exec_paths:
         f = ep.get("file", "")
         if not f:
@@ -991,6 +997,10 @@ def _build_module_expansion(
         mod = _extract_module_name(f)
         if mod:
             module_files[mod].append(Path(f).name.lower())
+        else:
+            # Group non-module files by their immediate parent directory
+            parent = str(Path(f).parent)
+            dir_files[parent].append(Path(f).name.lower())
 
     # Which modules have at least one covered file?
     covered_modules: set[str] = set()
@@ -998,10 +1008,18 @@ def _build_module_expansion(
         if any(f in covered_pages for f in files):
             covered_modules.add(mod)
 
-    # Expand: all files in covered modules are considered covered
+    # Which non-module directories have at least one covered file?
+    covered_dirs: set[str] = set()
+    for parent, files in dir_files.items():
+        if any(f in covered_pages for f in files):
+            covered_dirs.add(parent)
+
+    # Expand: all files in covered modules/dirs are considered covered
     expanded: set[str] = set(covered_pages)
     for mod in covered_modules:
         expanded.update(module_files[mod])
+    for parent in covered_dirs:
+        expanded.update(dir_files[parent])
     return expanded
 
 
@@ -1173,6 +1191,12 @@ def _gap_fill_pass(
     """
     cm = ctx.code_map
 
+    # Track which modules have already been sent to the LLM so we don't
+    # spin indefinitely on modules the model refuses to list page refs for.
+    attempted_modules: set[str] = set()
+    # Track which non-module files have already been sent to avoid re-sending.
+    attempted_flat: set[str] = set()
+
     for gap_round in range(1, MAX_GAP_ROUNDS + 1):
         # Re-compute which pages are still uncovered after previous rounds
         covered_pages: set[str] = set()
@@ -1203,39 +1227,55 @@ def _gap_fill_pass(
             print(f"  [stage4] All pages covered after round {gap_round - 1} — done.")
             break
 
-        # ── Module-grouped mode (preferred: covers ~10× more files per call) ──
+        # ── Group uncovered files by module and by flat remainder ─────────────
         module_groups, flat_files = _group_uncovered_by_module(
             uncovered, cm.execution_paths or []
         )
 
+        # Modules not yet attempted this pipeline run
+        fresh_module_groups = {
+            m: files for m, files in module_groups.items()
+            if m not in attempted_modules
+        }
+
         call_label = f"stage4-D{gap_round}"
         existing_names = [f["name"] for f in domain_model.features]
 
-        if module_groups:
-            # Take the next batch of modules
-            batch_modules = dict(list(module_groups.items())[:GAP_FILL_MAX_MODULES])
+        if fresh_module_groups:
+            # ── Module-grouped mode (covers ~10× more files per call) ──────
+            batch_modules = dict(list(fresh_module_groups.items())[:GAP_FILL_MAX_MODULES])
+            attempted_modules.update(batch_modules.keys())
             n_files = sum(len(v) for v in batch_modules.values())
             print(
                 f"  [stage4] Call D{gap_round} — gap-fill "
                 f"{len(batch_modules)} module(s) (~{n_files} files) "
-                f"of {len(module_groups)} uncovered modules"
+                f"of {len(fresh_module_groups)} fresh uncovered modules"
+                + (f" ({len(flat_files)} flat files pending)" if flat_files else "")
             )
             gap_system = _system_gap_fill(
                 quality_score, [], existing_names,
                 known_tables=known_tables, module_groups=batch_modules,
             )
-        else:
-            # Flat fallback (no modules/ structure, e.g. pure Laravel)
-            gap_pages = flat_files[:GAP_FILL_MAX_PAGES]
+        elif flat_files:
+            # ── Flat fallback: non-module files (include/, lib/, etc.) ──────
+            fresh_flat = [f for f in flat_files if f.lower() not in attempted_flat]
+            gap_pages = fresh_flat[:GAP_FILL_MAX_PAGES]
+            if not gap_pages:
+                print(f"  [stage4] All flat files sent in previous rounds — done.")
+                break
+            attempted_flat.update(f.lower() for f in gap_pages)
             print(
                 f"  [stage4] Call D{gap_round} — gap-fill "
-                f"{len(gap_pages)}/{len(flat_files)} uncovered file(s): "
+                f"{len(gap_pages)}/{len(flat_files)} non-module file(s): "
                 f"{gap_pages[:5]}{'...' if len(gap_pages) > 5 else ''}"
             )
             gap_system = _system_gap_fill(
                 quality_score, gap_pages, existing_names,
                 known_tables=known_tables,
             )
+        else:
+            print(f"  [stage4] No fresh modules or flat files remain — done.")
+            break
         raw_d          = _call_part(gap_system, user_prompt, MAX_TOKENS_GAP_FILL,
                                     call_label)
         data_d         = _parse_partial(raw_d, f"D{gap_round}", debug_dir)
