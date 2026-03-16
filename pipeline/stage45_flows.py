@@ -65,8 +65,13 @@ FLOWS_FILE     = "business_flows.json"
 
 # Graph traversal limits
 MAX_DEPTH      = 8    # max hops from an entry-point node
-MAX_PATHS      = 40   # cap on candidate paths before dedup
+MAX_PATHS      = 500  # cap on candidate paths before dedup (was 40 — too low for large apps)
 MAX_PATH_LEN   = 12   # max steps in a single flow
+
+# Gap-fill: modules per synthetic-skeleton call
+GAP_FILL_MAX_MODULES_45 = 20
+# Gap-fill: max rounds of coverage-driven flow generation
+MAX_GAP_ROUNDS_45 = 10
 
 # BFS edge types to follow — must match edge_type values written by stage2_graph.py
 # stage2 writes: "redirects_to", "submits_to", "handles", "entry_point",
@@ -350,6 +355,126 @@ _PATTERNS: list[FlowPattern] = [
 _PATTERN_BY_NAME: dict[str, FlowPattern] = {p.name: p for p in _PATTERNS}
 
 
+# ─── Coverage-Driven Gap-Fill ──────────────────────────────────────────────────
+
+def _extract_module_name_45(filepath: str) -> str | None:
+    """Extract SugarCRM-style module name from a file path."""
+    parts = Path(filepath).parts
+    for i, part in enumerate(parts):
+        if part.lower() == "modules" and i + 1 < len(parts):
+            return parts[i + 1]
+    return None
+
+
+def _get_uncovered_modules(
+    flows: list["BusinessFlow"],
+    exec_paths: list[dict],
+) -> dict[str, list[str]]:
+    """
+    Return {module_name: [full_file_paths]} for modules whose files don't
+    appear in any existing flow's evidence_files or steps.
+    """
+    from collections import defaultdict
+
+    # Collect all file basenames already covered by flows
+    covered_basenames: set[str] = set()
+    for flow in flows:
+        for ef in (flow.evidence_files or []):
+            covered_basenames.add(Path(ef).name.lower())
+        for step in (flow.steps or []):
+            covered_basenames.add(step.page.lower())
+
+    # Group all execution-path files by module
+    module_files: dict[str, list[str]] = defaultdict(list)
+    for ep in exec_paths:
+        f = ep.get("file", "")
+        if not f:
+            continue
+        mod = _extract_module_name_45(f)
+        if mod:
+            module_files[mod].append(f)
+
+    # Module expansion: if ANY file in a module is covered, the whole module is covered
+    uncovered_modules: dict[str, list[str]] = {}
+    for mod, files in module_files.items():
+        basenames = [Path(f).name.lower() for f in files]
+        if not any(b in covered_basenames for b in basenames):
+            uncovered_modules[mod] = files
+
+    return uncovered_modules
+
+
+def _build_gap_fill_skeletons(
+    uncovered_modules: dict[str, list[str]],
+    exec_paths: list[dict],
+    max_modules: int = GAP_FILL_MAX_MODULES_45,
+) -> list[dict]:
+    """
+    Build synthetic flow skeletons directly from execution_paths data for
+    modules that BFS graph traversal never reached.
+
+    Each skeleton represents the files in one module and carries whatever
+    db_ops / auth / inputs data stage1.5 extracted — enough for LLM enrichment
+    (Pass G-H) to produce a named BusinessFlow.
+    """
+    ep_by_file: dict[str, dict] = {
+        ep["file"]: ep for ep in exec_paths if ep.get("file")
+    }
+
+    skeletons: list[dict] = []
+
+    for mod_name, files in list(uncovered_modules.items())[:max_modules]:
+        steps: list[FlowStep] = []
+        step_num = 1
+
+        for fpath in files[:8]:   # max 8 files per synthetic skeleton
+            ep    = ep_by_file.get(fpath, {})
+            page  = Path(fpath).name
+
+            # Auth guard from execution path
+            auth_req = bool(ep.get("auth_guard"))
+
+            # Collect db_ops and inputs from happy_path steps
+            db_ops: list[str] = []
+            inputs: list[str] = []
+            for hp_step in ep.get("happy_path", []):
+                db_ops.extend(hp_step.get("db_ops", []))
+                inputs.extend(hp_step.get("inputs", []))
+
+            # Fallback: pull from entry_conditions for HTTP method
+            http_method: str | None = None
+            for ec in ep.get("entry_conditions", []):
+                if ec.get("type") == "method_check":
+                    http_method = ec.get("method")
+
+            steps.append(FlowStep(
+                step_num     = step_num,
+                page         = page,
+                action       = f"Process {Path(fpath).stem.replace('_', ' ').title()}",
+                http_method  = http_method,
+                auth_required= auth_req,
+                db_ops       = db_ops[:3],
+                inputs       = inputs[:5],
+                outputs      = [],
+            ))
+            step_num += 1
+
+        if not steps:
+            continue
+
+        skeletons.append({
+            "path_nodes":      [],
+            "files":           files,
+            "steps":           steps,
+            "branches":        [],
+            "evidence_files":  files,
+            "raw_confidence":  0.30,  # synthetic — lower confidence than BFS paths
+            "_gap_fill_module": mod_name,
+        })
+
+    return skeletons
+
+
 # ─── Public Entry Point ────────────────────────────────────────────────────────
 
 def run(ctx: PipelineContext) -> None:
@@ -440,6 +565,59 @@ def run(ctx: PipelineContext) -> None:
           f"({len(context_groups)} context group(s)) ...")
     flows = _enrich_with_llm(flow_skeletons, context_groups, ctx)
     print(f"  [stage45]   {len(flows)} named flow(s) produced")
+
+    # ── Gap-fill: coverage-driven synthetic skeletons ─────────────────────────
+    # After BFS+stitching, many modules may not have been reached (MAX_PATHS cap
+    # limits BFS to the first N paths from the first few entry points). Build
+    # synthetic skeletons directly from execution_paths for those modules, then
+    # enrich with LLM to produce proper BusinessFlow objects.
+    exec_paths_list = getattr(ctx.code_map, "execution_paths", None) or []
+    attempted_gap_modules: set[str] = set()
+
+    for gap_round in range(1, MAX_GAP_ROUNDS_45 + 1):
+        uncovered_modules = _get_uncovered_modules(flows, exec_paths_list)
+        fresh_uncovered = {
+            m: files for m, files in uncovered_modules.items()
+            if m not in attempted_gap_modules
+        }
+
+        if not fresh_uncovered:
+            print(f"  [stage45] Gap-fill: all modules covered after {gap_round - 1} round(s).")
+            break
+
+        gap_skeletons = _build_gap_fill_skeletons(
+            fresh_uncovered, exec_paths_list, max_modules=GAP_FILL_MAX_MODULES_45
+        )
+        if not gap_skeletons:
+            break
+
+        attempted_gap_modules.update(
+            sk["_gap_fill_module"] for sk in gap_skeletons
+            if sk.get("_gap_fill_module")
+        )
+        print(
+            f"  [stage45] Gap-fill round {gap_round}: "
+            f"{len(gap_skeletons)} synthetic skeleton(s) for "
+            f"{len(fresh_uncovered)} uncovered module(s)"
+        )
+
+        gap_context_groups = _group_by_context(gap_skeletons, ctx)
+        _classify_patterns(gap_skeletons)
+        gap_flows = _enrich_with_llm(gap_skeletons, gap_context_groups, ctx)
+
+        # Merge new flows in (deduplicate by name)
+        existing_names_lower = {f.name.lower() for f in flows}
+        added = 0
+        for gf in gap_flows:
+            if gf.name.lower() not in existing_names_lower:
+                flows.append(gf)
+                existing_names_lower.add(gf.name.lower())
+                added += 1
+        print(f"  [stage45] Gap-fill round {gap_round}: added {added} new flow(s)")
+
+        if added == 0:
+            print(f"  [stage45] Gap-fill: no new flows added — stopping early.")
+            break
 
     print("  [stage45] Pass I: Updating domain_model.workflows ...")
     collection = _build_collection(flows)
