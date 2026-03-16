@@ -442,6 +442,47 @@ class EntityRelationshipCollection:
 
 
 @dataclass
+class SpecRule:
+    """
+    One formal business rule produced by Stage 4.6 Specification Mining.
+
+    Unlike Stage 2.9 BusinessRule (which stores raw code-centric invariants),
+    SpecRule is BA-ready: Given/When/Then phrased in business language,
+    cross-referenced to all evidence sources.
+    """
+    rule_id:           str            # "BR-001"
+    category:          str            # VALIDATION | AUTHORIZATION | WORKFLOW |
+                                      # STATE | REFERENTIAL | BUSINESS_LIMIT
+    title:             str            # ≤10-word business-friendly name
+    description:       str            # fuller prose
+    given:             str            # "Given the user is registering…"
+    when:              str            # "When they submit a password shorter than 8 chars"
+    then:              str            # "Then the system rejects the input with an error"
+    entities:          list[str]      # ["User"]
+    bounded_context:   str            # "Users"
+    source_invariants: list[str]      # rule_ids from Stage 2.9
+    source_machines:   list[str]      # machine_ids from Stage 4.3
+    source_flows:      list[str]      # flow_ids from Stage 4.5
+    source_files:      list[str]
+    confidence:        float          # 0.0–1.0
+    tags:              list[str]      # ["password", "security", "validation"]
+    pass_origin:       str            # "pass1_invariant" | "pass2_state" |
+                                      # "pass3_flow"      | "pass4_referential"
+
+
+@dataclass
+class SpecRuleCollection:
+    """Container written to spec_rules.json by Stage 4.6."""
+    rules:        list[SpecRule]            = field(default_factory=list)
+    total:        int                       = 0
+    by_category:  dict[str, list[str]]      = field(default_factory=dict)
+    by_entity:    dict[str, list[str]]      = field(default_factory=dict)
+    by_flow:      dict[str, list[str]]      = field(default_factory=dict)
+    by_context:   dict[str, list[str]]      = field(default_factory=dict)
+    generated_at: str                       = field(default_factory=lambda: datetime.utcnow().isoformat())
+
+
+@dataclass
 class ArchitectureMeta:
     """
     Lightweight summary of the architecture reconstruction produced by Stage 6.2.
@@ -484,6 +525,8 @@ _STAGE_SUBDIRS: dict[str, str] = {
     "relationship_catalog.json":   "4.2_relationships",
     # Stage 4.3 — State Machine Reconstruction
     "state_machine_catalog.json":  "4.3_statemachines",
+    # Stage 4.6 — Specification Mining
+    "spec_rules.json":             "4.6_specrules",
     # Stage 3 — Vector Embeddings
     "chromadb":                    "3_embed",
     "chunks_manifest.json":        "3_embed",
@@ -565,6 +608,7 @@ class PipelineContext:
         "stage4_domain":        StageResult(),
         "stage43_statemachines": StageResult(),  # state machine reconstruction
         "stage45_flows":        StageResult(),
+        "stage46_specrules":    StageResult(),  # specification mining (business rule synthesis)
         "stage47_validate":     StageResult(),   # behavioral flow validation
         "stage5_brd":           StageResult(),
         "stage5_srs":           StageResult(),
@@ -587,6 +631,7 @@ class PipelineContext:
     entities:          Optional[EntityCollection]          = None  # Stage 4.1
     relationships:     Optional[EntityRelationshipCollection] = None  # Stage 4.2
     state_machines:    Optional[StateMachineCollection]   = None  # Stage 4.3
+    spec_rules:        Optional[SpecRuleCollection]        = None  # Stage 4.6
     embedding_meta:    Optional[EmbeddingMeta]          = None
     preflight:         Optional[PreflightResult]        = None
     domain_model:      Optional[DomainModel]            = None
@@ -962,6 +1007,39 @@ class PipelineContext:
             ctx.state_machines = StateMachineCollection(
                 machines     = machines,
                 total        = d.get("total", len(machines)),
+                generated_at = d.get("generated_at", ""),
+            )
+
+        if data.get("spec_rules") is not None:
+            d = data["spec_rules"]
+            srules = [
+                SpecRule(
+                    rule_id           = r["rule_id"],
+                    category          = r["category"],
+                    title             = r.get("title", ""),
+                    description       = r.get("description", ""),
+                    given             = r.get("given", ""),
+                    when              = r.get("when", ""),
+                    then              = r.get("then", ""),
+                    entities          = r.get("entities", []),
+                    bounded_context   = r.get("bounded_context", ""),
+                    source_invariants = r.get("source_invariants", []),
+                    source_machines   = r.get("source_machines", []),
+                    source_flows      = r.get("source_flows", []),
+                    source_files      = r.get("source_files", []),
+                    confidence        = r.get("confidence", 0.75),
+                    tags              = r.get("tags", []),
+                    pass_origin       = r.get("pass_origin", ""),
+                )
+                for r in d.get("rules", [])
+            ]
+            ctx.spec_rules = SpecRuleCollection(
+                rules        = srules,
+                total        = d.get("total", len(srules)),
+                by_category  = d.get("by_category", {}),
+                by_entity    = d.get("by_entity", {}),
+                by_flow      = d.get("by_flow", {}),
+                by_context   = d.get("by_context", {}),
                 generated_at = d.get("generated_at", ""),
             )
 
