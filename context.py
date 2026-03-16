@@ -274,6 +274,29 @@ class KnowledgeGraphMeta:
 
 
 @dataclass
+class ActionCluster:
+    """
+    One action cluster produced by Stage 2.8 — a group of PHP files that share
+    a common bounded context (module folder, DB tables, route prefix, redirects).
+    """
+    cluster_id:   str            # e.g. "cluster_001"
+    name:         str            # e.g. "Accounts" or "CalendarProvider"
+    files:        list[str]      # absolute paths of member files
+    tables:       list[str]      # DB tables touched by member files
+    route_prefix: str            # common route prefix, if any (e.g. "/accounts")
+    module:       str            # SugarCRM/framework module name, or ""
+    file_count:   int = 0        # len(files) convenience field
+
+
+@dataclass
+class ActionClusterCollection:
+    """Container written to action_clusters.json by Stage 2.8."""
+    clusters:     list[ActionCluster] = field(default_factory=list)
+    total:        int                 = 0
+    generated_at: str                 = field(default_factory=lambda: datetime.utcnow().isoformat())
+
+
+@dataclass
 class ArchitectureMeta:
     """
     Lightweight summary of the architecture reconstruction produced by Stage 6.2.
@@ -306,6 +329,8 @@ _STAGE_SUBDIRS: dict[str, str] = {
     "code_graph.png":              "2_graph",
     # Stage 2.5 — Behavior Graph
     "behavior_graph.json":         "2.5_behavior",
+    # Stage 2.8 — Action Clustering
+    "action_clusters.json":        "2.8_clusters",
     # Stage 3 — Vector Embeddings
     "chromadb":                    "3_embed",
     "chunks_manifest.json":        "3_embed",
@@ -378,6 +403,7 @@ class PipelineContext:
         "stage15_paths":        StageResult(),
         "stage2_graph":         StageResult(),
         "stage25_behavior":     StageResult(),   # behavior graph extraction
+        "stage28_clusters":     StageResult(),   # action clustering (similarity)
         "stage3_embed":         StageResult(),
         "stage35_preflight":    StageResult(),
         "stage4_domain":        StageResult(),
@@ -399,6 +425,7 @@ class PipelineContext:
     code_map:          Optional[CodeMap]                = None
     graph_meta:        Optional[GraphMeta]              = None
     behavior_graph:    Optional[dict]                   = None   # Stage 2.5
+    action_clusters:   Optional[ActionClusterCollection] = None  # Stage 2.8
     embedding_meta:    Optional[EmbeddingMeta]          = None
     preflight:         Optional[PreflightResult]        = None
     domain_model:      Optional[DomainModel]            = None
@@ -636,6 +663,26 @@ class PipelineContext:
                 playwright_path = d.get("playwright_path"),
                 pytest_path     = d.get("pytest_path"),
                 scenario_count  = d.get("scenario_count", 0),
+            )
+
+        if data.get("action_clusters") is not None:
+            d = data["action_clusters"]
+            clusters = [
+                ActionCluster(
+                    cluster_id   = c["cluster_id"],
+                    name         = c["name"],
+                    files        = c.get("files", []),
+                    tables       = c.get("tables", []),
+                    route_prefix = c.get("route_prefix", ""),
+                    module       = c.get("module", ""),
+                    file_count   = c.get("file_count", 0),
+                )
+                for c in d.get("clusters", [])
+            ]
+            ctx.action_clusters = ActionClusterCollection(
+                clusters     = clusters,
+                total        = d.get("total", len(clusters)),
+                generated_at = d.get("generated_at", ""),
             )
 
         if data.get("knowledge_graph_meta") is not None:

@@ -610,6 +610,8 @@ def run(ctx: PipelineContext) -> None:
     # enrich with LLM to produce proper BusinessFlow objects.
     exec_paths_list = getattr(ctx.code_map, "execution_paths", None) or []
     attempted_gap_modules: set[str] = set()
+    _mod_empty_rounds = 0        # consecutive rounds with 0 new flows
+    _MOD_MAX_EMPTY    = 2        # stop only after this many in a row
 
     for gap_round in range(1, MAX_GAP_ROUNDS_45 + 1):
         uncovered_modules = _get_uncovered_modules(flows, exec_paths_list)
@@ -653,8 +655,12 @@ def run(ctx: PipelineContext) -> None:
         print(f"  [stage45] Gap-fill round {gap_round}: added {added} new flow(s)")
 
         if added == 0:
-            print(f"  [stage45] Gap-fill: no new flows added — stopping early.")
-            break
+            _mod_empty_rounds += 1
+            if _mod_empty_rounds >= _MOD_MAX_EMPTY:
+                print(f"  [stage45] Gap-fill: {_mod_empty_rounds} consecutive empty round(s) — stopping.")
+                break
+        else:
+            _mod_empty_rounds = 0
 
     # ── Flat-dir gap-fill: non-module files (include/, lib/, etc.) ───────────
     # Module gap-fill above only covers files under modules/<Name>/.
@@ -662,6 +668,9 @@ def run(ctx: PipelineContext) -> None:
     # sent as synthetic skeletons so directory expansion in flow_coverage.py
     # can credit all siblings once any file from the directory is in a flow.
     attempted_gap_dirs: set[str] = set()
+    _dir_empty_rounds = 0        # consecutive rounds with 0 new flows
+    _DIR_MAX_EMPTY    = 2        # stop only after this many in a row
+
     for gap_round in range(1, MAX_GAP_ROUNDS_45 + 1):
         uncovered_dirs = _get_uncovered_flat_dirs(flows, exec_paths_list)
         fresh_dirs = {
@@ -702,7 +711,12 @@ def run(ctx: PipelineContext) -> None:
         print(f"  [stage45] Flat gap-fill round {gap_round}: added {added} new flow(s)")
 
         if added == 0:
-            break
+            _dir_empty_rounds += 1
+            if _dir_empty_rounds >= _DIR_MAX_EMPTY:
+                print(f"  [stage45] Flat gap-fill: {_dir_empty_rounds} consecutive empty round(s) — stopping.")
+                break
+        else:
+            _dir_empty_rounds = 0
 
     print("  [stage45] Pass I: Updating domain_model.workflows ...")
     collection = _build_collection(flows)
@@ -1545,9 +1559,14 @@ def _group_by_context(
     """
     Assign each skeleton to a bounded context.
 
-    Strategy (two-phase with fallback):
+    Strategy (three-phase with fallback):
 
-    Phase 1 — Graph module_id lookup (preferred):
+    Phase 0 — Action Cluster lookup (Stage 2.8, preferred when available):
+        Build a file→cluster_name mapping from ctx.action_clusters.  For each
+        skeleton, assign it to the plurality cluster of its evidence files.
+        Falls through to Phase 1 if action_clusters is missing or empty.
+
+    Phase 1 — Graph module_id lookup (preferred without Phase 0):
         If the graph was built with Stage 2 Pass 15, every code node carries a
         module_id attribute.  For each skeleton, collect the module_ids of all
         files in its evidence set by querying graph nodes, then assign the
@@ -1563,6 +1582,43 @@ def _group_by_context(
     """
     import pickle
     from collections import Counter as _Counter
+
+    # ── Phase 0: action_clusters lookup (Stage 2.8) ───────────────────────────
+    ac = getattr(ctx, "action_clusters", None)
+    if ac and ac.clusters:
+        # Build file → cluster name (by basename for robustness)
+        ac_file_to_name: dict[str, str] = {}
+        ac_base_to_name: dict[str, str] = {}
+        for cluster in ac.clusters:
+            for fpath in cluster.files:
+                ac_file_to_name[fpath] = cluster.name
+                ac_base_to_name[Path(fpath).name.lower()] = cluster.name
+
+        groups_ac: dict[str, list[int]] = defaultdict(list)
+        unmatched_ac: list[int] = []
+
+        for i, sk in enumerate(skeletons):
+            counts: _Counter = _Counter()
+            for fpath in sk.get("files", []):
+                name = (
+                    ac_file_to_name.get(fpath)
+                    or ac_base_to_name.get(Path(fpath).name.lower())
+                )
+                if name:
+                    counts[name] += 1
+            if counts:
+                groups_ac[counts.most_common(1)[0][0]].append(i)
+            else:
+                unmatched_ac.append(i)
+
+        # Route unmatched skeletons to a "General" bucket
+        if unmatched_ac:
+            fallback = (ctx.domain_model.bounded_contexts or ["General"])[0]
+            ctx_name = (fallback["name"] if isinstance(fallback, dict)
+                        else fallback)
+            groups_ac[ctx_name].extend(unmatched_ac)
+
+        return dict(groups_ac)
 
     # ── Phase 1: graph module_id lookup ──────────────────────────────────────
     G = None
