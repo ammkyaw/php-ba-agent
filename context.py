@@ -274,6 +274,35 @@ class KnowledgeGraphMeta:
 
 
 @dataclass
+class BusinessRule:
+    """
+    One extracted business invariant from Stage 2.9.
+
+    Populated entirely by static analysis — no LLM.
+    """
+    rule_id:         str            # e.g. "rule_001"
+    category:        str            # VALIDATION | AUTHORIZATION | STATE_TRANSITION |
+                                    # BUSINESS_LIMIT | TEMPORAL | REFERENTIAL
+    description:     str            # Human-readable, e.g. "Password must be ≥ 8 chars"
+    raw_expression:  str            # Code snippet, e.g. "strlen($password) < 8"
+    entity:          str            # Linked field, e.g. "User.password"
+    bounded_context: str            # Cluster/module name from Stage 2.8
+    source_files:    list[str]      # PHP files where this rule was found
+    confidence:      float = 0.8    # 1.0=schema, 0.8=guard-clause, 0.6=source-scan
+    tables:          list[str] = field(default_factory=list)
+
+
+@dataclass
+class InvariantCollection:
+    """Container written to rule_catalog.json by Stage 2.9."""
+    rules:        list[BusinessRule]   = field(default_factory=list)
+    total:        int                  = 0
+    by_category:  dict[str, list[str]] = field(default_factory=dict)
+    by_context:   dict[str, list[str]] = field(default_factory=dict)
+    generated_at: str                  = field(default_factory=lambda: datetime.utcnow().isoformat())
+
+
+@dataclass
 class ActionCluster:
     """
     One action cluster produced by Stage 2.8 — a group of PHP files that share
@@ -331,6 +360,8 @@ _STAGE_SUBDIRS: dict[str, str] = {
     "behavior_graph.json":         "2.5_behavior",
     # Stage 2.8 — Action Clustering
     "action_clusters.json":        "2.8_clusters",
+    # Stage 2.9 — Invariant Detection
+    "rule_catalog.json":           "2.9_invariants",
     # Stage 3 — Vector Embeddings
     "chromadb":                    "3_embed",
     "chunks_manifest.json":        "3_embed",
@@ -404,6 +435,7 @@ class PipelineContext:
         "stage2_graph":         StageResult(),
         "stage25_behavior":     StageResult(),   # behavior graph extraction
         "stage28_clusters":     StageResult(),   # action clustering (similarity)
+        "stage29_invariants":   StageResult(),   # business rule / invariant detection
         "stage3_embed":         StageResult(),
         "stage35_preflight":    StageResult(),
         "stage4_domain":        StageResult(),
@@ -426,6 +458,7 @@ class PipelineContext:
     graph_meta:        Optional[GraphMeta]              = None
     behavior_graph:    Optional[dict]                   = None   # Stage 2.5
     action_clusters:   Optional[ActionClusterCollection] = None  # Stage 2.8
+    invariants:        Optional[InvariantCollection]      = None  # Stage 2.9
     embedding_meta:    Optional[EmbeddingMeta]          = None
     preflight:         Optional[PreflightResult]        = None
     domain_model:      Optional[DomainModel]            = None
@@ -663,6 +696,30 @@ class PipelineContext:
                 playwright_path = d.get("playwright_path"),
                 pytest_path     = d.get("pytest_path"),
                 scenario_count  = d.get("scenario_count", 0),
+            )
+
+        if data.get("invariants") is not None:
+            d = data["invariants"]
+            rules = [
+                BusinessRule(
+                    rule_id         = r["rule_id"],
+                    category        = r["category"],
+                    description     = r["description"],
+                    raw_expression  = r["raw_expression"],
+                    entity          = r["entity"],
+                    bounded_context = r.get("bounded_context", ""),
+                    source_files    = r.get("source_files", []),
+                    confidence      = r.get("confidence", 0.8),
+                    tables          = r.get("tables", []),
+                )
+                for r in d.get("rules", [])
+            ]
+            ctx.invariants = InvariantCollection(
+                rules        = rules,
+                total        = d.get("total", len(rules)),
+                by_category  = d.get("by_category", {}),
+                by_context   = d.get("by_context", {}),
+                generated_at = d.get("generated_at", ""),
             )
 
         if data.get("action_clusters") is not None:

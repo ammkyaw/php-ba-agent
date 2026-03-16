@@ -913,6 +913,32 @@ def _build_user_prompt(ctx: PipelineContext, chunks: list[dict]) -> str:
                 + (f"  route={c.route_prefix}" if c.route_prefix else "")
             )
 
+    # ── Detected Business Rules from Stage 2.9 ───────────────────────────────
+    # High-confidence rules (schema-enforced ≥ 0.9, guard-clause ≥ 0.75) are
+    # injected as hard constraints.  The LLM must surface these in features,
+    # workflows, and key_entities rather than inventing its own constraints.
+    inv = getattr(ctx, "invariants", None)
+    if inv and inv.rules:
+        high_conf = [r for r in inv.rules if r.confidence >= 0.75]
+        if high_conf:
+            parts.append(
+                f"\n=== DETECTED BUSINESS RULES — STAGE 2.9 "
+                f"({len(high_conf)} high-confidence) ==="
+            )
+            parts.append(
+                "These rules were extracted statically from DB schema and guard "
+                "clauses.  When generating features and workflows, reference these "
+                "exact constraints.  Do NOT contradict them."
+            )
+            # Group by category for readability
+            by_cat: dict[str, list] = {}
+            for r in high_conf:
+                by_cat.setdefault(r.category, []).append(r)
+            for cat, cat_rules in sorted(by_cat.items()):
+                parts.append(f"\n  [{cat}]")
+                for r in cat_rules[:15]:      # cap per category
+                    parts.append(f"    • {r.description}  [{r.entity}]")
+
     # ── Retrieved semantic chunks ─────────────────────────────────────────────
     parts.append(f"\n=== SEMANTIC CONTEXT ({len(chunks)} chunks) ===")
     for i, chunk in enumerate(chunks, 1):
