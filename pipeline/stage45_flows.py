@@ -404,6 +404,41 @@ def _get_uncovered_modules(
     return uncovered_modules
 
 
+def _get_uncovered_flat_dirs(
+    flows: list["BusinessFlow"],
+    exec_paths: list[dict],
+) -> dict[str, list[str]]:
+    """
+    Return {parent_dir: [full_file_paths]} for non-module exec-path files
+    whose parent directory has no file covered by any existing flow.
+    Used as a flat-file fallback after module gap-fill is exhausted.
+    """
+    from collections import defaultdict
+
+    covered_basenames: set[str] = set()
+    for flow in flows:
+        for ef in (flow.evidence_files or []):
+            covered_basenames.add(Path(ef).name.lower())
+        for step in (flow.steps or []):
+            covered_basenames.add(step.page.lower())
+
+    dir_files: dict[str, list[str]] = defaultdict(list)
+    for ep in exec_paths:
+        f = ep.get("file", "")
+        if not f or _extract_module_name_45(f):
+            continue   # skip module files — handled by _get_uncovered_modules
+        parent = str(Path(f).parent)
+        dir_files[parent].append(f)
+
+    uncovered_dirs: dict[str, list[str]] = {}
+    for parent, files in dir_files.items():
+        basenames = [Path(f).name.lower() for f in files]
+        if not any(b in covered_basenames for b in basenames):
+            uncovered_dirs[parent] = files
+
+    return uncovered_dirs
+
+
 def _build_gap_fill_skeletons(
     uncovered_modules: dict[str, list[str]],
     exec_paths: list[dict],
@@ -619,6 +654,54 @@ def run(ctx: PipelineContext) -> None:
 
         if added == 0:
             print(f"  [stage45] Gap-fill: no new flows added — stopping early.")
+            break
+
+    # ── Flat-dir gap-fill: non-module files (include/, lib/, etc.) ───────────
+    # Module gap-fill above only covers files under modules/<Name>/.
+    # Files in include/, lib/, src/ etc. are grouped by parent directory and
+    # sent as synthetic skeletons so directory expansion in flow_coverage.py
+    # can credit all siblings once any file from the directory is in a flow.
+    attempted_gap_dirs: set[str] = set()
+    for gap_round in range(1, MAX_GAP_ROUNDS_45 + 1):
+        uncovered_dirs = _get_uncovered_flat_dirs(flows, exec_paths_list)
+        fresh_dirs = {
+            d: files for d, files in uncovered_dirs.items()
+            if d not in attempted_gap_dirs
+        }
+
+        if not fresh_dirs:
+            print(f"  [stage45] Flat gap-fill: all directories covered after "
+                  f"{gap_round - 1} round(s).")
+            break
+
+        batch_dirs = dict(list(fresh_dirs.items())[:GAP_FILL_MAX_MODULES_45])
+        attempted_gap_dirs.update(batch_dirs.keys())
+
+        # Re-use module skeleton builder — each "module" key is a dir path here
+        gap_skeletons = _build_gap_fill_skeletons(
+            batch_dirs, exec_paths_list, max_modules=GAP_FILL_MAX_MODULES_45
+        )
+        if not gap_skeletons:
+            break
+
+        print(
+            f"  [stage45] Flat gap-fill round {gap_round}: "
+            f"{len(gap_skeletons)} skeleton(s) for {len(fresh_dirs)} uncovered dir(s)"
+        )
+        gap_context_groups = _group_by_context(gap_skeletons, ctx)
+        _classify_patterns(gap_skeletons)
+        gap_flows = _enrich_with_llm(gap_skeletons, gap_context_groups, ctx)
+
+        existing_names_lower = {f.name.lower() for f in flows}
+        added = 0
+        for gf in gap_flows:
+            if gf.name.lower() not in existing_names_lower:
+                flows.append(gf)
+                existing_names_lower.add(gf.name.lower())
+                added += 1
+        print(f"  [stage45] Flat gap-fill round {gap_round}: added {added} new flow(s)")
+
+        if added == 0:
             break
 
     print("  [stage45] Pass I: Updating domain_model.workflows ...")
