@@ -913,6 +913,55 @@ def _build_user_prompt(ctx: PipelineContext, chunks: list[dict]) -> str:
                 + (f"  route={c.route_prefix}" if c.route_prefix else "")
             )
 
+    # ── Entities from Stage 4.1 ──────────────────────────────────────────────
+    ent_col = getattr(ctx, "entities", None)
+    if ent_col and ent_col.entities:
+        core_ents = [e for e in ent_col.entities if e.is_core and not e.is_system]
+        if core_ents:
+            parts.append(
+                f"\n=== DETECTED ENTITIES — STAGE 4.1 ({len(core_ents)} core) ==="
+            )
+            parts.append(
+                "These entities were extracted statically from the DB schema. "
+                "Use them as your key_entities and as the basis for bounded_contexts."
+            )
+            for ent in core_ents[:30]:
+                col_names = [c.name for c in ent.columns[:6]]
+                pk_note   = f"  pk={ent.primary_key}" if ent.primary_key else ""
+                pivot_note = "  [pivot]" if ent.is_pivot else ""
+                parts.append(
+                    f"  • {ent.name:<30} table={ent.table:<25} "
+                    f"context={ent.bounded_context}{pk_note}{pivot_note}"
+                    + (f"  cols=[{', '.join(col_names)}{'…' if len(ent.columns) > 6 else ''}]"
+                       if col_names else "")
+                )
+            if len(core_ents) > 30:
+                parts.append(f"  … and {len(core_ents) - 30} more core entities")
+
+    # ── Relationships from Stage 4.2 ─────────────────────────────────────────
+    rel_col = getattr(ctx, "relationships", None)
+    if rel_col and rel_col.relationships:
+        high_rel = [r for r in rel_col.relationships if r.confidence >= 0.75]
+        if high_rel:
+            parts.append(
+                f"\n=== DETECTED RELATIONSHIPS — STAGE 4.2 "
+                f"({len(high_rel)} high-confidence) ==="
+            )
+            parts.append(
+                "These entity relationships were reconstructed from FK constraints, "
+                "SQL JOINs, ORM declarations, and column naming patterns. "
+                "Use them to define accurate cardinality in bounded_contexts and "
+                "data models.  Do NOT invent relationships that contradict these."
+            )
+            for rel in high_rel[:40]:
+                parts.append(
+                    f"  • {rel.from_entity:<25} {rel.cardinality:<5} {rel.to_entity:<25}"
+                    f"  via={rel.via_column or rel.via_table or '?':<20}"
+                    f"  [{','.join(rel.signals)}]"
+                )
+            if len(high_rel) > 40:
+                parts.append(f"  … and {len(high_rel) - 40} more")
+
     # ── Detected Business Rules from Stage 2.9 ───────────────────────────────
     # High-confidence rules (schema-enforced ≥ 0.9, guard-clause ≥ 0.75) are
     # injected as hard constraints.  The LLM must surface these in features,
