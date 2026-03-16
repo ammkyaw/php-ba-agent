@@ -438,6 +438,8 @@ def _build_gap_fill_skeletons(
             db_ops: list[str] = []
             inputs: list[str] = []
             for hp_step in ep.get("happy_path", []):
+                if not isinstance(hp_step, dict):
+                    continue
                 db_ops.extend(hp_step.get("db_ops", []))
                 inputs.extend(hp_step.get("inputs", []))
 
