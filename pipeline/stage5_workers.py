@@ -160,12 +160,14 @@ def _run_brd_agent(domain: DomainModel, ctx: PipelineContext) -> str:
 
     # Compact domain summary — avoids sending the full JSON blob
     feature_lines = "\n".join(
-        f"  - {f['name']}: {f['description']} | pages={f.get('pages',[])} tables={f.get('tables',[])}"
+        f"  - {f.get('name','?')}: {f.get('description','')} | pages={f.get('pages',[])} tables={f.get('tables',[])}"
         for f in domain.features
+        if isinstance(f, dict)
     )
     role_lines = "\n".join(
-        f"  - {r['role']}: {r['description']}"
+        f"  - {r.get('role','?')}: {r.get('description','')}"
         for r in domain.user_roles
+        if isinstance(r, dict)
     )
     rule_lines = "\n".join(
         f"  - {rule}"
