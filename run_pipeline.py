@@ -10,6 +10,7 @@ Stages (in execution order):
     Stage 3    embed          — vector index (ChromaDB)
     Stage 3.5  preflight      — context pre-flight checks
     Stage 4    domain         — DomainAnalystAgent (LLM)
+    Stage 4.3  statemachines  — State Machine Reconstruction (static)
     Stage 4.5  flows          — BusinessFlowExtractor (LLM)
     Stage 4.7  validate       — Behavioral Flow Validation (deterministic)
     Stage 5    brd/srs/ac/us  — parallel BA document agents (LLM)
@@ -57,6 +58,7 @@ from pipeline.stage29_invariants   import run as stage29
 from pipeline.stage3_embed         import run as stage3
 from pipeline.stage35_preflight    import run as stage35
 from pipeline.stage4_domain        import run as stage4
+from pipeline.stage43_statemachines import run as stage43
 from pipeline.stage45_flows        import run as stage45
 from pipeline.stage47_validate_flows import run as stage47
 from pipeline.stage5_workers       import run as stage5
@@ -81,6 +83,7 @@ STAGES: list[tuple[str, any]] = [
     ("stage3_embed",         stage3),
     ("stage35_preflight",    stage35),
     ("stage4_domain",        stage4),
+    ("stage43_statemachines", stage43),  # state machine reconstruction (feeds stage45 + stage67)
     ("stage45_flows",        stage45),  # business flow extraction (feeds stage62 + stage67)
     ("stage47_validate",     stage47),  # behavioral validation (are flows missing / valid / real?)
     ("stage5_brd",           None),     # ← parallel group handled below

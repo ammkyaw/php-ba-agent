@@ -939,6 +939,28 @@ def _build_user_prompt(ctx: PipelineContext, chunks: list[dict]) -> str:
                 for r in cat_rules[:15]:      # cap per category
                     parts.append(f"    • {r.description}  [{r.entity}]")
 
+    # ── State machines (Stage 4.3) ───────────────────────────────────────────
+    sm_col = getattr(ctx, "state_machines", None)
+    if sm_col and sm_col.machines:
+        parts.append(
+            f"\n=== DETECTED STATE MACHINES — STAGE 4.3 "
+            f"({sm_col.total} machine(s)) ==="
+        )
+        parts.append(
+            "These entity lifecycles were reconstructed statically from DB and PHP. "
+            "Use them to define entity states in bounded_contexts and workflows."
+        )
+        for sm in sm_col.machines[:10]:   # cap at 10 to keep prompt size sane
+            states_str = " → ".join(sm.initial_states + [
+                s for s in sm.states
+                if s not in sm.initial_states and s not in sm.terminal_states
+            ] + sm.terminal_states) or ", ".join(sm.states)
+            parts.append(
+                f"  • {sm.entity}.{sm.field} [{sm.bounded_context}]: {states_str}"
+            )
+            if sm.dead_states:
+                parts.append(f"    (dead/unreachable: {', '.join(sm.dead_states)})")
+
     # ── Retrieved semantic chunks ─────────────────────────────────────────────
     parts.append(f"\n=== SEMANTIC CONTEXT ({len(chunks)} chunks) ===")
     for i, chunk in enumerate(chunks, 1):
