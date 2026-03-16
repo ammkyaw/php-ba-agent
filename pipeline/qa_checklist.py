@@ -80,8 +80,9 @@ def build_checklist(
     """
     items: list[dict] = []
     items.extend(_completeness_items(flow_coverage_data or {}))
-    items.extend(_doc_coverage_items(dc_data or {}))   # Stage 5.9
+    items.extend(_doc_coverage_items(dc_data or {}))          # Stage 5.9
     items.extend(_consistency_items(pass_d_issues))
+    items.extend(_cross_doc_items(pass_d_issues))             # Pass E
     items.extend(_evidence_items(ev_idx or {}))
     return items
 
@@ -297,6 +298,84 @@ def _con_status(n: int) -> tuple[str, str]:
     if n <= _CON_WARN:
         return "warn", "⚠️"
     return "fail", "❌"
+
+
+# ─── Cross-Document Consistency (Pass E) ──────────────────────────────────────
+
+# Pass E issue category string (must match cross_doc_check.py)
+_CROSS_DOC_CATEGORY = "Cross-Document Consistency"
+
+# Thresholds for the roll-up checklist items
+_CROSS_PASS = 0    # 0 issues    → ✅
+_CROSS_WARN = 2    # 1-2 issues  → ⚠️
+                   # > 2 issues  → ❌
+
+_CROSS_CHECKS = {
+    # check_key: (label, artefact_hint)
+    "orphan_epics":    ("Orphan Epic Headings",          "UserStories"),
+    "orphan_ac":       ("Orphan AC Sections",            "AC"),
+    "undefined_actors":("Undefined Story Actors",        "UserStories"),
+    "srs_ac_gap":      ("SRS Feature → AC Test Coverage","SRS→AC"),
+}
+
+# Map artefact strings in issues to check keys
+_ARTEFACT_TO_KEY = {
+    "UserStories": ["orphan_epics", "undefined_actors"],
+    "AC":          ["orphan_ac"],
+    "SRS→AC":      ["srs_ac_gap"],
+}
+
+
+def _cross_doc_items(all_issues: list[dict]) -> list[dict]:
+    """
+    Produce one checklist item per Pass E check from the merged issue list.
+
+    Pass E issues are identified by category == "Cross-Document Consistency".
+    Each check gets its own row so the QA report clearly shows which
+    traceability relationship has problems.
+    """
+    # Filter to Pass E issues only
+    e_issues = [i for i in all_issues if i.get("category") == _CROSS_DOC_CATEGORY]
+
+    # Bucket by artefact
+    buckets: dict[str, list[dict]] = {k: [] for k in _CROSS_CHECKS}
+    for issue in e_issues:
+        art = issue.get("artefact", "")
+        for key in _ARTEFACT_TO_KEY.get(art, []):
+            buckets[key].append(issue)
+
+    items: list[dict] = []
+    for key, (label, artefact) in _CROSS_CHECKS.items():
+        n = len(buckets[key])
+        if n <= _CROSS_PASS:
+            status, icon = "pass", "✅"
+        elif n <= _CROSS_WARN:
+            status, icon = "warn", "⚠️"
+        else:
+            status, icon = "fail", "❌"
+
+        detail = (
+            f"No issues found"
+            if n == 0
+            else f"{n} issue(s) — "
+            + "; ".join(
+                i["description"][:80] + ("…" if len(i["description"]) > 80 else "")
+                for i in buckets[key][:2]
+            )
+            + (f" (+{n - 2} more)" if n > 2 else "")
+        )
+
+        items.append(_item(
+            category    = "Cross-Document Consistency",
+            check       = label,
+            status      = status,
+            icon        = icon,
+            score       = max(0.0, 1.0 - n * 0.25),   # indicative score
+            issue_count = n,
+            detail      = detail,
+        ))
+
+    return items
 
 
 # ─── Evidence ──────────────────────────────────────────────────────────────────
