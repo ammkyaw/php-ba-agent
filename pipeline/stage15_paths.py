@@ -790,10 +790,28 @@ class _FileAnalyser:
         source = self.source
 
         var_map: dict[str, str] = {}
+        # Direct assignment: $var = $_POST['key']
         for m in re.finditer(
             r'\$(\w+)\s*=\s*\$_(POST|GET|REQUEST)\s*\[\s*[\'"](\w+)[\'"]\s*\]', source
         ):
             var_map[m.group(1)] = f"$_{m.group(2)}['{m.group(3)}']"
+
+        # Wrapped/sanitized assignment: $var = anyFn($_POST['key'])
+        # e.g. $var = intval($_POST['id']), $var = htmlspecialchars($_GET['q'])
+        for m in re.finditer(
+            r'\$(\w+)\s*=\s*\w+\s*\(\s*\$_(POST|GET|REQUEST)\s*\[\s*[\'"](\w+)[\'"]\s*\]',
+            source,
+        ):
+            if m.group(1) not in var_map:   # don't overwrite direct assignments
+                var_map[m.group(1)] = f"$_{m.group(2)}['{m.group(3)}']"
+
+        # filter_input(INPUT_POST/GET/REQUEST, 'key') — standard PHP input filter
+        for m in re.finditer(
+            r'\$(\w+)\s*=\s*filter_input\s*\(\s*INPUT_(POST|GET|REQUEST)\s*,\s*[\'"](\w+)[\'"]',
+            source, re.IGNORECASE,
+        ):
+            if m.group(1) not in var_map:
+                var_map[m.group(1)] = f"$_{m.group(2)}['{m.group(3)}']"
 
         sql_var_map: dict[str, str] = {}
         for m in re.finditer(r'\$(\w+)\s*=\s*["\']([^"\']{10,})["\']', source):
@@ -833,7 +851,7 @@ class _FileAnalyser:
             op    = _classify_sql_op(sql)
 
             field_mapping: dict[str, str] = {}
-            for im in re.finditer(r'\$_(POST|GET)\[\'(\w+)\'\]', sql):
+            for im in re.finditer(r'\$_(POST|GET|REQUEST)\[\'(\w+)\'\]', sql):
                 field_mapping[im.group(2)] = f"$_{im.group(1)}['{im.group(2)}']"
 
             for var, origin in var_map.items():
@@ -866,6 +884,7 @@ class _FileAnalyser:
     def _extract_auth_guard(self) -> dict[str, Any] | None:
         top = "\n".join(self.lines[:50])
 
+        # Pattern 1: if (!isset($_SESSION['key'])) { header("Location: ...") }
         m = re.search(
             r'if\s*\(\s*(!?)isset\s*\(\s*\$_SESSION\[([\'"])(\w+)\2\]\s*\)\s*\)'
             r'[^{]*\{[^}]*header\s*\(\s*[\'"]Location:\s*([^\'\"]+)[\'"]',
@@ -878,12 +897,42 @@ class _FileAnalyser:
                 "redirect": m.group(4).strip(),
             }
 
+        # Pattern 2: $_SESSION['key'] == 'value' comparison
         m = re.search(
             r'\$_SESSION\[([\'"])(\w+)\1\]\s*(==|!=|===)\s*[\'"](\w+)[\'"]',
             top,
         )
         if m:
             return {"key": m.group(2), "check": f"{m.group(3)} '{m.group(4)}'", "redirect": None}
+
+        # Pattern 3: isset($_SESSION['key']) or die/exit  (short-circuit auth)
+        # e.g.  isset($_SESSION['user']) or die('Not authorized');
+        m = re.search(
+            r'isset\s*\(\s*\$_SESSION\[([\'"])(\w+)\1\]\s*\)\s*or\s*(?:die|exit)\s*\(',
+            top, re.IGNORECASE,
+        )
+        if m:
+            return {"key": m.group(2), "check": "isset_or_die", "redirect": None}
+
+        # Pattern 4: if (!defined('CONSTANT')) die/exit  (direct-access guard)
+        # Generic pattern used by WordPress, Joomla, and many raw PHP apps.
+        m = re.search(
+            r'if\s*\(\s*!defined\s*\(\s*[\'"](\w+)[\'"]\s*\)\s*\)\s*(?:die|exit)\s*[(\s;]',
+            top, re.IGNORECASE,
+        )
+        if m:
+            return {"key": m.group(1), "check": "defined_guard", "redirect": None}
+
+        # Pattern 5: require/include of a file with auth-related name
+        # e.g. require_once('includes/auth.php'), include('session_check.php')
+        # Generic — many PHP apps gate pages via an included auth file.
+        m = re.search(
+            r'(?:require|include)(?:_once)?\s*\(?\s*[\'"][^\'"]*'
+            r'(?:auth|login|session_check|access_check|check_login|guard|security)[^\'"]*\.php[\'"]',
+            top, re.IGNORECASE,
+        )
+        if m:
+            return {"key": "auth_include", "check": "require_auth_file", "redirect": None}
 
         return None
 
