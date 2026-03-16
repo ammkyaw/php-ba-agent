@@ -53,6 +53,7 @@ from pipeline.stage15_paths        import run as stage15
 from pipeline.stage2_graph         import run as stage2
 from pipeline.stage25_behavior     import run as stage25
 from pipeline.stage28_clusters     import run as stage28
+from pipeline.stage29_invariants   import run as stage29
 from pipeline.stage3_embed         import run as stage3
 from pipeline.stage35_preflight    import run as stage35
 from pipeline.stage4_domain        import run as stage4
@@ -76,6 +77,7 @@ STAGES: list[tuple[str, any]] = [
     ("stage2_graph",         stage2),
     ("stage25_behavior",     stage25),  # behavior graph extraction (feeds stage45 + stage6)
     ("stage28_clusters",     stage28),  # action clustering (feeds stage4 + stage45 bounded contexts)
+    ("stage29_invariants",   stage29),  # business rule extraction (feeds stage3 chunks + stage4 grounding)
     ("stage3_embed",         stage3),
     ("stage35_preflight",    stage35),
     ("stage4_domain",        stage4),
