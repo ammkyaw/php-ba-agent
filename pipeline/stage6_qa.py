@@ -534,14 +534,58 @@ def _build_report_md(
     major    = [i for i in issues if i.get("severity") == "major"]
     minor    = [i for i in issues if i.get("severity") == "minor"]
 
+    # ── Per-dimension coverage metrics (from flow_coverage.json) ─────────────
+    fc_data = _load_flow_coverage(ctx)
+    _cov_labels = [
+        ("exec_path", "Execution Path Coverage"),
+        ("route",     "Route Coverage"),
+        ("table",     "Database Coverage"),
+        ("form",      "Form Coverage"),
+    ]
+    cov_rows: list[tuple[str, float]] = []   # (label, pct)
+    for key, label in _cov_labels:
+        block = fc_data.get(key, {})
+        if isinstance(block, dict) and block.get("total", 0) > 0:
+            cov_rows.append((label, float(block.get("pct", 0.0))))
+
+    # ── Overall confidence = average of coverage metrics + avg feature score ──
+    scores_for_overall: list[float] = [pct for _, pct in cov_rows]
+    if conf_report:
+        avg_feat = sum(r["score"] for r in conf_report) / len(conf_report)
+        scores_for_overall.append(avg_feat)
+    overall_conf = sum(scores_for_overall) / len(scores_for_overall) if scores_for_overall else cov
+
+    # ── Status badge icons for coverage rows ─────────────────────────────────
+    def _cov_icon(pct: float) -> str:
+        return "✅" if pct >= 0.85 else "⚠️" if pct >= 0.50 else "❌"
+
+    # ── Header block ──────────────────────────────────────────────────────────
     lines = [
         f"# QA Review Report — {domain.domain_name}",
         "",
         f"**Status:** {'✅ PASSED' if passed else '❌ FAILED'}  ",
-        f"**Coverage Score:** {cov:.0%}  ",
+        f"**Overall Confidence:** {overall_conf:.0%}  ",
         f"**Consistency Score:** {con:.0%}  ",
         f"**Issues:** {len(critical)} critical · {len(major)} major · {len(minor)} minor",
         "",
+    ]
+
+    # Per-dimension coverage table (only when flow_coverage data is available)
+    if cov_rows:
+        lines += ["## Coverage Breakdown", ""]
+        col_w = max(len(lbl) for lbl, _ in cov_rows)
+        for label, pct in cov_rows:
+            bar = _coverage_bar(pct)
+            icon = _cov_icon(pct)
+            lines.append(
+                f"| {label:<{col_w}} | {icon} {pct:>6.1%} | {bar} |"
+            )
+        lines.append("")
+    else:
+        # Fallback: single LLM coverage score when flow_coverage.json missing
+        lines += [f"**Coverage Score:** {cov:.0%}  ", ""]
+
+    lines += [
         "## Summary",
         "",
         summary,
@@ -685,6 +729,13 @@ def _build_report_md(
 
 
 # ─── Helpers ───────────────────────────────────────────────────────────────────
+
+def _coverage_bar(pct: float, width: int = 20) -> str:
+    """Render a compact ASCII progress bar for a coverage percentage."""
+    filled = round(pct * width)
+    empty  = width - filled
+    return "█" * filled + "░" * empty
+
 
 def _load_flow_coverage(ctx: PipelineContext) -> dict:
     """Load flow_coverage.json if it exists; return empty dict otherwise."""
