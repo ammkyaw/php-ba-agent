@@ -324,6 +324,7 @@ _STAGE_SUBDIRS: dict[str, str] = {
     "qa_report.md":                "6_qa",
     "qa_result.json":              "6_qa",
     "confidence_scores.json":      "6_qa",
+    "qa_checklist.json":           "6_qa",
     # Stage 6.2 — Architecture
     "architecture.json":           "6.2_architecture",
     "architecture.md":             "6.2_architecture",

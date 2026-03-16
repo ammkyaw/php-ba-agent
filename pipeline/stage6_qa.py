@@ -102,11 +102,16 @@ def run(ctx: PipelineContext) -> None:
     from pipeline.consistency_check import run_checks as _run_consistency_checks
     from pipeline.consistency_check import format_summary as _consistency_summary
     from pipeline.evidence_index import build_evidence_index, build_confidence_report
+    from pipeline.qa_checklist import (
+        build_checklist as _build_checklist,
+        checklist_overall_status as _checklist_status,
+    )
     system_prompt = _build_system_prompt(ctx)
 
     # ── Confidence Scoring (no LLM) ───────────────────────────────────────────
-    # Build once — used by both Pass D (C-08) and the QA report section.
+    # Build once — used by Pass D (C-08), the checklist, and the QA report.
     conf_report: list[dict] = []
+    ev_idx:      dict       = {}
     if ctx.domain_model and ctx.code_map:
         ev_idx      = build_evidence_index(ctx, ctx.domain_model)
         conf_report = build_confidence_report(ev_idx)
@@ -116,7 +121,6 @@ def run(ctx: PipelineContext) -> None:
               f"({n_hi} HIGH 🟢, "
               f"{len(conf_report)-n_hi-n_low} MEDIUM 🟡, "
               f"{n_low} LOW 🔴)")
-        # Save standalone JSON for downstream tooling
         _save_confidence_json(ctx, conf_report)
 
     # ── Pass D: Deterministic Consistency Checks (no LLM) ─────────────────────
@@ -125,6 +129,18 @@ def run(ctx: PipelineContext) -> None:
     print("  [stage6] Pass D — deterministic consistency checks ...")
     pass_d_issues = _run_consistency_checks(ctx, artefacts, conf_report)
     print(f"  [stage6] Pass D — {_consistency_summary(pass_d_issues)}")
+
+    # ── Automated QA Checklist (no LLM) ───────────────────────────────────────
+    fc_data    = _load_flow_coverage(ctx)
+    qa_checks  = _build_checklist(fc_data, pass_d_issues, ev_idx)
+    cl_status  = _checklist_status(qa_checks)
+    n_cl_pass  = sum(1 for c in qa_checks if c["status"] == "pass")
+    n_cl_warn  = sum(1 for c in qa_checks if c["status"] == "warn")
+    n_cl_fail  = sum(1 for c in qa_checks if c["status"] == "fail")
+    print(f"  [stage6] Checklist — {len(qa_checks)} checks: "
+          f"{n_cl_pass} ✅  {n_cl_warn} ⚠️  {n_cl_fail} ❌  "
+          f"(overall: {cl_status.upper()})")
+    _save_checklist_json(ctx, qa_checks)
 
     # ── Pass A: Coverage ──────────────────────────────────────────────────────
     pass_a_prompt = _build_coverage_prompt(ctx, artefacts)
@@ -178,7 +194,7 @@ def run(ctx: PipelineContext) -> None:
     )
 
     # ── Write outputs ─────────────────────────────────────────────────────────
-    report_md = _build_report_md(qa_data, ctx, conf_report)
+    report_md = _build_report_md(qa_data, ctx, conf_report, qa_checks)
     Path(report_path).write_text(report_md, encoding="utf-8")
 
     with open(ctx.output_path(QA_JSON_FILE), "w", encoding="utf-8") as fh:
@@ -499,6 +515,7 @@ def _build_report_md(
     qa_data:     dict,
     ctx:         PipelineContext,
     conf_report: list[dict] | None = None,
+    qa_checks:   list[dict] | None = None,
 ) -> str:
     """Render the QA result as a human-readable Markdown report."""
     domain        = ctx.domain_model
@@ -530,6 +547,11 @@ def _build_report_md(
         summary,
         "",
     ]
+
+    # ── Automated QA Checklist ────────────────────────────────────────────────
+    if qa_checks:
+        from pipeline.qa_checklist import format_checklist_md
+        lines.append(format_checklist_md(qa_checks))
 
     lines += ["## Feature Coverage", ""]
     covered = coverage.get("features_covered", [])
@@ -663,6 +685,24 @@ def _build_report_md(
 
 
 # ─── Helpers ───────────────────────────────────────────────────────────────────
+
+def _load_flow_coverage(ctx: PipelineContext) -> dict:
+    """Load flow_coverage.json if it exists; return empty dict otherwise."""
+    import os
+    path = ctx.output_path("flow_coverage.json")
+    if os.path.exists(path):
+        with open(path, encoding="utf-8") as fh:
+            return json.load(fh)
+    return {}
+
+
+def _save_checklist_json(ctx: PipelineContext, qa_checks: list[dict]) -> None:
+    """Save the QA checklist as qa_checklist.json in the stage6 output dir."""
+    path = ctx.output_path("qa_checklist.json")
+    with open(path, "w", encoding="utf-8") as fh:
+        json.dump(qa_checks, fh, indent=2, ensure_ascii=False)
+    print(f"  [stage6] Checklist saved → {path}")
+
 
 def _save_confidence_json(ctx: PipelineContext, conf_report: list[dict]) -> None:
     """Save the confidence report as confidence_scores.json in the stage6 output dir."""
