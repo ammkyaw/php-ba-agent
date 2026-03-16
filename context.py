@@ -303,6 +303,50 @@ class InvariantCollection:
 
 
 @dataclass
+class StateTransition:
+    """
+    One detected state transition for a state-machine entity field.
+
+    Produced by Stage 4.3 — fully static, no LLM.
+    """
+    from_state:   str            # e.g. "Draft"
+    to_state:     str            # e.g. "Submitted"
+    trigger:      str            # PHP file stem or operation label, e.g. "save_case"
+    guard:        str            # guard condition if known, else ""
+    source_files: list[str]
+    confidence:   float = 0.75   # 0.9=SQL SET+WHERE, 0.75=branch+action, 0.5=proximity
+
+
+@dataclass
+class StateMachine:
+    """
+    State machine for one (table, field) pair, produced by Stage 4.3.
+
+    Consumed by Stage 4.5 (flow validation), Stage 6.7 (diagrams),
+    Stage 8 (test generation).
+    """
+    machine_id:      str           # e.g. "sm_001"
+    entity:          str           # human name, e.g. "Email"
+    table:           str           # e.g. "emails"
+    field:           str           # e.g. "status"
+    bounded_context: str           # cluster name from Stage 2.8
+    states:          list[str]     # all distinct states detected
+    initial_states:  list[str]     # states with no incoming transition
+    terminal_states: list[str]     # states with no outgoing transition
+    dead_states:     list[str]     # unreachable states
+    transitions:     list[StateTransition]
+    mermaid:         str           # stateDiagram-v2 source
+
+
+@dataclass
+class StateMachineCollection:
+    """Container written to state_machine_catalog.json by Stage 4.3."""
+    machines:     list[StateMachine] = field(default_factory=list)
+    total:        int                = 0
+    generated_at: str                = field(default_factory=lambda: datetime.utcnow().isoformat())
+
+
+@dataclass
 class ActionCluster:
     """
     One action cluster produced by Stage 2.8 — a group of PHP files that share
@@ -362,6 +406,8 @@ _STAGE_SUBDIRS: dict[str, str] = {
     "action_clusters.json":        "2.8_clusters",
     # Stage 2.9 — Invariant Detection
     "rule_catalog.json":           "2.9_invariants",
+    # Stage 4.3 — State Machine Reconstruction
+    "state_machine_catalog.json":  "4.3_statemachines",
     # Stage 3 — Vector Embeddings
     "chromadb":                    "3_embed",
     "chunks_manifest.json":        "3_embed",
@@ -439,6 +485,7 @@ class PipelineContext:
         "stage3_embed":         StageResult(),
         "stage35_preflight":    StageResult(),
         "stage4_domain":        StageResult(),
+        "stage43_statemachines": StageResult(),  # state machine reconstruction
         "stage45_flows":        StageResult(),
         "stage47_validate":     StageResult(),   # behavioral flow validation
         "stage5_brd":           StageResult(),
@@ -459,6 +506,7 @@ class PipelineContext:
     behavior_graph:    Optional[dict]                   = None   # Stage 2.5
     action_clusters:   Optional[ActionClusterCollection] = None  # Stage 2.8
     invariants:        Optional[InvariantCollection]      = None  # Stage 2.9
+    state_machines:    Optional[StateMachineCollection]   = None  # Stage 4.3
     embedding_meta:    Optional[EmbeddingMeta]          = None
     preflight:         Optional[PreflightResult]        = None
     domain_model:      Optional[DomainModel]            = None
@@ -739,6 +787,40 @@ class PipelineContext:
             ctx.action_clusters = ActionClusterCollection(
                 clusters     = clusters,
                 total        = d.get("total", len(clusters)),
+                generated_at = d.get("generated_at", ""),
+            )
+
+        if data.get("state_machines") is not None:
+            d = data["state_machines"]
+            machines = [
+                StateMachine(
+                    machine_id      = m["machine_id"],
+                    entity          = m["entity"],
+                    table           = m["table"],
+                    field           = m["field"],
+                    bounded_context = m.get("bounded_context", ""),
+                    states          = m.get("states", []),
+                    initial_states  = m.get("initial_states", []),
+                    terminal_states = m.get("terminal_states", []),
+                    dead_states     = m.get("dead_states", []),
+                    transitions     = [
+                        StateTransition(
+                            from_state   = t["from_state"],
+                            to_state     = t["to_state"],
+                            trigger      = t.get("trigger", ""),
+                            guard        = t.get("guard", ""),
+                            source_files = t.get("source_files", []),
+                            confidence   = t.get("confidence", 0.75),
+                        )
+                        for t in m.get("transitions", [])
+                    ],
+                    mermaid         = m.get("mermaid", ""),
+                )
+                for m in d.get("machines", [])
+            ]
+            ctx.state_machines = StateMachineCollection(
+                machines     = machines,
+                total        = d.get("total", len(machines)),
                 generated_at = d.get("generated_at", ""),
             )
 
