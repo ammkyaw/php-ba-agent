@@ -65,10 +65,12 @@ MAX_TOKENS_GAP_FILL = 6_000   # Call D: gap-fill features for uncovered pages
 DOMAIN_FILE      = "domain_model.json"
 COVERAGE_FILE    = "coverage_report.json"
 
-# Gap-fill: maximum uncovered pages to send in a single gap-fill call
+# Gap-fill: max modules per module-grouped call (covers ~10× more files than pages)
+GAP_FILL_MAX_MODULES = 30
+# Gap-fill: max individual files per call (fallback when no module structure)
 GAP_FILL_MAX_PAGES = 50
-# Gap-fill: maximum number of loop rounds (each covers GAP_FILL_MAX_PAGES pages)
-MAX_GAP_ROUNDS = 5
+# Gap-fill: maximum number of loop rounds
+MAX_GAP_ROUNDS = 10
 
 # Retrieval: queries × top-k chunks each
 RETRIEVAL_QUERIES = [
@@ -487,12 +489,56 @@ Output ONLY this JSON (no other fields):
 Now produce the JSON for user_roles and workflows only:"""
 
 
+def _group_uncovered_by_module(
+    uncovered_files: list[str],
+    exec_paths: list[dict],
+) -> tuple[dict[str, list[str]], list[str]]:
+    """
+    Group uncovered file basenames by their module directory.
+
+    Returns
+    -------
+    module_groups : {module_name: [file1.php, file2.php, ...]}
+        Only modules that have at least one uncovered file.
+    flat_remainder : [file.php, ...]
+        Files that are NOT inside a modules/ directory (no module grouping possible).
+    """
+    from collections import defaultdict
+
+    # Build file-basename → module name map from exec_paths
+    basename_to_module: dict[str, str] = {}
+    for ep in exec_paths:
+        f = ep.get("file", "")
+        if not f:
+            continue
+        mod = _extract_module_name(f)
+        if mod:
+            basename_to_module[Path(f).name.lower()] = mod
+
+    module_groups: dict[str, list[str]] = defaultdict(list)
+    flat_remainder: list[str] = []
+
+    for fname in uncovered_files:
+        mod = basename_to_module.get(fname.lower())
+        if mod:
+            module_groups[mod].append(fname)
+        else:
+            flat_remainder.append(fname)
+
+    return dict(module_groups), flat_remainder
+
+
 def _system_gap_fill(quality_score: int, uncovered_pages: list[str],
                      existing_feature_names: list[str],
-                     known_tables: list[str] | None = None) -> str:
-    """Call D — gap-fill features for pages not yet covered by known features."""
+                     known_tables: list[str] | None = None,
+                     module_groups: dict[str, list[str]] | None = None) -> str:
+    """Call D — gap-fill features for pages not yet covered by known features.
+
+    When *module_groups* is supplied the prompt presents modules (with sample
+    filenames) instead of bare filenames — one feature per module covers all
+    sibling files through module-expansion and is far more token-efficient.
+    """
     existing_str = ", ".join(f'"{n}"' for n in existing_feature_names[:20])
-    pages_str    = ", ".join(f'"{p}"' for p in uncovered_pages)
     tables_grounding = ""
     if known_tables:
         t_str = ", ".join(known_tables[:100])
@@ -500,18 +546,39 @@ def _system_gap_fill(quality_score: int, uncovered_pages: list[str],
             f"\nMANDATORY GROUNDING — use ONLY these actual table names in 'tables' arrays:\n"
             f"{t_str}\n"
         )
+
+    if module_groups:
+        # Module-grouped format: one feature per module
+        module_lines = []
+        for mod, files in module_groups.items():
+            sample = ", ".join(files[:5])
+            extra  = f" (+{len(files)-5} more)" if len(files) > 5 else ""
+            module_lines.append(f'  - {mod}: {sample}{extra}')
+        modules_str = "\n".join(module_lines)
+
+        coverage_instruction = f"""The following application MODULES are NOT yet covered by any existing feature.
+Each module is a group of PHP files under modules/<ModuleName>/:
+
+{modules_str}
+
+Existing features already extracted (do NOT duplicate): {existing_str}
+
+Create ONE feature per module (or merge closely related small modules into one feature).
+Each feature's "pages" array MUST include the representative PHP filenames listed above."""
+    else:
+        pages_str = ", ".join(f'"{p}"' for p in uncovered_pages)
+        coverage_instruction = f"""The following PHP pages are NOT yet covered by any existing feature:
+{pages_str}
+
+Existing features already extracted (do NOT duplicate): {existing_str}
+
+For each uncovered page, determine what business feature it represents.
+Group multiple uncovered pages under one feature if they implement the same business function."""
+
     return f"""{_SYSTEM_PREAMBLE}
 {_evidence_instruction(quality_score)}{tables_grounding}
 
-The following PHP pages are NOT yet covered by any existing feature in the domain model:
-{pages_str}
-
-Existing features already extracted (do NOT duplicate or re-list these):
-{existing_str}
-
-For each uncovered page, determine what business feature it represents based on the
-codebase evidence. Group multiple uncovered pages under one feature if they implement
-the same business function.
+{coverage_instruction}
 
 Output ONLY this JSON (no other fields):
 {{
@@ -519,7 +586,7 @@ Output ONLY this JSON (no other fields):
     {{
       "name": "Feature name",
       "description": "What this feature does from a business perspective",
-      "pages": ["the_uncovered_page.php"],
+      "pages": ["representative_file.php"],
       "tables": ["relevant_table"],
       "inputs": ["field1", "field2"],
       "outputs": "What the user gets after completing this feature",
@@ -528,7 +595,7 @@ Output ONLY this JSON (no other fields):
   ]
 }}
 
-Now produce the JSON for new features covering the uncovered pages:"""
+Now produce the JSON for new features covering the uncovered modules/pages:"""
 
 
 def _build_user_prompt(ctx: PipelineContext, chunks: list[dict]) -> str:
@@ -1112,27 +1179,55 @@ def _gap_fill_pass(
         })
         html_all: list[str] = [Path(p).name for p in (cm.html_pages or [])]
 
+        # Use module-expansion so module-covered siblings don't count as uncovered
+        module_covered = _build_module_expansion(
+            cm.execution_paths or [], covered_pages
+        )
+
         seen_unc: set[str] = set()
         uncovered: list[str] = []
         for p in ep_all + html_all:
-            if p.lower() not in covered_pages and p.lower() not in seen_unc:
+            if p.lower() not in module_covered and p.lower() not in seen_unc:
                 seen_unc.add(p.lower())
                 uncovered.append(p)
 
         if not uncovered:
+            print(f"  [stage4] All pages covered after round {gap_round - 1} — done.")
             break
 
-        gap_pages = uncovered[:GAP_FILL_MAX_PAGES]
-        call_label = f"stage4-D{gap_round}"
-        print(
-            f"  [stage4] Call D{gap_round} — gap-fill for "
-            f"{len(gap_pages)}/{len(uncovered)} uncovered page(s): "
-            f"{gap_pages[:5]}{'...' if len(gap_pages) > 5 else ''}"
+        # ── Module-grouped mode (preferred: covers ~10× more files per call) ──
+        module_groups, flat_files = _group_uncovered_by_module(
+            uncovered, cm.execution_paths or []
         )
 
+        call_label = f"stage4-D{gap_round}"
         existing_names = [f["name"] for f in domain_model.features]
-        gap_system     = _system_gap_fill(quality_score, gap_pages, existing_names,
-                                          known_tables=known_tables)
+
+        if module_groups:
+            # Take the next batch of modules
+            batch_modules = dict(list(module_groups.items())[:GAP_FILL_MAX_MODULES])
+            n_files = sum(len(v) for v in batch_modules.values())
+            print(
+                f"  [stage4] Call D{gap_round} — gap-fill "
+                f"{len(batch_modules)} module(s) (~{n_files} files) "
+                f"of {len(module_groups)} uncovered modules"
+            )
+            gap_system = _system_gap_fill(
+                quality_score, [], existing_names,
+                known_tables=known_tables, module_groups=batch_modules,
+            )
+        else:
+            # Flat fallback (no modules/ structure, e.g. pure Laravel)
+            gap_pages = flat_files[:GAP_FILL_MAX_PAGES]
+            print(
+                f"  [stage4] Call D{gap_round} — gap-fill "
+                f"{len(gap_pages)}/{len(flat_files)} uncovered file(s): "
+                f"{gap_pages[:5]}{'...' if len(gap_pages) > 5 else ''}"
+            )
+            gap_system = _system_gap_fill(
+                quality_score, gap_pages, existing_names,
+                known_tables=known_tables,
+            )
         raw_d          = _call_part(gap_system, user_prompt, MAX_TOKENS_GAP_FILL,
                                     call_label)
         data_d         = _parse_partial(raw_d, f"D{gap_round}", debug_dir)
