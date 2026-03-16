@@ -915,25 +915,29 @@ def _filter_hallucinated_refs(
     Empty grounding sets mean the code_map had nothing to check against, so
     we skip filtering for that dimension to avoid falsely removing valid refs.
     """
-    features = data.get("features", [])
+    features = [f for f in data.get("features", []) if isinstance(f, dict)]
     if not features:
         return data
+    data["features"] = features
 
     hallucinated_pages  = 0
     hallucinated_tables = 0
 
     for feat in features:
+        if not isinstance(feat, dict):
+            continue
+
         if known_pages_lower:
             orig_pages = feat.get("pages", [])
             real_pages = [p for p in orig_pages
-                          if Path(p).name.lower() in known_pages_lower]
+                          if isinstance(p, str) and Path(p).name.lower() in known_pages_lower]
             hallucinated_pages += len(orig_pages) - len(real_pages)
             feat["pages"] = real_pages
 
         if known_tables_lower:
             orig_tables = feat.get("tables", [])
             real_tables = [t for t in orig_tables
-                           if t.lower() in known_tables_lower]
+                           if isinstance(t, str) and t.lower() in known_tables_lower]
             hallucinated_tables += len(orig_tables) - len(real_tables)
             feat["tables"] = real_tables
 
