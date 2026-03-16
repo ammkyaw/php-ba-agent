@@ -101,13 +101,29 @@ def run(ctx: PipelineContext) -> None:
     from pipeline.llm_client import call_llm
     from pipeline.consistency_check import run_checks as _run_consistency_checks
     from pipeline.consistency_check import format_summary as _consistency_summary
+    from pipeline.evidence_index import build_evidence_index, build_confidence_report
     system_prompt = _build_system_prompt(ctx)
+
+    # ── Confidence Scoring (no LLM) ───────────────────────────────────────────
+    # Build once — used by both Pass D (C-08) and the QA report section.
+    conf_report: list[dict] = []
+    if ctx.domain_model and ctx.code_map:
+        ev_idx      = build_evidence_index(ctx, ctx.domain_model)
+        conf_report = build_confidence_report(ev_idx)
+        n_low = sum(1 for r in conf_report if r["score"] < 0.4)
+        n_hi  = sum(1 for r in conf_report if r["score"] >= 0.8)
+        print(f"  [stage6] Confidence — {len(conf_report)} features scored "
+              f"({n_hi} HIGH 🟢, "
+              f"{len(conf_report)-n_hi-n_low} MEDIUM 🟡, "
+              f"{n_low} LOW 🔴)")
+        # Save standalone JSON for downstream tooling
+        _save_confidence_json(ctx, conf_report)
 
     # ── Pass D: Deterministic Consistency Checks (no LLM) ─────────────────────
     # Runs BEFORE the LLM passes so findings appear at the top of the report
     # and can be referenced in the Pass B consistency prompt.
     print("  [stage6] Pass D — deterministic consistency checks ...")
-    pass_d_issues = _run_consistency_checks(ctx, artefacts)
+    pass_d_issues = _run_consistency_checks(ctx, artefacts, conf_report)
     print(f"  [stage6] Pass D — {_consistency_summary(pass_d_issues)}")
 
     # ── Pass A: Coverage ──────────────────────────────────────────────────────
@@ -162,7 +178,7 @@ def run(ctx: PipelineContext) -> None:
     )
 
     # ── Write outputs ─────────────────────────────────────────────────────────
-    report_md = _build_report_md(qa_data, ctx)
+    report_md = _build_report_md(qa_data, ctx, conf_report)
     Path(report_path).write_text(report_md, encoding="utf-8")
 
     with open(ctx.output_path(QA_JSON_FILE), "w", encoding="utf-8") as fh:
@@ -479,7 +495,11 @@ def _merge_passes(
 
 # ─── Report Building ───────────────────────────────────────────────────────────
 
-def _build_report_md(qa_data: dict, ctx: PipelineContext) -> str:
+def _build_report_md(
+    qa_data:     dict,
+    ctx:         PipelineContext,
+    conf_report: list[dict] | None = None,
+) -> str:
     """Render the QA result as a human-readable Markdown report."""
     domain        = ctx.domain_model
     passed        = qa_data.get("passed", False)
@@ -599,6 +619,34 @@ def _build_report_md(qa_data: dict, ctx: PipelineContext) -> str:
             )
         lines.append("")
 
+    # ── Feature Confidence Scores ──────────────────────────────────────────────
+    if conf_report:
+        n_hi  = sum(1 for r in conf_report if r["score"] >= 0.8)
+        n_med = sum(1 for r in conf_report if 0.4 <= r["score"] < 0.8)
+        n_low = sum(1 for r in conf_report if r["score"] < 0.4)
+        lines += [
+            "## Feature Confidence Scores",
+            "",
+            f"Confidence measures how many of the 5 evidence types "
+            f"(route, controller, SQL, form, execution path) back each feature.",
+            f"",
+            f"**{n_hi} HIGH 🟢** · **{n_med} MEDIUM 🟡** · **{n_low} LOW 🔴**",
+            "",
+            "| Feature | Score | Grade | Present | Missing |",
+            "|---------|-------|-------|---------|---------|",
+        ]
+        for row in conf_report:
+            present_str = ", ".join(row.get("present", [])) or "—"
+            missing_str = ", ".join(row.get("missing", [])) or "—"
+            lines.append(
+                f"| {row['feature']} "
+                f"| {row['score']:.1f} "
+                f"| {row['grade']} "
+                f"| {present_str} "
+                f"| {missing_str} |"
+            )
+        lines.append("")
+
     if ctx.ba_artifacts:
         lines += ["## Reviewed Artefacts", ""]
         for label, path in [
@@ -615,6 +663,15 @@ def _build_report_md(qa_data: dict, ctx: PipelineContext) -> str:
 
 
 # ─── Helpers ───────────────────────────────────────────────────────────────────
+
+def _save_confidence_json(ctx: PipelineContext, conf_report: list[dict]) -> None:
+    """Save the confidence report as confidence_scores.json in the stage6 output dir."""
+    import json as _json
+    path = ctx.output_path("confidence_scores.json")
+    with open(path, "w", encoding="utf-8") as fh:
+        _json.dump(conf_report, fh, indent=2, ensure_ascii=False)
+    print(f"  [stage6] Confidence report saved → {path}")
+
 
 def _load_artefacts(ctx: PipelineContext) -> dict[str, str]:
     """Load all four BA artefact files. Raises if any are missing."""
