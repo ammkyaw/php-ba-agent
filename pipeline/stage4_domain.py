@@ -890,6 +890,29 @@ def _build_user_prompt(ctx: PipelineContext, chunks: list[dict]) -> str:
                 f"  ({type_summary})"
             )
 
+    # ── Action Clusters from Stage 2.8 ───────────────────────────────────────
+    # Provide the similarity-based cluster map as an alternative bounded-context
+    # seed.  This is especially useful when the Stage 2 graph was built without
+    # community detection (no detected_modules) or the graph is absent.
+    ac = getattr(ctx, "action_clusters", None)
+    if ac and ac.clusters and not detected_modules:
+        parts.append(f"\n=== ACTION CLUSTERS — STAGE 2.8 ({len(ac.clusters)}) ===")
+        parts.append(
+            "These clusters were computed from shared DB tables, route prefixes, "
+            "and module directory structure.  Use them as the basis for "
+            "bounded_contexts — merge near-empty ones, rename for clarity, "
+            "but anchor to these cluster names."
+        )
+        for c in ac.clusters[:40]:   # cap to avoid prompt bloat
+            tbl_preview = ", ".join(c.tables[:5])
+            if len(c.tables) > 5:
+                tbl_preview += f" (+{len(c.tables)-5} more)"
+            parts.append(
+                f"  [{c.name}]  files={c.file_count}"
+                + (f"  tables=[{tbl_preview}]" if tbl_preview else "")
+                + (f"  route={c.route_prefix}" if c.route_prefix else "")
+            )
+
     # ── Retrieved semantic chunks ─────────────────────────────────────────────
     parts.append(f"\n=== SEMANTIC CONTEXT ({len(chunks)} chunks) ===")
     for i, chunk in enumerate(chunks, 1):
