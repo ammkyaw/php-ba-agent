@@ -11,6 +11,7 @@ Stages (in execution order):
     Stage 3.5  preflight      — context pre-flight checks
     Stage 4    domain         — DomainAnalystAgent (LLM)
     Stage 4.5  flows          — BusinessFlowExtractor (LLM)
+    Stage 4.7  validate       — Behavioral Flow Validation (deterministic)
     Stage 5    brd/srs/ac/us  — parallel BA document agents (LLM)
     Stage 6    qa             — QAReviewAgent (LLM)
     Stage 6.2  architecture   — ArchitectureReconstructionAgent (LLM)
@@ -55,6 +56,7 @@ from pipeline.stage3_embed         import run as stage3
 from pipeline.stage35_preflight    import run as stage35
 from pipeline.stage4_domain        import run as stage4
 from pipeline.stage45_flows        import run as stage45
+from pipeline.stage47_validate_flows import run as stage47
 from pipeline.stage5_workers       import run as stage5
 from pipeline.stage6_qa            import run as stage6
 from pipeline.stage62_architecture import run as stage62
@@ -76,6 +78,7 @@ STAGES: list[tuple[str, any]] = [
     ("stage35_preflight",    stage35),
     ("stage4_domain",        stage4),
     ("stage45_flows",        stage45),  # business flow extraction (feeds stage62 + stage67)
+    ("stage47_validate",     stage47),  # behavioral validation (are flows missing / valid / real?)
     ("stage5_brd",           None),     # ← parallel group handled below
     ("stage5_srs",           None),
     ("stage5_ac",            None),

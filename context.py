@@ -317,6 +317,9 @@ _STAGE_SUBDIRS: dict[str, str] = {
     # Stage 4.5 — Business Flows
     "business_flows.json":         "4.5_flows",
     "flow_coverage.json":          "4.5_flows",
+    # Stage 4.7 — Behavioral Validation
+    "flow_validation.json":        "4.7_validation",
+    "flow_validation.md":          "4.7_validation",
     # Stage 5 — BA Documents (Markdown)
     "brd.md":                      "5_documents",
     "srs.md":                      "5_documents",
@@ -379,6 +382,7 @@ class PipelineContext:
         "stage35_preflight":    StageResult(),
         "stage4_domain":        StageResult(),
         "stage45_flows":        StageResult(),
+        "stage47_validate":     StageResult(),   # behavioral flow validation
         "stage5_brd":           StageResult(),
         "stage5_srs":           StageResult(),
         "stage5_ac":            StageResult(),
@@ -399,6 +403,7 @@ class PipelineContext:
     preflight:         Optional[PreflightResult]        = None
     domain_model:      Optional[DomainModel]            = None
     business_flows:    Optional[BusinessFlowCollection] = None
+    flow_validation:   Optional[dict]                   = None   # Stage 4.7
     ba_artifacts:      Optional[BAArtifacts]            = None
     qa_result:         Optional[QAResult]               = None
     architecture_meta: Optional[ArchitectureMeta]       = None  # Stage 6.2
