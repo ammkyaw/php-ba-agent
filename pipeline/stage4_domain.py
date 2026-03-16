@@ -136,6 +136,13 @@ def run(ctx: PipelineContext) -> None:
         if q.get("table") and q["table"] not in ("UNKNOWN", "")
     })
 
+    # POST field names — used to ground 'inputs' arrays in features so the
+    # LLM doesn't hallucinate form fields that don't exist in the codebase.
+    known_fields: list[str] = sorted({
+        s["key"] for s in (cm.superglobals or [])
+        if s.get("var") == "$_POST" and s.get("key")
+    })
+
     # Wide filter set: ALL file basenames across the entire code_map.
     # This prevents _filter_hallucinated_refs from incorrectly stripping
     # controller / service / execution-path references just because they
@@ -158,7 +165,8 @@ def run(ctx: PipelineContext) -> None:
     raw_b = _call_part(
         _system_features(quality_score,
                          known_tables=known_tables,
-                         known_pages=known_pages),
+                         known_pages=known_pages,
+                         known_fields=known_fields),
         user_prompt, MAX_TOKENS_FEATURES, "stage4-B",
     )
     data_b = _parse_partial(raw_b, "B", debug_dir)
@@ -191,6 +199,7 @@ def run(ctx: PipelineContext) -> None:
     domain_model = _gap_fill_pass(
         ctx, domain_model, coverage_report, user_prompt, quality_score, debug_dir,
         known_tables=known_tables, known_pages_lower=known_files_all,
+        known_fields=known_fields,
     )
 
     # ── Post-gap-fill coverage (shows improvement vs initial report) ───────────
@@ -410,11 +419,12 @@ def _system_features(
     quality_score: int,
     known_tables: list[str] | None = None,
     known_pages:  list[str] | None = None,
+    known_fields: list[str] | None = None,
 ) -> str:
     """Call B — features list only.
 
-    known_tables / known_pages: when provided, injected as mandatory grounding
-    so the model cannot hallucinate filenames or table names that don't exist
+    known_tables / known_pages / known_fields: when provided, injected as
+    mandatory grounding so the model cannot hallucinate names that don't exist
     in the actual codebase.
     """
     # ── Build grounding block ────────────────────────────────────────────────
@@ -436,6 +446,15 @@ def _system_features(
             "You MUST use ONLY filenames from the list above in 'pages' arrays.\n"
             "Do NOT invent filenames like 'registration.php', 'catalog.php', "
             "'cart.php', 'checkout.php' unless they actually appear in this list."
+        )
+    if known_fields:
+        fields_str = ", ".join(known_fields[:200])   # cap to avoid token overflow
+        grounding_parts.append(
+            "MANDATORY GROUNDING — ACTUAL POST FORM FIELDS IN THIS CODEBASE:\n"
+            f"{fields_str}\n"
+            "You MUST populate each feature's 'inputs' array ONLY with field names "
+            "from the list above that are relevant to that feature.\n"
+            "Do NOT invent field names. If a feature has no matching fields, use []."
         )
     grounding = ("\n\n" + "\n\n".join(grounding_parts)) if grounding_parts else ""
 
@@ -535,6 +554,7 @@ def _group_uncovered_by_module(
 def _system_gap_fill(quality_score: int, uncovered_pages: list[str],
                      existing_feature_names: list[str],
                      known_tables: list[str] | None = None,
+                     known_fields: list[str] | None = None,
                      module_groups: dict[str, list[str]] | None = None) -> str:
     """Call D — gap-fill features for pages not yet covered by known features.
 
@@ -543,13 +563,19 @@ def _system_gap_fill(quality_score: int, uncovered_pages: list[str],
     sibling files through module-expansion and is far more token-efficient.
     """
     existing_str = ", ".join(f'"{n}"' for n in existing_feature_names[:20])
-    tables_grounding = ""
+    grounding_parts: list[str] = []
     if known_tables:
         t_str = ", ".join(known_tables[:100])
-        tables_grounding = (
-            f"\nMANDATORY GROUNDING — use ONLY these actual table names in 'tables' arrays:\n"
-            f"{t_str}\n"
+        grounding_parts.append(
+            f"MANDATORY GROUNDING — use ONLY these actual table names in 'tables' arrays:\n{t_str}"
         )
+    if known_fields:
+        f_str = ", ".join(known_fields[:200])
+        grounding_parts.append(
+            f"MANDATORY GROUNDING — populate 'inputs' ONLY from these actual POST field names:\n{f_str}\n"
+            "Do NOT invent field names. If a feature has no matching fields, use []."
+        )
+    tables_grounding = ("\n" + "\n\n".join(grounding_parts) + "\n") if grounding_parts else ""
 
     if module_groups:
         # Module-grouped format: one feature per module
@@ -1179,6 +1205,7 @@ def _gap_fill_pass(
     debug_dir: str | None = None,
     known_tables: list[str] | None = None,
     known_pages_lower: set[str] | None = None,
+    known_fields: list[str] | None = None,
 ) -> "DomainModel":
     """
     If page_coverage < 1.0, loop up to MAX_GAP_ROUNDS additional LLM calls
@@ -1254,7 +1281,8 @@ def _gap_fill_pass(
             )
             gap_system = _system_gap_fill(
                 quality_score, [], existing_names,
-                known_tables=known_tables, module_groups=batch_modules,
+                known_tables=known_tables, known_fields=known_fields,
+                module_groups=batch_modules,
             )
         elif flat_files:
             # ── Flat fallback: non-module files (include/, lib/, etc.) ──────
@@ -1271,7 +1299,7 @@ def _gap_fill_pass(
             )
             gap_system = _system_gap_fill(
                 quality_score, gap_pages, existing_names,
-                known_tables=known_tables,
+                known_tables=known_tables, known_fields=known_fields,
             )
         else:
             print(f"  [stage4] No fresh modules or flat files remain — done.")
