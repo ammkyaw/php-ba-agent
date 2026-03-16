@@ -132,7 +132,8 @@ def run(ctx: PipelineContext) -> None:
 
     # ── Automated QA Checklist (no LLM) ───────────────────────────────────────
     fc_data    = _load_flow_coverage(ctx)
-    qa_checks  = _build_checklist(fc_data, pass_d_issues, ev_idx)
+    dc_data    = _load_doc_coverage(ctx)          # Stage 5.9 document coverage
+    qa_checks  = _build_checklist(fc_data, pass_d_issues, ev_idx, dc_data=dc_data)
     cl_status  = _checklist_status(qa_checks)
     n_cl_pass  = sum(1 for c in qa_checks if c["status"] == "pass")
     n_cl_warn  = sum(1 for c in qa_checks if c["status"] == "warn")
@@ -253,10 +254,28 @@ def _build_coverage_prompt(ctx: PipelineContext, artefacts: dict[str, str]) -> s
         parts.append(f"\n{name} ({len(headings)} headings):")
         parts.append("\n".join(f"  • {h}" for h in headings[:30]))
 
+    # ── Stage 5.9 gap injection ───────────────────────────────────────────────
+    dc = getattr(ctx, "doc_coverage", None)
+    if dc and dc.gap_summary:
+        parts.append("\n=== STATIC COVERAGE GAPS — Stage 5.9 ===")
+        parts.append(
+            "These gaps were detected by deterministic analysis comparing "
+            "pipeline signals (entities, flows, rules, states) to document text. "
+            "Address each gap in your coverage assessment."
+        )
+        for gap in dc.gap_summary:
+            parts.append(f"  • {gap}")
+        parts.append(
+            f"\nStatic coverage overall: {dc.overall_pct:.0%} "
+            f"[{dc.overall_status.upper()}]"
+        )
+
     parts.append("""
 === TASK ===
 Check whether each feature/entity/bounded context from the domain model
 appears as a heading or sub-heading in the artefacts.
+Also explicitly reference any gaps from the STATIC COVERAGE GAPS section above
+in your summary if they are significant.
 
 Return ONLY this JSON (no other text):
 
@@ -744,6 +763,25 @@ def _load_flow_coverage(ctx: PipelineContext) -> dict:
     if os.path.exists(path):
         with open(path, encoding="utf-8") as fh:
             return json.load(fh)
+    return {}
+
+
+def _load_doc_coverage(ctx: PipelineContext) -> dict:
+    """
+    Return Stage 5.9 doc coverage data from ctx.doc_coverage (preferred)
+    or by loading doc_coverage.json from disk if the field is not hydrated.
+    Returns empty dict when Stage 5.9 has not run.
+    """
+    import os
+    dc = getattr(ctx, "doc_coverage", None)
+    if dc is not None:
+        # already hydrated — convert DimCoverage dicts to checklist-friendly shape
+        return {d["dimension"]: d for d in (dc.dimensions or [])}
+    path = ctx.output_path("doc_coverage.json")
+    if os.path.exists(path):
+        with open(path, encoding="utf-8") as fh:
+            data = json.load(fh)
+        return {d["dimension"]: d for d in data.get("dimensions", [])}
     return {}
 
 

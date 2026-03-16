@@ -17,6 +17,7 @@ Stages (in execution order):
     Stage 4.6  specrules      — Specification Mining (static + 1 LLM batch)
     Stage 4.7  validate       — Behavioral Flow Validation (deterministic)
     Stage 5    brd/srs/ac/us  — parallel BA document agents (LLM)
+    Stage 5.9  doccoverage    — Document Coverage Audit (static)
     Stage 6    qa             — QAReviewAgent (LLM)
     Stage 6.2  architecture   — ArchitectureReconstructionAgent (LLM)
     Stage 6.5  postprocess    — DOCX formatting
@@ -68,6 +69,7 @@ from pipeline.stage45_flows        import run as stage45
 from pipeline.stage46_specrules    import run as stage46
 from pipeline.stage47_validate_flows import run as stage47
 from pipeline.stage5_workers       import run as stage5
+from pipeline.stage59_doccoverage  import run as stage59
 from pipeline.stage6_qa            import run as stage6
 from pipeline.stage62_architecture import run as stage62
 from pipeline.stage65_postprocess  import run as stage65
@@ -99,6 +101,7 @@ STAGES: list[tuple[str, any]] = [
     ("stage5_srs",           None),
     ("stage5_ac",            None),
     ("stage5_userstories",   None),
+    ("stage59_doccoverage",  stage59),  # document coverage audit — signals vs documents (static)
     ("stage6_qa",            stage6),
     ("stage62_architecture", stage62),  # architecture reconstruction (feeds stage65 + stage67)
     ("stage65_postprocess",  stage65),
