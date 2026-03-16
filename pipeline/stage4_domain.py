@@ -1223,6 +1223,9 @@ def _gap_fill_pass(
     attempted_modules: set[str] = set()
     # Track which non-module files have already been sent to avoid re-sending.
     attempted_flat: set[str] = set()
+    # Allow up to this many consecutive empty/failed LLM rounds before giving up.
+    MAX_CONSECUTIVE_EMPTY = 3
+    consecutive_empty = 0
 
     for gap_round in range(1, MAX_GAP_ROUNDS + 1):
         # Re-compute which pages are still uncovered after previous rounds
@@ -1322,8 +1325,17 @@ def _gap_fill_pass(
             new_features = data_d
 
         if not new_features:
-            print(f"  [stage4] Gap-fill round {gap_round} returned no new features — stopping.")
-            break
+            consecutive_empty += 1
+            print(
+                f"  [stage4] Gap-fill round {gap_round} returned no new features "
+                f"({consecutive_empty}/{MAX_CONSECUTIVE_EMPTY} consecutive empty)."
+            )
+            if consecutive_empty >= MAX_CONSECUTIVE_EMPTY:
+                print(f"  [stage4] {MAX_CONSECUTIVE_EMPTY} consecutive empty rounds — stopping.")
+                break
+            continue  # try next batch of files
+
+        consecutive_empty = 0  # reset on any successful response
 
         # Merge — skip duplicates by name (case-insensitive)
         existing_lower = {f["name"].lower() for f in domain_model.features}
@@ -1336,13 +1348,19 @@ def _gap_fill_pass(
                     added.append(feat["name"])
 
         if added:
+            consecutive_empty = 0
             suffix = f" ... +{len(added) - 5} more" if len(added) > 5 else ""
             print(f"  [stage4] Gap-fill round {gap_round} added "
                   f"{len(added)} feature(s): {added[:5]}{suffix}")
         else:
-            print(f"  [stage4] Gap-fill round {gap_round}: "
-                  f"all returned features already present — stopping.")
-            break
+            consecutive_empty += 1
+            print(
+                f"  [stage4] Gap-fill round {gap_round}: all returned features already present "
+                f"({consecutive_empty}/{MAX_CONSECUTIVE_EMPTY} consecutive empty)."
+            )
+            if consecutive_empty >= MAX_CONSECUTIVE_EMPTY:
+                print(f"  [stage4] {MAX_CONSECUTIVE_EMPTY} consecutive empty rounds — stopping.")
+                break
 
     return domain_model
 
