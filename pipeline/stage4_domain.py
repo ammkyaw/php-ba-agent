@@ -68,9 +68,9 @@ COVERAGE_FILE    = "coverage_report.json"
 # Gap-fill: max modules per module-grouped call (covers ~10× more files than pages)
 GAP_FILL_MAX_MODULES = 30
 # Gap-fill: max individual files per call (fallback when no module structure)
-GAP_FILL_MAX_PAGES = 50
+GAP_FILL_MAX_PAGES = 100
 # Gap-fill: maximum number of loop rounds
-MAX_GAP_ROUNDS = 10
+MAX_GAP_ROUNDS = 20
 
 # Retrieval: queries × top-k chunks each
 RETRIEVAL_QUERIES = [
@@ -192,6 +192,10 @@ def run(ctx: PipelineContext) -> None:
         ctx, domain_model, coverage_report, user_prompt, quality_score, debug_dir,
         known_tables=known_tables, known_pages_lower=known_files_all,
     )
+
+    # ── Post-gap-fill coverage (shows improvement vs initial report) ───────────
+    print(f"  [stage4] Coverage after gap-fill:")
+    _compute_coverage(ctx, domain_model, debug_dir)
 
     # ── Save ──────────────────────────────────────────────────────────────────
     _save_domain_model(domain_model, output_path)
