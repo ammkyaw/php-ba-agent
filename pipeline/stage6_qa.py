@@ -101,6 +101,8 @@ def run(ctx: PipelineContext) -> None:
     from pipeline.llm_client import call_llm
     from pipeline.consistency_check import run_checks as _run_consistency_checks
     from pipeline.consistency_check import format_summary as _consistency_summary
+    from pipeline.cross_doc_check   import run_checks as _run_cross_doc_checks
+    from pipeline.cross_doc_check   import format_summary as _cross_doc_summary
     from pipeline.evidence_index import build_evidence_index, build_confidence_report
     from pipeline.qa_checklist import (
         build_checklist as _build_checklist,
@@ -130,6 +132,15 @@ def run(ctx: PipelineContext) -> None:
     pass_d_issues = _run_consistency_checks(ctx, artefacts, conf_report)
     print(f"  [stage6] Pass D — {_consistency_summary(pass_d_issues)}")
 
+    # ── Pass E: Cross-Document Consistency (no LLM) ───────────────────────────
+    # Checks traceability between document pairs: orphan epics/AC sections,
+    # undefined actors, and SRS→AC requirement gaps.  Issues are merged into
+    # pass_d_issues so they flow through the same report path.
+    print("  [stage6] Pass E — cross-document consistency checks ...")
+    pass_e_issues = _run_cross_doc_checks(ctx, artefacts)
+    print(f"  [stage6] Pass E — {_cross_doc_summary(pass_e_issues)}")
+    pass_d_issues = pass_d_issues + pass_e_issues  # merge; D issues stay first
+
     # ── Automated QA Checklist (no LLM) ───────────────────────────────────────
     fc_data    = _load_flow_coverage(ctx)
     dc_data    = _load_doc_coverage(ctx)          # Stage 5.9 document coverage
@@ -151,6 +162,7 @@ def run(ctx: PipelineContext) -> None:
     pass_a_data = _parse_response(raw_a, pass_label="A")
 
     # ── Pass B: Consistency & Issues ─────────────────────────────────────────
+    # pass_d_issues now includes Pass E cross-doc findings — injected here.
     pass_b_prompt = _build_consistency_prompt(ctx, artefacts, pass_d_issues)
     print(f"  [stage6] Pass B — consistency + issues ({len(pass_b_prompt):,} chars) ...")
     raw_b     = call_llm(system_prompt, pass_b_prompt,
