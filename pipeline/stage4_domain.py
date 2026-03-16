@@ -66,7 +66,9 @@ DOMAIN_FILE      = "domain_model.json"
 COVERAGE_FILE    = "coverage_report.json"
 
 # Gap-fill: maximum uncovered pages to send in a single gap-fill call
-GAP_FILL_MAX_PAGES = 15
+GAP_FILL_MAX_PAGES = 50
+# Gap-fill: maximum number of loop rounds (each covers GAP_FILL_MAX_PAGES pages)
+MAX_GAP_ROUNDS = 5
 
 # Retrieval: queries × top-k chunks each
 RETRIEVAL_QUERIES = [
@@ -141,7 +143,7 @@ def run(ctx: PipelineContext) -> None:
     # Grounding list injected into the prompt: exec_paths first (most
     # informative for business logic), then html_pages, then controllers.
     # Capped to keep the prompt token budget manageable.
-    known_pages: list[str] = _build_grounding_pages(cm)
+    known_pages: list[str] = _build_grounding_pages(cm, cap=300)
 
     # ── Call A: meta + entities + contexts (fast, ~4K tokens) ────────────────
     print(f"  [stage4] Call 1/3 — domain name, entities, contexts ...")
@@ -421,7 +423,7 @@ def _system_features(
             "unless they actually appear in this list."
         )
     if known_pages:
-        pages_str = ", ".join(known_pages[:120])     # cap to avoid token overflow
+        pages_str = ", ".join(known_pages[:250])     # cap to avoid token overflow
         grounding_parts.append(
             "MANDATORY GROUNDING — ACTUAL PHP PAGE FILES IN THIS CODEBASE:\n"
             f"{pages_str}\n"
@@ -877,6 +879,57 @@ def _filter_hallucinated_refs(
 # ─── Coverage Metrics ──────────────────────────────────────────────────────────
 
 
+def _extract_module_name(filepath: str) -> str | None:
+    """
+    Extract the module directory name from a SugarCRM / raw-PHP style path.
+
+    Examples
+    --------
+    modules/ACL/ACLController.php        → "ACL"
+    custom/modules/ACL/ACLController.php → "ACL"
+    include/MassUpdate.php               → None  (not in a module dir)
+    """
+    parts = Path(filepath).parts
+    for i, part in enumerate(parts):
+        if part.lower() == "modules" and i + 1 < len(parts):
+            return parts[i + 1]
+    return None
+
+
+def _build_module_expansion(
+    exec_paths: list[dict],
+    covered_pages: set[str],
+) -> set[str]:
+    """
+    If any file in a module directory is already covered, expand coverage to
+    ALL files in that module directory (module-level coverage).
+
+    Returns an expanded set of covered page basenames (lowercase).
+    """
+    from collections import defaultdict
+
+    module_files: dict[str, list[str]] = defaultdict(list)
+    for ep in exec_paths:
+        f = ep.get("file", "")
+        if not f:
+            continue
+        mod = _extract_module_name(f)
+        if mod:
+            module_files[mod].append(Path(f).name.lower())
+
+    # Which modules have at least one covered file?
+    covered_modules: set[str] = set()
+    for mod, files in module_files.items():
+        if any(f in covered_pages for f in files):
+            covered_modules.add(mod)
+
+    # Expand: all files in covered modules are considered covered
+    expanded: set[str] = set(covered_pages)
+    for mod in covered_modules:
+        expanded.update(module_files[mod])
+    return expanded
+
+
 def _compute_coverage(
     ctx: PipelineContext,
     domain_model: "DomainModel",
@@ -912,6 +965,13 @@ def _compute_coverage(
         for inp in feat.get("inputs", []):
             covered_inputs.add(inp.lower())
 
+    # ── Module-expanded coverage set ──────────────────────────────────────────
+    # If any file in a module dir is explicitly covered, all sibling files in
+    # that module are counted as covered (module-level granularity).
+    module_covered_pages = _build_module_expansion(
+        cm.execution_paths or [], covered_pages
+    )
+
     # ── Execution-path coverage (primary for API codebases) ───────────────────
     # execution_paths are the stage15 static-analysis entry points — they map
     # 1-to-1 to controller/handler files and represent actual business logic.
@@ -920,14 +980,14 @@ def _compute_coverage(
         for ep in (cm.execution_paths or [])
         if ep.get("file")
     })
-    ep_covered   = [p for p in ep_all if p.lower() in covered_pages]
-    ep_uncovered = [p for p in ep_all if p.lower() not in covered_pages]
+    ep_covered   = [p for p in ep_all if p.lower() in module_covered_pages]
+    ep_uncovered = [p for p in ep_all if p.lower() not in module_covered_pages]
     exec_cov     = len(ep_covered) / len(ep_all) if ep_all else 1.0
 
     # ── HTML-page coverage (secondary — view / entry-point files) ────────────
     html_all       = [Path(p).name for p in (cm.html_pages or [])]
-    html_covered   = [p for p in html_all if p.lower() in covered_pages]
-    html_uncovered = [p for p in html_all if p.lower() not in covered_pages]
+    html_covered   = [p for p in html_all if p.lower() in module_covered_pages]
+    html_uncovered = [p for p in html_all if p.lower() not in module_covered_pages]
     page_cov       = len(html_covered) / len(html_all) if html_all else 1.0
 
     # ── Gap-fill priority list: exec paths first, then remaining html_pages ───
@@ -1028,59 +1088,90 @@ def _gap_fill_pass(
     known_pages_lower: set[str] | None = None,
 ) -> "DomainModel":
     """
-    If page_coverage < 1.0, make an additional LLM call (Call D) to extract
-    features for uncovered entry points and merge them into the domain model.
+    If page_coverage < 1.0, loop up to MAX_GAP_ROUNDS additional LLM calls
+    (Call D, D2, D3 …) to extract features for uncovered entry points and
+    merge them into the domain model.  Each round re-computes uncovered pages
+    against the latest features so new features discovered in round N are
+    accounted for in round N+1.
 
     Returns the (possibly enriched) DomainModel.
     """
-    uncovered = coverage_report.get("pages_uncovered", [])
-    if not uncovered:
-        return domain_model
+    cm = ctx.code_map
 
-    gap_pages = uncovered[:GAP_FILL_MAX_PAGES]
-    print(
-        f"  [stage4] Call 4 — gap-fill for {len(gap_pages)} uncovered page(s): "
-        f"{gap_pages[:5]}{'...' if len(gap_pages) > 5 else ''}"
-    )
+    for gap_round in range(1, MAX_GAP_ROUNDS + 1):
+        # Re-compute which pages are still uncovered after previous rounds
+        covered_pages: set[str] = set()
+        for feat in domain_model.features:
+            for p in feat.get("pages", []):
+                covered_pages.add(Path(p).name.lower())
 
-    existing_names = [f["name"] for f in domain_model.features]
-    gap_system     = _system_gap_fill(quality_score, gap_pages, existing_names,
-                                      known_tables=known_tables)
-    raw_d          = _call_part(gap_system, user_prompt, MAX_TOKENS_GAP_FILL, "stage4-D")
-    data_d         = _parse_partial(raw_d, "D", debug_dir)
+        ep_all: list[str] = sorted({
+            Path(ep["file"]).name
+            for ep in (cm.execution_paths or [])
+            if ep.get("file")
+        })
+        html_all: list[str] = [Path(p).name for p in (cm.html_pages or [])]
 
-    # Filter hallucinated refs from gap-fill response
-    if known_pages_lower or known_tables:
-        data_d = _filter_hallucinated_refs(
-            data_d,
-            known_pages_lower  = known_pages_lower  or set(),
-            known_tables_lower = {t.lower() for t in (known_tables or [])},
+        seen_unc: set[str] = set()
+        uncovered: list[str] = []
+        for p in ep_all + html_all:
+            if p.lower() not in covered_pages and p.lower() not in seen_unc:
+                seen_unc.add(p.lower())
+                uncovered.append(p)
+
+        if not uncovered:
+            break
+
+        gap_pages = uncovered[:GAP_FILL_MAX_PAGES]
+        call_label = f"stage4-D{gap_round}"
+        print(
+            f"  [stage4] Call D{gap_round} — gap-fill for "
+            f"{len(gap_pages)}/{len(uncovered)} uncovered page(s): "
+            f"{gap_pages[:5]}{'...' if len(gap_pages) > 5 else ''}"
         )
 
-    # Normalise: some models return a bare list
-    new_features: list = data_d.get("features", [])
-    if not new_features and isinstance(data_d, list):
-        new_features = data_d
+        existing_names = [f["name"] for f in domain_model.features]
+        gap_system     = _system_gap_fill(quality_score, gap_pages, existing_names,
+                                          known_tables=known_tables)
+        raw_d          = _call_part(gap_system, user_prompt, MAX_TOKENS_GAP_FILL,
+                                    call_label)
+        data_d         = _parse_partial(raw_d, f"D{gap_round}", debug_dir)
 
-    if not new_features:
-        print(f"  [stage4] Gap-fill returned no new features.")
-        return domain_model
+        # Filter hallucinated refs from gap-fill response
+        if known_pages_lower or known_tables:
+            data_d = _filter_hallucinated_refs(
+                data_d,
+                known_pages_lower  = known_pages_lower  or set(),
+                known_tables_lower = {t.lower() for t in (known_tables or [])},
+            )
 
-    # Merge — skip duplicates by name (case-insensitive)
-    existing_lower = {f["name"].lower() for f in domain_model.features}
-    added: list[str] = []
-    for feat in new_features:
-        if isinstance(feat, dict) and feat.get("name"):
-            if feat["name"].lower() not in existing_lower:
-                domain_model.features.append(feat)
-                existing_lower.add(feat["name"].lower())
-                added.append(feat["name"])
+        # Normalise: some models return a bare list
+        new_features: list = data_d.get("features", [])
+        if not new_features and isinstance(data_d, list):
+            new_features = data_d
 
-    if added:
-        suffix = f" ... +{len(added) - 5} more" if len(added) > 5 else ""
-        print(f"  [stage4] Gap-fill added {len(added)} feature(s): {added[:5]}{suffix}")
-    else:
-        print(f"  [stage4] Gap-fill: all returned features already present — nothing added.")
+        if not new_features:
+            print(f"  [stage4] Gap-fill round {gap_round} returned no new features — stopping.")
+            break
+
+        # Merge — skip duplicates by name (case-insensitive)
+        existing_lower = {f["name"].lower() for f in domain_model.features}
+        added: list[str] = []
+        for feat in new_features:
+            if isinstance(feat, dict) and feat.get("name"):
+                if feat["name"].lower() not in existing_lower:
+                    domain_model.features.append(feat)
+                    existing_lower.add(feat["name"].lower())
+                    added.append(feat["name"])
+
+        if added:
+            suffix = f" ... +{len(added) - 5} more" if len(added) > 5 else ""
+            print(f"  [stage4] Gap-fill round {gap_round} added "
+                  f"{len(added)} feature(s): {added[:5]}{suffix}")
+        else:
+            print(f"  [stage4] Gap-fill round {gap_round}: "
+                  f"all returned features already present — stopping.")
+            break
 
     return domain_model
 
