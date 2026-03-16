@@ -370,6 +370,78 @@ class ActionClusterCollection:
 
 
 @dataclass
+class EntityColumn:
+    """One column of a DB table, produced by Stage 4.1."""
+    name:              str
+    data_type:         str  = ""
+    nullable:          bool = True
+    is_primary_key:    bool = False
+    is_foreign_key:    bool = False
+    references_table:  str  = ""
+    references_column: str  = ""
+
+
+@dataclass
+class Entity:
+    """
+    One business entity extracted by Stage 4.1.
+
+    Covers every table/model in the codebase.  Use is_core / is_system /
+    is_pivot flags to filter for different consumers (ER diagram vs full graph).
+    """
+    entity_id:       str            # "ent_001"
+    name:            str            # "Customer"  (humanized from table name)
+    table:           str            # "customers"
+    bounded_context: str            # cluster name from Stage 2.8
+    columns:         list[EntityColumn]
+    primary_key:     str            # e.g. "id"
+    is_pivot:        bool = False   # junction table for N:M
+    is_core:         bool = True    # has ≥1 relationship OR ≥1 state machine OR in action cluster
+    is_system:       bool = False   # infra/log/config tables (sugar_config, log_messages…)
+    source_files:    list[str] = field(default_factory=list)
+    confidence:      float = 1.0
+
+
+@dataclass
+class EntityCollection:
+    """Container written to entity_catalog.json by Stage 4.1."""
+    entities:     list[Entity] = field(default_factory=list)
+    total:        int          = 0
+    core_count:   int          = 0   # entities where is_core=True
+    generated_at: str          = field(default_factory=lambda: datetime.utcnow().isoformat())
+
+
+@dataclass
+class EntityRelationship:
+    """
+    One detected relationship between two entities, produced by Stage 4.2.
+
+    Multiple signals (FK, JOIN, ORM, column pattern) are merged into a single
+    entry per (from_entity, to_entity) pair.
+    """
+    rel_id:       str            # "rel_001"
+    from_entity:  str            # table name e.g. "customers"
+    to_entity:    str            # table name e.g. "orders"
+    cardinality:  str            # "1:1" | "1:N" | "N:M"
+    rel_type:     str            # "has_many" | "has_one" | "belongs_to" | "many_to_many"
+    via_column:   str            # FK column, e.g. "customer_id"
+    via_table:    str            # pivot table name (N:M only), else ""
+    confidence:   float
+    signals:      list[str]      # ["foreign_key","column_pattern","sql_join","orm"]
+    source_files: list[str]
+
+
+@dataclass
+class EntityRelationshipCollection:
+    """Container written to relationship_catalog.json by Stage 4.2."""
+    relationships: list[EntityRelationship] = field(default_factory=list)
+    entity_names:  list[str]                = field(default_factory=list)
+    total:         int                      = 0
+    mermaid_path:  str                      = ""   # path to erDiagram .mmd file
+    generated_at:  str                      = field(default_factory=lambda: datetime.utcnow().isoformat())
+
+
+@dataclass
 class ArchitectureMeta:
     """
     Lightweight summary of the architecture reconstruction produced by Stage 6.2.
@@ -406,6 +478,10 @@ _STAGE_SUBDIRS: dict[str, str] = {
     "action_clusters.json":        "2.8_clusters",
     # Stage 2.9 — Invariant Detection
     "rule_catalog.json":           "2.9_invariants",
+    # Stage 4.1 — Entity Extraction
+    "entity_catalog.json":         "4.1_entities",
+    # Stage 4.2 — Entity Relationship Reconstruction
+    "relationship_catalog.json":   "4.2_relationships",
     # Stage 4.3 — State Machine Reconstruction
     "state_machine_catalog.json":  "4.3_statemachines",
     # Stage 3 — Vector Embeddings
@@ -484,6 +560,8 @@ class PipelineContext:
         "stage29_invariants":   StageResult(),   # business rule / invariant detection
         "stage3_embed":         StageResult(),
         "stage35_preflight":    StageResult(),
+        "stage41_entities":     StageResult(),  # entity extraction (static)
+        "stage42_relationships": StageResult(), # entity relationship reconstruction (static)
         "stage4_domain":        StageResult(),
         "stage43_statemachines": StageResult(),  # state machine reconstruction
         "stage45_flows":        StageResult(),
@@ -506,6 +584,8 @@ class PipelineContext:
     behavior_graph:    Optional[dict]                   = None   # Stage 2.5
     action_clusters:   Optional[ActionClusterCollection] = None  # Stage 2.8
     invariants:        Optional[InvariantCollection]      = None  # Stage 2.9
+    entities:          Optional[EntityCollection]          = None  # Stage 4.1
+    relationships:     Optional[EntityRelationshipCollection] = None  # Stage 4.2
     state_machines:    Optional[StateMachineCollection]   = None  # Stage 4.3
     embedding_meta:    Optional[EmbeddingMeta]          = None
     preflight:         Optional[PreflightResult]        = None
@@ -788,6 +868,67 @@ class PipelineContext:
                 clusters     = clusters,
                 total        = d.get("total", len(clusters)),
                 generated_at = d.get("generated_at", ""),
+            )
+
+        if data.get("entities") is not None:
+            d = data["entities"]
+            ents = [
+                Entity(
+                    entity_id       = e["entity_id"],
+                    name            = e["name"],
+                    table           = e["table"],
+                    bounded_context = e.get("bounded_context", ""),
+                    columns         = [
+                        EntityColumn(
+                            name              = c["name"],
+                            data_type         = c.get("data_type", ""),
+                            nullable          = c.get("nullable", True),
+                            is_primary_key    = c.get("is_primary_key", False),
+                            is_foreign_key    = c.get("is_foreign_key", False),
+                            references_table  = c.get("references_table", ""),
+                            references_column = c.get("references_column", ""),
+                        )
+                        for c in e.get("columns", [])
+                    ],
+                    primary_key     = e.get("primary_key", ""),
+                    is_pivot        = e.get("is_pivot", False),
+                    is_core         = e.get("is_core", True),
+                    is_system       = e.get("is_system", False),
+                    source_files    = e.get("source_files", []),
+                    confidence      = e.get("confidence", 1.0),
+                )
+                for e in d.get("entities", [])
+            ]
+            ctx.entities = EntityCollection(
+                entities     = ents,
+                total        = d.get("total", len(ents)),
+                core_count   = d.get("core_count", 0),
+                generated_at = d.get("generated_at", ""),
+            )
+
+        if data.get("relationships") is not None:
+            d = data["relationships"]
+            rels = [
+                EntityRelationship(
+                    rel_id       = r["rel_id"],
+                    from_entity  = r["from_entity"],
+                    to_entity    = r["to_entity"],
+                    cardinality  = r.get("cardinality", "1:N"),
+                    rel_type     = r.get("rel_type", "has_many"),
+                    via_column   = r.get("via_column", ""),
+                    via_table    = r.get("via_table", ""),
+                    confidence   = r.get("confidence", 0.75),
+                    signals      = r.get("signals", []),
+                    source_files = r.get("source_files", []),
+                )
+                for r in d.get("relationships", [])
+            ]
+            ctx.relationships = EntityRelationshipCollection(
+                relationships = rels,
+                entity_names  = d.get("entity_names", []),
+                total         = d.get("total", len(rels)),
+                mermaid_path  = d.get("mermaid_path", ""),
+                generated_at  = d.get("generated_at", ""),
             )
 
         if data.get("state_machines") is not None:
