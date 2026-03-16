@@ -7,6 +7,7 @@ Stages (in execution order):
     Stage 1.5  paths          — execution-path / branch extraction
     Stage 2    graph          — knowledge graph (NetworkX)
     Stage 2.5  behavior       — behavior graph extraction (Route→Ctrl→Service→SQL→Redirect)
+    Stage 2.7  semanticroles — semantic role tagging (action type + external systems)
     Stage 3    embed          — vector index (ChromaDB)
     Stage 3.5  preflight      — context pre-flight checks
     Stage 4.1  entities       — Entity Extraction (static)
@@ -57,6 +58,7 @@ from pipeline.stage1_parse         import run as stage1
 from pipeline.stage15_paths        import run as stage15
 from pipeline.stage2_graph         import run as stage2
 from pipeline.stage25_behavior     import run as stage25
+from pipeline.stage27_semanticroles import run as stage27
 from pipeline.stage28_clusters     import run as stage28
 from pipeline.stage29_invariants   import run as stage29
 from pipeline.stage3_embed         import run as stage3
@@ -86,6 +88,7 @@ STAGES: list[tuple[str, any]] = [
     ("stage15_paths",        stage15),  # execution-path extraction (feeds stage45 + stage5)
     ("stage2_graph",         stage2),
     ("stage25_behavior",     stage25),  # behavior graph extraction (feeds stage45 + stage6)
+    ("stage27_semanticroles", stage27), # semantic role tagging (feeds stage28 + stage45 + stage9)
     ("stage28_clusters",     stage28),  # action clustering (feeds stage4 + stage45 bounded contexts)
     ("stage29_invariants",   stage29),  # business rule extraction (feeds stage3 chunks + stage4 grounding)
     ("stage3_embed",         stage3),

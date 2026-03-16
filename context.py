@@ -347,6 +347,50 @@ class StateMachineCollection:
 
 
 @dataclass
+class ActionTag:
+    """
+    Semantic role assigned to one HTTP endpoint / controller action by Stage 2.7.
+    """
+    symbol:      str          # "OrderController::store" or "create_order"
+    file:        str
+    role:        str          # BUSINESS_ACTION | AUTH_ACTION | CRUD_ACTION | INTEGRATION_ACTION | INFRASTRUCTURE_ACTION
+    confidence:  float        # 0.0 – 1.0
+    signals:     list[str]    = field(default_factory=list)  # human-readable evidence
+    actor:       str          = ""  # "Admin" | "Authenticated User" | "Guest" | "API Client"
+    entities:    list[str]    = field(default_factory=list)  # DB tables written/read
+    http_method: str          = ""  # "POST" | "GET" | ""
+    route_path:  str          = ""  # "/orders" | ""
+
+
+@dataclass
+class ExternalSystem:
+    """
+    An external system detected by Stage 2.7 (payment gateway, email, storage…).
+    """
+    name:         str                   # "Stripe"
+    category:     str                   # PAYMENT | EMAIL | STORAGE | SMS_PUSH | AUTH_OAUTH | MONITORING | CRM | ERP | INFRA
+    env_keys:     list[str]  = field(default_factory=list)   # ["STRIPE_KEY", "STRIPE_SECRET"]
+    class_hints:  list[str]  = field(default_factory=list)   # ["StripeService", "StripeGateway"]
+    dep_hints:    list[str]  = field(default_factory=list)   # ["Stripe\StripeClient"]
+    detected_via: list[str]  = field(default_factory=list)   # ["env_var", "class_name", "service_dep"]
+
+
+@dataclass
+class SemanticRoleIndex:
+    """
+    Full semantic-role index produced by Stage 2.7.
+    Written to 2.7_semanticroles/semantic_roles.json.
+    Consumed by Stage 2.8 (clustering), Stage 4 (domain model), Stage 4.5 (flows).
+    """
+    actions:          list[ActionTag]      = field(default_factory=list)
+    external_systems: list[ExternalSystem] = field(default_factory=list)
+    role_summary:     dict[str, int]       = field(default_factory=dict)  # role → count
+    infra_files:      list[str]            = field(default_factory=list)  # files whose dominant role is INFRASTRUCTURE
+    business_files:   list[str]            = field(default_factory=list)  # files with ≥1 BUSINESS_ACTION tag
+    generated_at:     str                  = field(default_factory=lambda: datetime.utcnow().isoformat())
+
+
+@dataclass
 class ActionCluster:
     """
     One action cluster produced by Stage 2.8 — a group of PHP files that share
@@ -531,6 +575,8 @@ _STAGE_SUBDIRS: dict[str, str] = {
     "code_graph.png":              "2_graph",
     # Stage 2.5 — Behavior Graph
     "behavior_graph.json":         "2.5_behavior",
+    # Stage 2.7 — Semantic Role Tagging
+    "semantic_roles.json":         "2.7_semanticroles",
     # Stage 2.8 — Action Clustering
     "action_clusters.json":        "2.8_clusters",
     # Stage 2.9 — Invariant Detection
@@ -618,6 +664,7 @@ class PipelineContext:
         "stage15_paths":        StageResult(),
         "stage2_graph":         StageResult(),
         "stage25_behavior":     StageResult(),   # behavior graph extraction
+        "stage27_semanticroles": StageResult(),  # semantic role tagging (static)
         "stage28_clusters":     StageResult(),   # action clustering (similarity)
         "stage29_invariants":   StageResult(),   # business rule / invariant detection
         "stage3_embed":         StageResult(),
@@ -646,6 +693,7 @@ class PipelineContext:
     code_map:          Optional[CodeMap]                = None
     graph_meta:        Optional[GraphMeta]              = None
     behavior_graph:    Optional[dict]                   = None   # Stage 2.5
+    semantic_roles:    Optional[SemanticRoleIndex]       = None  # Stage 2.7
     action_clusters:   Optional[ActionClusterCollection] = None  # Stage 2.8
     invariants:        Optional[InvariantCollection]      = None  # Stage 2.9
     entities:          Optional[EntityCollection]          = None  # Stage 4.1
@@ -924,6 +972,42 @@ class PipelineContext:
                 by_category  = d.get("by_category", {}),
                 by_context   = d.get("by_context", {}),
                 generated_at = d.get("generated_at", ""),
+            )
+
+        if data.get("semantic_roles") is not None:
+            d = data["semantic_roles"]
+            actions = [
+                ActionTag(
+                    symbol      = a["symbol"],
+                    file        = a["file"],
+                    role        = a["role"],
+                    confidence  = a.get("confidence", 0.0),
+                    signals     = a.get("signals", []),
+                    actor       = a.get("actor", ""),
+                    entities    = a.get("entities", []),
+                    http_method = a.get("http_method", ""),
+                    route_path  = a.get("route_path", ""),
+                )
+                for a in d.get("actions", [])
+            ]
+            ext_systems = [
+                ExternalSystem(
+                    name         = e["name"],
+                    category     = e["category"],
+                    env_keys     = e.get("env_keys", []),
+                    class_hints  = e.get("class_hints", []),
+                    dep_hints    = e.get("dep_hints", []),
+                    detected_via = e.get("detected_via", []),
+                )
+                for e in d.get("external_systems", [])
+            ]
+            ctx.semantic_roles = SemanticRoleIndex(
+                actions          = actions,
+                external_systems = ext_systems,
+                role_summary     = d.get("role_summary", {}),
+                infra_files      = d.get("infra_files", []),
+                business_files   = d.get("business_files", []),
+                generated_at     = d.get("generated_at", ""),
             )
 
         if data.get("action_clusters") is not None:
