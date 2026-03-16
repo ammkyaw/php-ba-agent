@@ -49,8 +49,47 @@ Output
 from __future__ import annotations
 
 import json
+from collections import defaultdict
 from pathlib import Path
 from typing import Any
+
+
+def _extract_module_name(filepath: str) -> str | None:
+    """Return the module directory name from a SugarCRM/raw-PHP path, or None."""
+    parts = Path(filepath).parts
+    for i, part in enumerate(parts):
+        if part.lower() == "modules" and i + 1 < len(parts):
+            return parts[i + 1]
+    return None
+
+
+def _module_expand(exec_paths: list[dict], flow_pages: set[str]) -> set[str]:
+    """
+    Expand *flow_pages* to include all sibling files of any file whose module
+    directory is already represented in *flow_pages*.
+
+    This lets a flow that references ``ACLController.php`` also count
+    ``ACLAction.php``, ``ACLRole.php``, etc. as covered — they all live in
+    the same ``modules/ACL/`` directory.
+    """
+    module_files: dict[str, list[str]] = defaultdict(list)
+    for ep in exec_paths:
+        f = ep.get("file", "")
+        if not f:
+            continue
+        mod = _extract_module_name(f)
+        if mod:
+            module_files[mod].append(Path(f).name.lower())
+
+    covered_modules: set[str] = set()
+    for mod, files in module_files.items():
+        if any(f in flow_pages for f in files):
+            covered_modules.add(mod)
+
+    expanded: set[str] = set(flow_pages)
+    for mod in covered_modules:
+        expanded.update(module_files[mod])
+    return expanded
 
 # ── Thresholds ────────────────────────────────────────────────────────────────
 WARNING_THRESHOLD  = 0.85   # below this → ⚠️  warning
@@ -98,13 +137,19 @@ def _compute(ctx: Any) -> dict[str, Any]:
                     if raw:
                         flow_pages.add(Path(raw).name.lower())
 
+    # ── Module-expanded flow_pages ────────────────────────────────────────────
+    # If a flow references any file from a module dir, count all sibling files
+    # in that module as covered (module-level granularity).
+    exec_paths_list = list(cm.execution_paths or []) if cm else []
+    module_flow_pages = _module_expand(exec_paths_list, flow_pages)
+
     # ── 1. Execution-path coverage ────────────────────────────────────────────
     ep_all: set[str] = set()
     if cm and cm.execution_paths:
         ep_all = {Path(ep["file"]).name.lower() for ep in cm.execution_paths
                   if ep.get("file")}
-    ep_covered = ep_all & flow_pages
-    ep_missing = sorted(ep_all - flow_pages)
+    ep_covered = ep_all & module_flow_pages
+    ep_missing = sorted(ep_all - module_flow_pages)
 
     # ── 2. Route coverage ─────────────────────────────────────────────────────
     route_files: set[str] = set()
@@ -114,8 +159,8 @@ def _compute(ctx: Any) -> dict[str, Any]:
             for r in cm.routes
             if r.get("file") and r.get("method", "GROUP") not in ("GROUP",)
         }
-    rt_covered = route_files & flow_pages
-    rt_missing = sorted(route_files - flow_pages)
+    rt_covered = route_files & module_flow_pages
+    rt_missing = sorted(route_files - module_flow_pages)
 
     # ── 3. Database table coverage ────────────────────────────────────────────
     # All unique tables in the codebase
@@ -127,14 +172,14 @@ def _compute(ctx: Any) -> dict[str, Any]:
             if q.get("table") and q["table"].upper() not in ("", "UNKNOWN")
         }
 
-    # Tables reachable by joining sql_query['file'] → flow_pages
+    # Tables reachable by joining sql_query['file'] → module_flow_pages
     tables_in_flows: set[str] = set()
-    if cm and cm.sql_queries and flow_pages:
+    if cm and cm.sql_queries and module_flow_pages:
         tables_in_flows = {
             q["table"].lower()
             for q in cm.sql_queries
             if (q.get("table") and q["table"].upper() not in ("", "UNKNOWN")
-                and Path(q.get("file", "")).name.lower() in flow_pages)
+                and Path(q.get("file", "")).name.lower() in module_flow_pages)
         }
     tbl_covered = tables_in_flows
     tbl_missing = sorted(all_tables - tables_in_flows)
@@ -147,8 +192,8 @@ def _compute(ctx: Any) -> dict[str, Any]:
             for ff in cm.form_fields
             if ff.get("file")
         }
-    fm_covered = form_files & flow_pages
-    fm_missing = sorted(form_files - flow_pages)
+    fm_covered = form_files & module_flow_pages
+    fm_missing = sorted(form_files - module_flow_pages)
 
     # ── Assemble report ───────────────────────────────────────────────────────
     def _entry(label: str, covered: set, total: set, missing: list) -> dict:
