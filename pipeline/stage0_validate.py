@@ -134,9 +134,11 @@ def run(ctx: PipelineContext) -> None:
     # ── BLOCKER 5: nikic/php-parser installed ─────────────────────────────────
     parser_ok, parser_msg = _check_parser_installed(project_path)
     if not parser_ok:
+        agent_root = Path(__file__).parent.parent
         raise PipelineError(
             f"[stage0] nikic/php-parser not found. {parser_msg}\n"
-            "Run: composer require nikic/php-parser"
+            f"Run from the BA agent directory:\n"
+            f"  cd {agent_root} && composer require nikic/php-parser"
         )
 
     # ── BLOCKER 6: parse_project.php locatable ────────────────────────────────
@@ -349,23 +351,31 @@ def _parse_version_tuple(version_str: str) -> tuple[int, ...]:
 def _check_parser_installed(project_path: Path) -> tuple[bool, str]:
     """
     Check that nikic/php-parser is available. Accepts:
-      - vendor/nikic/php-parser/  (composer install)
-      - phpparser.phar             (standalone phar)
+      - vendor/nikic/php-parser/  in the BA agent's own directory (primary)
+      - vendor/nikic/php-parser/  in the analyzed PHP project (legacy)
+      - phpparser.phar             (standalone phar anywhere on search path)
     """
-    # Standard composer vendor path
-    vendor_dir = project_path / "vendor" / "nikic" / "php-parser"
-    if vendor_dir.is_dir():
-        return True, f"Found at {vendor_dir}"
+    # ── Primary: BA agent's own vendor/ (installed via composer in agent root) ──
+    agent_root = Path(__file__).parent.parent
+    agent_vendor = agent_root / "vendor" / "nikic" / "php-parser"
+    if agent_vendor.is_dir():
+        return True, f"Found at {agent_vendor}"
 
-    # Phar in project root or same dir as script
-    for search_dir in [project_path, Path(__file__).parent, Path.cwd()]:
+    # ── Fallback: vendor/ inside the analyzed PHP project ─────────────────────
+    project_vendor = project_path / "vendor" / "nikic" / "php-parser"
+    if project_vendor.is_dir():
+        return True, f"Found at {project_vendor}"
+
+    # ── Phar: project root, pipeline dir, agent root, or cwd ─────────────────
+    for search_dir in [project_path, Path(__file__).parent, agent_root, Path.cwd()]:
         phar = search_dir / "phpparser.phar"
         if phar.is_file():
             return True, f"Found phar at {phar}"
 
     return False, (
-        "nikic/php-parser not found in vendor/nikic/php-parser/ "
-        "or as phpparser.phar."
+        f"nikic/php-parser not found in {agent_vendor} "
+        "or as phpparser.phar.\n"
+        f"Fix: cd {agent_root} && composer require nikic/php-parser"
     )
 
 
