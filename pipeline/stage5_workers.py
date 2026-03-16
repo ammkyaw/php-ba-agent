@@ -226,6 +226,7 @@ Bounded Contexts: {", ".join(_to_str_list(domain.bounded_contexts))}
 
 Business Rules:
 {rule_lines}
+{_format_spec_rules_for_prompt(ctx)}
 
 CRITICAL: Section 5 MUST use EXACTLY these {n_features} subsection headings in order.
 Do NOT rename, merge, skip, or reorder them. Fill in the Priority and Acceptance fields.
@@ -309,10 +310,15 @@ form field names. Output clean Markdown only.
         _fr_entry(i, f) for i, f in enumerate(domain.features, 1)
     )
 
+    spec_rules_section = _format_spec_rules_for_prompt(
+        ctx, categories=["VALIDATION", "REFERENTIAL", "STATE", "BUSINESS_LIMIT"]
+    )
+
     user = f"""Using the domain model below, write a complete SRS for the '{domain.domain_name}'.
 
 DOMAIN MODEL:
 {_format_domain_for_prompt(domain)}
+{spec_rules_section}
 
 CRITICAL: Section 3 MUST contain exactly {n_features} subsections — one per feature.
 Do not skip ANY feature. For trivial features (e.g. logout, static pages) write a brief
@@ -409,12 +415,15 @@ Output clean Markdown only.
         _ac_entry(i, f) for i, f in enumerate(domain.features, 1)
     )
 
+    spec_rules_ac = _format_spec_rules_for_prompt(ctx)
+
     user = f"""Using the domain model below, write complete Acceptance Criteria for '{domain.domain_name}'.
 
 DOMAIN MODEL:
 {_format_domain_for_prompt(domain)}
 {flows_section}
 {ep_section}
+{spec_rules_ac}
 
 CRITICAL HEADING RULE: The section headings below are FIXED. You MUST use them verbatim —
 do NOT rename, merge, reorder, or replace them. Each "## AC-XX: [Feature Name]" line
@@ -494,12 +503,17 @@ rather than generic placeholders. Output clean Markdown only.
 
     epic_scaffold = "\n\n---\n\n".join(_epic_block(f) for f in domain.features)
 
+    spec_rules_us = _format_spec_rules_for_prompt(
+        ctx, categories=["WORKFLOW", "AUTHORIZATION"]
+    )
+
     user = f"""Using the domain model below, write a complete User Story backlog for '{domain.domain_name}'.
 
 DOMAIN MODEL:
 {_format_domain_for_prompt(domain)}
 {flows_section}
 {ep_section}
+{spec_rules_us}
 
 CRITICAL HEADING RULE: The "## Epic: [Feature Name]" headings below are FIXED.
 You MUST use them verbatim — do NOT rename, merge, reorder, or replace them.
@@ -528,6 +542,52 @@ Sum by priority band."""
 
 
 # ─── Helpers ───────────────────────────────────────────────────────────────────
+
+def _format_spec_rules_for_prompt(ctx: PipelineContext, categories: list[str] | None = None) -> str:
+    """
+    Format Stage 4.6 SpecRules as a structured prompt block.
+
+    Parameters
+    ----------
+    categories : if provided, only include rules from these categories.
+                 Useful for targeting: BRD → all, SRS → VALIDATION+REFERENTIAL,
+                 AC → all, UserStories → WORKFLOW+AUTHORIZATION.
+    """
+    sr_col = getattr(ctx, "spec_rules", None)
+    if not sr_col or not sr_col.rules:
+        return ""
+
+    rules = sr_col.rules
+    if categories:
+        rules = [r for r in rules if r.category in categories]
+    if not rules:
+        return ""
+
+    lines = [
+        f"\n=== MINED BUSINESS RULES — STAGE 4.6 ({len(rules)} rules) ===",
+        "These rules were synthesised from DB constraints, guard clauses, state machines, "
+        "and business flows. Use them DIRECTLY in the document — cite rule IDs.",
+    ]
+
+    # Group by category
+    by_cat: dict[str, list] = {}
+    for r in rules:
+        by_cat.setdefault(r.category, []).append(r)
+
+    for cat, cat_rules in sorted(by_cat.items()):
+        lines.append(f"\n[{cat}]")
+        for rule in cat_rules[:20]:   # cap per category to stay within token budget
+            lines.append(f"  {rule.rule_id}  {rule.title}")
+            lines.append(f"    Given: {rule.given}")
+            lines.append(f"    When:  {rule.when}")
+            lines.append(f"    Then:  {rule.then}")
+            if rule.entities:
+                lines.append(f"    Entities: {', '.join(rule.entities)}")
+        if len(cat_rules) > 20:
+            lines.append(f"  … and {len(cat_rules) - 20} more {cat} rules")
+
+    return "\n".join(lines)
+
 
 def _format_business_flows_for_prompt(ctx: PipelineContext) -> str:
     """
