@@ -57,6 +57,10 @@ ROUTE_PREFIX_WEIGHT= 1.0   # score if route prefix matches
 REDIRECT_WEIGHT    = 0.5   # score per shared redirect target
 SINGLETON_MIN      = 2     # directory clusters with fewer files → "Misc"
 
+# Stage 2.7 role-tag bonuses/penalties applied during phase-3 scoring
+BUSINESS_ROLE_BONUS = 1.0  # bonus per file flagged as a BUSINESS_ACTION carrier
+INFRA_ROLE_PENALTY  = -99  # effectively ban INFRASTRUCTURE-only files from scoring
+
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -90,6 +94,15 @@ def run(ctx: PipelineContext) -> None:
         ctx.action_clusters = ActionClusterCollection()
         return
 
+    # ── Load Stage 2.7 role sets (optional — graceful fallback if absent) ──────
+    sr = getattr(ctx, "semantic_roles", None)
+    infra_files:    frozenset[str] = frozenset(sr.infra_files   if sr else [])
+    business_files: frozenset[str] = frozenset(sr.business_files if sr else [])
+    if sr:
+        print(f"  [stage28] Role hints from Stage 2.7 — "
+              f"{len(infra_files)} infra files excluded, "
+              f"{len(business_files)} business files boosted.")
+
     exec_paths = list(cm.execution_paths or [])
 
     # ── Phase 1: Module seed clusters ─────────────────────────────────────────
@@ -97,9 +110,11 @@ def run(ctx: PipelineContext) -> None:
     module_to_files: dict[str, list[str]] = defaultdict(list)
     flat_files: list[str] = []   # files not under any modules/<Name>/ dir
 
-    # Collect all unique file paths from execution_paths (Stage 1.5 output)
+    # Collect all unique file paths from execution_paths (Stage 1.5 output).
+    # Exclude pure-infrastructure files so they don't pollute business clusters.
     all_files: list[str] = sorted({
-        ep["file"] for ep in exec_paths if ep.get("file")
+        ep["file"] for ep in exec_paths
+        if ep.get("file") and ep["file"] not in infra_files
     })
 
     for fpath in all_files:
@@ -109,8 +124,10 @@ def run(ctx: PipelineContext) -> None:
         else:
             flat_files.append(fpath)
 
+    infra_excluded = len(infra_files) if infra_files else 0
     print(f"  [stage28] {len(module_to_files)} module clusters seeded "
-          f"({len(all_files)} total files, {len(flat_files)} flat).")
+          f"({len(all_files)} business files, {len(flat_files)} flat"
+          f"{f', {infra_excluded} infra excluded' if infra_excluded else ''}).")
 
     # ── Phase 2: Inverted indices ──────────────────────────────────────────────
     # file → set of tables
@@ -180,6 +197,9 @@ def run(ctx: PipelineContext) -> None:
                 score += ROUTE_PREFIX_WEIGHT
             # shared redirect basenames
             score += REDIRECT_WEIGHT * len(f_redirects & cluster_redirects.get(mod, set()))
+            # Stage 2.7 role bonus: business files are more reliably assignable
+            if fpath in business_files:
+                score += BUSINESS_ROLE_BONUS
 
             if score > best_score:
                 best_score = score
