@@ -165,11 +165,13 @@ def _compute(ctx: Any) -> dict[str, Any]:
 
     # ── 2. Route coverage ─────────────────────────────────────────────────────
     route_files: set[str] = set()
+    _SKIP_METHODS = {"GROUP", "MIDDLEWARE", "PREFIX", "MIDDLEWARE_GROUP"}
     if cm and cm.routes:
         route_files = {
             Path(r["file"]).name.lower()
             for r in cm.routes
-            if r.get("file") and r.get("method", "GROUP") not in ("GROUP",)
+            if r.get("file")
+            and (r.get("method") or "GROUP").upper() not in _SKIP_METHODS
         }
     rt_covered = route_files & module_flow_pages
     rt_missing = sorted(route_files - module_flow_pages)
