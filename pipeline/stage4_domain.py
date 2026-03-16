@@ -126,13 +126,22 @@ def run(ctx: PipelineContext) -> None:
     debug_dir = str(Path(output_path).parent)
 
     # ── Build grounding lists from code_map (anti-hallucination) ─────────────
-    # Injected into Call B so the model cannot invent page/table names.
     cm = ctx.code_map
     known_tables: list[str] = sorted({
         q.get("table", "") for q in (cm.sql_queries or [])
         if q.get("table") and q["table"] not in ("UNKNOWN", "")
     })
-    known_pages: list[str] = [Path(p).name for p in sorted(cm.html_pages or [])]
+
+    # Wide filter set: ALL file basenames across the entire code_map.
+    # This prevents _filter_hallucinated_refs from incorrectly stripping
+    # controller / service / execution-path references just because they
+    # are not in cm.html_pages.
+    known_files_all: set[str] = _build_all_known_filenames(cm)
+
+    # Grounding list injected into the prompt: exec_paths first (most
+    # informative for business logic), then html_pages, then controllers.
+    # Capped to keep the prompt token budget manageable.
+    known_pages: list[str] = _build_grounding_pages(cm)
 
     # ── Call A: meta + entities + contexts (fast, ~4K tokens) ────────────────
     print(f"  [stage4] Call 1/3 — domain name, entities, contexts ...")
@@ -150,9 +159,11 @@ def run(ctx: PipelineContext) -> None:
     )
     data_b = _parse_partial(raw_b, "B", debug_dir)
 
-    # Filter hallucinated page/table names (model sometimes ignores grounding)
+    # Filter hallucinated page/table names.
+    # Use known_files_all (not just known_pages) so that controller / service
+    # file references are preserved — only truly invented filenames are dropped.
     data_b = _filter_hallucinated_refs(data_b,
-                                       known_pages_lower={p.lower() for p in known_pages},
+                                       known_pages_lower=known_files_all,
                                        known_tables_lower={t.lower() for t in known_tables})
 
     # ── Call C: user roles + workflows (~8K tokens) ───────────────────────────
@@ -167,13 +178,15 @@ def run(ctx: PipelineContext) -> None:
     # ── Hydrate DomainModel ───────────────────────────────────────────────────
     domain_model = _hydrate_domain_model(merged)
 
-    # ── Coverage metrics (Thing 1) ────────────────────────────────────────────
+    # ── Coverage metrics ──────────────────────────────────────────────────────
     coverage_report = _compute_coverage(ctx, domain_model, debug_dir)
 
-    # ── Gap-fill pass (Thing 2) ───────────────────────────────────────────────
+    # ── Gap-fill pass ─────────────────────────────────────────────────────────
+    # Use the wide filter set for gap-fill too so new features can reference
+    # any real file (not only html_pages).
     domain_model = _gap_fill_pass(
         ctx, domain_model, coverage_report, user_prompt, quality_score, debug_dir,
-        known_tables=known_tables, known_pages_lower={p.lower() for p in known_pages},
+        known_tables=known_tables, known_pages_lower=known_files_all,
     )
 
     # ── Save ──────────────────────────────────────────────────────────────────
@@ -257,6 +270,83 @@ def _modules_from_graph(ctx: "PipelineContext") -> dict[str, dict]:
         return G.graph.get("modules", {})
     except Exception:
         return {}
+
+
+def _build_all_known_filenames(cm: Any) -> set[str]:
+    """
+    Build a comprehensive set of ALL lowercase file basenames known to the
+    code_map.  Used as the wide filter for _filter_hallucinated_refs() so
+    that real controller / service / execution-path filenames are NOT stripped
+    just because they are absent from cm.html_pages.
+
+    Draws from every list in cm that carries a "file" key, plus html_pages.
+    """
+    files: set[str] = set()
+    for p in (cm.html_pages or []):
+        if isinstance(p, str):
+            files.add(Path(p).name.lower())
+    for lst in [
+        cm.routes or [],
+        cm.controllers or [],
+        cm.services or [],
+        cm.form_fields or [],
+        cm.sql_queries or [],
+        cm.execution_paths or [],
+        cm.redirects or [],
+    ]:
+        for item in lst:
+            if isinstance(item, dict) and item.get("file"):
+                files.add(Path(item["file"]).name.lower())
+    return files
+
+
+def _build_grounding_pages(cm: Any, cap: int = 150) -> list[str]:
+    """
+    Build a **prioritised** list of PHP filenames to inject into the features
+    prompt as grounding.
+
+    Priority order (highest value for feature mapping first):
+      1. Execution-path files (stage15 detected entry points — carry most context)
+      2. HTML pages (traditional view/entry-point files)
+      3. Controller files
+      4. Service files
+    Capped at *cap* entries to avoid blowing the token budget.
+
+    Returns unique basenames (insertion-order deduplicated).
+    """
+    seen:  set[str]  = set()
+    pages: list[str] = []
+
+    def _add(fname: str) -> None:
+        key = fname.lower()
+        if key not in seen:
+            seen.add(key)
+            pages.append(fname)
+
+    # 1 — Execution paths (most important: business logic entry points)
+    for ep in (cm.execution_paths or []):
+        f = ep.get("file", "")
+        if f:
+            _add(Path(f).name)
+
+    # 2 — HTML pages (view / traditional entry points)
+    for p in sorted(cm.html_pages or []):
+        _add(Path(p).name)
+
+    # 3 — Controllers
+    for c in (cm.controllers or []):
+        f = c.get("file", "")
+        if f:
+            _add(Path(f).name)
+
+    # 4 — Services (lower priority — implementation detail, not entry point)
+    for s in (cm.services or []):
+        f = s.get("file", "")
+        if f:
+            _add(Path(f).name)
+
+    return pages[:cap]
+
 
 # ─── Prompt Building ───────────────────────────────────────────────────────────
 
@@ -793,14 +883,20 @@ def _compute_coverage(
     debug_dir: str | None = None,
 ) -> dict:
     """
-    Compute three coverage metrics after domain model extraction:
+    Compute four coverage metrics after domain model extraction.
 
-      page_coverage   — fraction of cm.html_pages mentioned in any feature's 'pages'
+      exec_coverage   — fraction of execution-path entry points in any feature's 'pages'
+                        (primary metric for API / controller-heavy codebases)
+      page_coverage   — fraction of cm.html_pages in any feature's 'pages'
+                        (traditional metric for view-based codebases)
       table_coverage  — fraction of unique SQL tables in any feature's 'tables'
       field_coverage  — fraction of POST fields in any feature's 'inputs'
 
+    ``pages_uncovered`` in the returned report is drawn from execution-path
+    files first (highest value for gap-fill), then from html_pages not already
+    included.  The gap-fill pass uses this list to request new features.
+
     Saves coverage_report.json to debug_dir and prints a summary line.
-    Returns the report dict (used by the gap-fill pass to find uncovered pages).
     """
     cm = ctx.code_map
 
@@ -816,11 +912,39 @@ def _compute_coverage(
         for inp in feat.get("inputs", []):
             covered_inputs.add(inp.lower())
 
-    # ── Page coverage ─────────────────────────────────────────────────────────
-    all_pages       = [Path(p).name for p in (cm.html_pages or [])]
-    pages_covered   = [p for p in all_pages if p.lower() in covered_pages]
-    pages_uncovered = [p for p in all_pages if p.lower() not in covered_pages]
-    page_cov        = len(pages_covered) / len(all_pages) if all_pages else 1.0
+    # ── Execution-path coverage (primary for API codebases) ───────────────────
+    # execution_paths are the stage15 static-analysis entry points — they map
+    # 1-to-1 to controller/handler files and represent actual business logic.
+    ep_all: list[str] = sorted({
+        Path(ep["file"]).name
+        for ep in (cm.execution_paths or [])
+        if ep.get("file")
+    })
+    ep_covered   = [p for p in ep_all if p.lower() in covered_pages]
+    ep_uncovered = [p for p in ep_all if p.lower() not in covered_pages]
+    exec_cov     = len(ep_covered) / len(ep_all) if ep_all else 1.0
+
+    # ── HTML-page coverage (secondary — view / entry-point files) ────────────
+    html_all       = [Path(p).name for p in (cm.html_pages or [])]
+    html_covered   = [p for p in html_all if p.lower() in covered_pages]
+    html_uncovered = [p for p in html_all if p.lower() not in covered_pages]
+    page_cov       = len(html_covered) / len(html_all) if html_all else 1.0
+
+    # ── Gap-fill priority list: exec paths first, then remaining html_pages ───
+    seen_unc: set[str] = set()
+    pages_uncovered: list[str] = []
+    for p in ep_uncovered:
+        key = p.lower()
+        if key not in seen_unc:
+            seen_unc.add(key)
+            pages_uncovered.append(p)
+    for p in html_uncovered:
+        key = p.lower()
+        if key not in seen_unc:
+            seen_unc.add(key)
+            pages_uncovered.append(p)
+
+    pages_covered = sorted(set(ep_covered + html_covered))
 
     # ── Table coverage ────────────────────────────────────────────────────────
     all_tables = sorted({
@@ -841,11 +965,17 @@ def _compute_coverage(
     field_cov        = len(fields_covered) / len(all_fields) if all_fields else 1.0
 
     report = {
+        # Primary metric: execution-path coverage
+        "exec_coverage":     round(exec_cov,  3),
+        "exec_covered":      ep_covered,
+        "exec_uncovered":    ep_uncovered,
+        # Secondary metric: html-page coverage
         "page_coverage":     round(page_cov,  3),
+        "pages_covered":     pages_covered,
+        "pages_uncovered":   pages_uncovered,   # used by gap-fill pass
+        # Table + field
         "table_coverage":    round(table_cov, 3),
         "field_coverage":    round(field_cov, 3),
-        "pages_covered":     pages_covered,
-        "pages_uncovered":   pages_uncovered,
         "tables_covered":    tables_covered,
         "tables_uncovered":  tables_uncovered,
         "fields_covered":    fields_covered,
@@ -863,20 +993,26 @@ def _compute_coverage(
             print(f"  [stage4] Warning: could not save {COVERAGE_FILE}: {e}")
 
     # ── Print summary ─────────────────────────────────────────────────────────
+    # Show exec-path coverage as the headline number; html-page as secondary.
     print(
         f"  [stage4] Coverage — "
-        f"pages: {page_cov:.0%} ({len(pages_covered)}/{len(all_pages)}), "
+        f"exec-paths: {exec_cov:.0%} ({len(ep_covered)}/{len(ep_all)}), "
+        f"pages: {page_cov:.0%} ({len(html_covered)}/{len(html_all)}), "
         f"tables: {table_cov:.0%} ({len(tables_covered)}/{len(all_tables)}), "
         f"fields: {field_cov:.0%} ({len(fields_covered)}/{len(all_fields)})"
     )
-    if pages_uncovered:
-        sample = pages_uncovered[:8]
-        suffix = f" ... +{len(pages_uncovered) - 8} more" if len(pages_uncovered) > 8 else ""
-        print(f"  [stage4]   Uncovered pages : {sample}{suffix}")
+    if ep_uncovered:
+        sample = ep_uncovered[:8]
+        suffix = f" ... +{len(ep_uncovered) - 8} more" if len(ep_uncovered) > 8 else ""
+        print(f"  [stage4]   Uncovered exec-paths: {sample}{suffix}")
+    elif html_uncovered:
+        sample = html_uncovered[:8]
+        suffix = f" ... +{len(html_uncovered) - 8} more" if len(html_uncovered) > 8 else ""
+        print(f"  [stage4]   Uncovered pages     : {sample}{suffix}")
     if tables_uncovered:
         sample = tables_uncovered[:8]
         suffix = f" ... +{len(tables_uncovered) - 8} more" if len(tables_uncovered) > 8 else ""
-        print(f"  [stage4]   Uncovered tables: {sample}{suffix}")
+        print(f"  [stage4]   Uncovered tables    : {sample}{suffix}")
 
     return report
 
