@@ -61,6 +61,7 @@ def build_checklist(
     flow_coverage_data: dict | None,
     pass_d_issues:      list[dict],
     ev_idx:             dict[str, dict] | None,
+    dc_data:            dict | None = None,
 ) -> list[dict]:
     """
     Build and return the automated QA checklist.
@@ -70,6 +71,8 @@ def build_checklist(
     flow_coverage_data : dict loaded from flow_coverage.json (may be None).
     pass_d_issues      : list of issue dicts from consistency_check.run_checks().
     ev_idx             : evidence index from evidence_index.build_evidence_index().
+    dc_data            : dict from Stage 5.9 doc_coverage.json dimensions
+                         (keyed by dimension name; may be None).
 
     Returns
     -------
@@ -77,6 +80,7 @@ def build_checklist(
     """
     items: list[dict] = []
     items.extend(_completeness_items(flow_coverage_data or {}))
+    items.extend(_doc_coverage_items(dc_data or {}))   # Stage 5.9
     items.extend(_consistency_items(pass_d_issues))
     items.extend(_evidence_items(ev_idx or {}))
     return items
@@ -171,6 +175,52 @@ def _cov_status(pct: float) -> tuple[str, str]:
     if pct >= _COV_WARN:
         return "warn", "⚠️"
     return "fail", "❌"
+
+
+# ─── Document Coverage (Stage 5.9) ────────────────────────────────────────────
+
+_DC_LABELS: dict[str, str] = {
+    "entities":   "Entity Coverage → SRS",
+    "flows":      "Flow Coverage → BRD",
+    "spec_rules": "Business Rule Coverage → SRS+BRD",
+    "states":     "State Machine Coverage → SRS",
+    "relations":  "Relationship Coverage → SRS",
+}
+
+
+def _doc_coverage_items(dc: dict) -> list[dict]:
+    """
+    Build checklist items from Stage 5.9 document coverage dimensions.
+
+    dc : {dimension_name: DimCoverage-as-dict} — may be empty when stage59
+         has not run, in which case no items are emitted.
+    """
+    items: list[dict] = []
+    for key, label in _DC_LABELS.items():
+        dim = dc.get(key)
+        if not isinstance(dim, dict):
+            continue
+        pct     = float(dim.get("pct", 0.0))
+        covered = int(dim.get("covered", 0))
+        total   = int(dim.get("total", 0))
+        status, icon = _cov_status(pct)
+        uncovered = dim.get("uncovered", [])
+        sample    = uncovered[:3]
+        suffix    = f" (+{len(uncovered) - 3} more)" if len(uncovered) > 3 else ""
+        detail = (
+            f"{covered}/{total} ({pct:.0%})"
+            + (f" — missing: {', '.join(sample)}{suffix}" if uncovered else " — fully covered")
+        )
+        items.append(_item(
+            category    = "Document Coverage",
+            check       = label,
+            status      = status,
+            icon        = icon,
+            score       = round(pct, 4),
+            issue_count = None,
+            detail      = detail,
+        ))
+    return items
 
 
 # ─── Consistency ───────────────────────────────────────────────────────────────

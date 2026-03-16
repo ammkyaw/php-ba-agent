@@ -483,6 +483,22 @@ class SpecRuleCollection:
 
 
 @dataclass
+class DocCoverageResult:
+    """
+    Document coverage audit produced by Stage 5.9.
+
+    Records how many static-analysis signals (entities, flows, spec rules,
+    state machines, relationships) made it into the generated BA documents.
+    Consumed by Stage 6 to inject gap context into the QA review prompt.
+    """
+    dimensions:     list[dict]  = field(default_factory=list)   # DimCoverage as dicts
+    overall_pct:    float       = 0.0
+    overall_status: str         = "fail"                        # "pass" | "warn" | "fail"
+    gap_summary:    list[str]   = field(default_factory=list)   # human-readable gaps
+    generated_at:   str         = field(default_factory=lambda: datetime.utcnow().isoformat())
+
+
+@dataclass
 class ArchitectureMeta:
     """
     Lightweight summary of the architecture reconstruction produced by Stage 6.2.
@@ -546,6 +562,9 @@ _STAGE_SUBDIRS: dict[str, str] = {
     "srs.md":                      "5_documents",
     "ac.md":                       "5_documents",
     "user_stories.md":             "5_documents",
+    # Stage 5.9 — Document Coverage Audit
+    "doc_coverage.json":           "5.9_doccoverage",
+    "doc_coverage_summary.md":     "5.9_doccoverage",
     # Stage 6 — QA Review
     "qa_report.md":                "6_qa",
     "qa_result.json":              "6_qa",
@@ -614,6 +633,7 @@ class PipelineContext:
         "stage5_srs":           StageResult(),
         "stage5_ac":            StageResult(),
         "stage5_userstories":   StageResult(),
+        "stage59_doccoverage":  StageResult(),  # document coverage audit (static)
         "stage6_qa":            StageResult(),
         "stage62_architecture": StageResult(),  # architecture reconstruction (LLM)
         "stage65_postprocess":  StageResult(),
@@ -638,6 +658,7 @@ class PipelineContext:
     business_flows:    Optional[BusinessFlowCollection] = None
     flow_validation:   Optional[dict]                   = None   # Stage 4.7
     ba_artifacts:      Optional[BAArtifacts]            = None
+    doc_coverage:      Optional[DocCoverageResult]      = None  # Stage 5.9
     qa_result:         Optional[QAResult]               = None
     architecture_meta: Optional[ArchitectureMeta]       = None  # Stage 6.2
     test_suite:            Optional[TestSuiteArtifacts]     = None  # Stage 8
@@ -840,6 +861,16 @@ class PipelineContext:
                 srs_path          = d.get("srs_path"),
                 ac_path           = d.get("ac_path"),
                 user_stories_path = d.get("user_stories_path"),
+            )
+
+        if data.get("doc_coverage") is not None:
+            d = data["doc_coverage"]
+            ctx.doc_coverage = DocCoverageResult(
+                dimensions      = d.get("dimensions", []),
+                overall_pct     = d.get("overall_pct", 0.0),
+                overall_status  = d.get("overall_status", "fail"),
+                gap_summary     = d.get("gap_summary", []),
+                generated_at    = d.get("generated_at", ""),
             )
 
         if data.get("qa_result") is not None:
