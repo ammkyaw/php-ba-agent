@@ -1,5 +1,5 @@
 """
-pipeline/evidence_index.py — Per-Feature Evidence Index
+pipeline/evidence_index.py — Per-Feature Evidence Index + Confidence Scoring
 
 Builds a lookup table that maps every domain-model feature name to the
 concrete code artefacts that support it, drawn entirely from data already
@@ -19,13 +19,33 @@ Join strategy
   Everything   → fallback join on feature['pages'] basename set
   Both joins are case-insensitive.
 
+Confidence scoring
+------------------
+Each evidence category contributes equally (+0.2) to a 0.0–1.0 score:
+  route found          +0.2
+  controller found     +0.2
+  SQL found            +0.2
+  form found           +0.2
+  execution path found +0.2
+
+Grade bands:
+  🟢 HIGH    ≥ 0.8  (4–5 evidence types)
+  🟡 MEDIUM  ≥ 0.4  (2–3 evidence types)
+  🔴 LOW     < 0.4  (0–1 evidence type)
+
 Usage
 -----
-    from pipeline.evidence_index import build_evidence_index, format_evidence_block
+    from pipeline.evidence_index import (
+        build_evidence_index,
+        format_evidence_block,
+        compute_confidence,
+        build_confidence_report,
+    )
 
     ev_idx = build_evidence_index(ctx, ctx.domain_model)
     block  = format_evidence_block(ev_idx.get("Campaign Management", {}))
-    # block is a short Markdown string ready to embed in an LLM prompt
+    report = build_confidence_report(ev_idx)
+    # report is list[dict] sorted by score ascending (weakest first)
 
 Token budget
 ------------
@@ -46,6 +66,16 @@ _MAX_SQL         = 6   # deduplicated by (operation, table)
 _MAX_FORM_FILES  = 3
 _MAX_FIELDS      = 8   # field names per form file
 _MAX_EXEC_PATHS  = 3
+
+# ── Confidence thresholds ──────────────────────────────────────────────────────
+_SCORE_PER_CATEGORY   = 0.2   # each of 5 evidence types = +0.2
+_THRESHOLD_HIGH       = 0.8
+_THRESHOLD_MEDIUM     = 0.4
+_GRADE_HIGH           = "HIGH 🟢"
+_GRADE_MEDIUM         = "MEDIUM 🟡"
+_GRADE_LOW            = "LOW 🔴"
+
+_EVIDENCE_KEYS = ("routes", "controllers", "sql", "form_fields", "execution_paths")
 
 
 # ─── Public API ───────────────────────────────────────────────────────────────
@@ -107,10 +137,66 @@ def build_evidence_index(ctx: Any, domain: Any) -> dict[str, dict]:
     return result
 
 
+def compute_confidence(ev: dict) -> float:
+    """
+    Compute a 0.0–1.0 confidence score for a single feature's evidence dict.
+
+    Each of the 5 evidence categories that has ≥1 item contributes +0.2.
+    A score of 1.0 means all five evidence types are present.
+    """
+    score = 0.0
+    for key in _EVIDENCE_KEYS:
+        if ev.get(key):
+            score += _SCORE_PER_CATEGORY
+    return round(score, 2)
+
+
+def _confidence_grade(score: float) -> str:
+    if score >= _THRESHOLD_HIGH:
+        return _GRADE_HIGH
+    if score >= _THRESHOLD_MEDIUM:
+        return _GRADE_MEDIUM
+    return _GRADE_LOW
+
+
+def build_confidence_report(ev_idx: dict[str, dict]) -> list[dict]:
+    """
+    Build a confidence report for every feature in the evidence index.
+
+    Returns
+    -------
+    list[dict] sorted by score ascending (weakest features first), each entry:
+        {
+            "feature":  str,    feature name
+            "score":    float,  0.0 – 1.0
+            "grade":    str,    HIGH 🟢 / MEDIUM 🟡 / LOW 🔴
+            "present":  list[str],  evidence categories that had data
+            "missing":  list[str],  evidence categories with no data
+        }
+    """
+    rows: list[dict] = []
+    for feature, ev in ev_idx.items():
+        score   = compute_confidence(ev)
+        present = [k for k in _EVIDENCE_KEYS if ev.get(k)]
+        missing = [k for k in _EVIDENCE_KEYS if not ev.get(k)]
+        rows.append({
+            "feature": feature,
+            "score":   score,
+            "grade":   _confidence_grade(score),
+            "present": present,
+            "missing": missing,
+        })
+    rows.sort(key=lambda r: (r["score"], r["feature"]))
+    return rows
+
+
 def format_evidence_block(ev: dict) -> str:
     """
     Format a single feature's evidence dict as a concise Markdown block
     suitable for embedding in an LLM prompt scaffold.
+
+    The header line includes the confidence score and grade so the LLM
+    agent knows how reliably the feature is backed by code evidence.
 
     Returns an empty string when no evidence was found for the feature.
     """
@@ -184,9 +270,16 @@ def format_evidence_block(ev: dict) -> str:
         lines.append(f"  - ExecPath: {' | '.join(parts)}")
 
     if not lines:
-        return ""
+        # No evidence at all — still emit a confidence label so the LLM
+        # knows this feature has zero code backing.
+        score = compute_confidence(ev)
+        grade = _confidence_grade(score)
+        return f"**Evidence (confidence: {score:.1f} {grade}):** _none found_"
 
-    return "**Evidence:**\n" + "\n".join(lines)
+    score  = compute_confidence(ev)
+    grade  = _confidence_grade(score)
+    header = f"**Evidence (confidence: {score:.1f} {grade}):**"
+    return header + "\n" + "\n".join(lines)
 
 
 # ─── Internal matchers ────────────────────────────────────────────────────────

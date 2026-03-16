@@ -47,6 +47,14 @@ Checks implemented
         corresponding flow indicate missing business flows for data-mutating
         behaviour — the highest-priority coverage gap.
 
+  C-08  Low Confidence Features
+        Features with a low evidence confidence score are under-specified —
+        the BA artefacts describe behaviour that has minimal code backing.
+        Score bands:
+          score = 0.0  (no evidence at all)  → critical issue
+          score < 0.4  (only 1 evidence type) → major issue
+        Features scoring MEDIUM (≥0.4) or HIGH (≥0.8) are not flagged.
+
 Output
 ------
   Returns list[dict] — each dict matches the stage6 issue schema:
@@ -75,15 +83,21 @@ _FUZZY_WORD_RATIO = 0.75
 
 # ─── Public API ───────────────────────────────────────────────────────────────
 
-def run_checks(ctx: Any, artefacts: dict[str, str] | None = None) -> list[dict]:
+def run_checks(
+    ctx: Any,
+    artefacts: dict[str, str] | None = None,
+    confidence_report: list[dict] | None = None,
+) -> list[dict]:
     """
     Run all consistency checks and return a combined list of issues.
 
     Parameters
     ----------
-    ctx       : PipelineContext
-    artefacts : optional dict {name: content} from stage6 _load_artefacts().
-                If omitted, heading-presence checks (C-04, C-05) are skipped.
+    ctx               : PipelineContext
+    artefacts         : optional dict {name: content} from stage6 _load_artefacts().
+                        If omitted, heading-presence checks (C-04, C-05) are skipped.
+    confidence_report : optional output of evidence_index.build_confidence_report().
+                        If omitted, C-08 (low confidence) is skipped.
 
     Returns
     -------
@@ -98,6 +112,8 @@ def run_checks(ctx: Any, artefacts: dict[str, str] | None = None) -> list[dict]:
         issues.extend(_check_flow_ac_coverage(ctx, artefacts))
     issues.extend(_check_routes_not_in_flows(ctx))
     issues.extend(_check_sql_not_in_flows(ctx))
+    if confidence_report is not None:
+        issues.extend(_check_low_confidence_features(confidence_report))
     return issues
 
 
@@ -543,6 +559,79 @@ def _check_sql_not_in_flows(ctx: Any) -> list[dict]:
                 f"operation, or verify that the operation is framework "
                 f"infrastructure not requiring a user-facing flow."
             ),
+        ))
+
+    return issues
+
+
+# ─── C-08: Low Confidence Features ───────────────────────────────────────────
+
+_CONFIDENCE_CRITICAL = 0.0   # zero evidence → critical
+_CONFIDENCE_MAJOR    = 0.4   # < 0.4 but > 0.0 → major
+
+
+def _check_low_confidence_features(confidence_report: list[dict]) -> list[dict]:
+    """
+    Features with insufficient code evidence backing their BA artefacts.
+
+    A feature with no evidence at all (score=0.0) is critical — the BA
+    artefact may be entirely hallucinated.  A feature with only one evidence
+    type (score=0.2) is major — the specification is weakly grounded.
+    Features at MEDIUM (≥0.4) are acceptable; HIGH (≥0.8) are ideal.
+
+    Parameters
+    ----------
+    confidence_report : list[dict] from evidence_index.build_confidence_report()
+    """
+    issues: list[dict] = []
+
+    for row in confidence_report:
+        score   = row["score"]
+        feature = row["feature"]
+        grade   = row["grade"]
+        missing = row.get("missing", [])
+        present = row.get("present", [])
+
+        if score > _CONFIDENCE_MAJOR - 1e-9:
+            continue   # MEDIUM or HIGH — no issue
+
+        if score <= _CONFIDENCE_CRITICAL + 1e-9:
+            sev = _CRITICAL
+            desc = (
+                f"Feature `{feature}` has NO code evidence (confidence: 0.0 🔴). "
+                f"All five evidence types are missing: routes, controllers, SQL, "
+                f"forms, and execution paths. The BA artefacts for this feature "
+                f"may be entirely unsupported by the codebase."
+            )
+            rec = (
+                f"Verify that `{feature}` exists in the codebase. If it does, "
+                f"check that its source files are included in the domain model's "
+                f"pages/tables lists. If it does not exist, remove it from the "
+                f"domain model and BA artefacts."
+            )
+        else:
+            sev = _MAJOR
+            missing_str = ", ".join(missing) if missing else "unknown"
+            present_str = ", ".join(present) if present else "none"
+            desc = (
+                f"Feature `{feature}` has weak code evidence "
+                f"(confidence: {score:.1f} {grade}). "
+                f"Present: {present_str}. "
+                f"Missing: {missing_str}. "
+                f"The BA specification may outrun what the codebase supports."
+            )
+            rec = (
+                f"Confirm that the feature `{feature}` is actually implemented. "
+                f"Extend the domain model's pages/tables for this feature so the "
+                f"evidence index can find the missing artefact types: {missing_str}."
+            )
+
+        issues.append(_issue(
+            severity       = sev,
+            artefact       = "cross-doc",
+            category       = "Feature Confidence",
+            description    = desc,
+            recommendation = rec,
         ))
 
     return issues
