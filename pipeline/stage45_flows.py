@@ -398,12 +398,24 @@ def run(ctx: PipelineContext) -> None:
             print(f"  [stage45]   Tier-0 Laravel: "
                   f"{len(laravel_skeletons)} route-based skeleton(s)")
 
+    # ── Tier-1: Structured route→controller→service→SQL chain ─────────────────
+    # Fires for ANY project that has FQN-style route handlers (not just Laravel).
+    # Uses transitive service_deps BFS (depth ≤ 3) to trace:
+    #   Route → Controller → Service(s) → SQL / Redirect
+    # Routes already covered by Tier-0 are skipped.
+    tier1_skeletons: list[dict] = []
+    if ctx.code_map and ctx.code_map.routes:
+        tier1_skeletons = _traverse_structured_routes(ctx, laravel_skeletons)
+        if tier1_skeletons:
+            print(f"  [stage45]   Tier-1 Structured: "
+                  f"{len(tier1_skeletons)} route-chain skeleton(s)")
+
     print("  [stage45] Pass A–C: Graph traversal + path deduplication ...")
     raw_paths = _traverse_graph(G, ctx)
     print(f"  [stage45]   {len(raw_paths)} candidate path(s) found")
 
-    # Laravel skeletons first (higher quality); graph paths fill the rest
-    all_raw: list = laravel_skeletons + raw_paths
+    # Tier-0 highest priority, then Tier-1, then graph BFS paths
+    all_raw: list = laravel_skeletons + tier1_skeletons + raw_paths
 
     print("  [stage45] Pass D–E: Stitching execution_paths onto graph paths ...")
     flow_skeletons = _stitch_execution_paths(all_raw, ctx, G)
@@ -662,6 +674,277 @@ def _build_laravel_flow_skeleton(sk: dict) -> str:
     if meta.get("return_type") and meta["return_type"] != "unknown":
         lines.append(f"  Returns: {meta['return_type']}")
     return "\n".join(lines)
+
+
+# ─── Tier-1: Structured Route → Controller → Service → SQL Chain ──────────────
+
+def _traverse_structured_routes(
+    ctx: PipelineContext,
+    already_built: list[dict],
+) -> list[dict]:
+    """
+    Build flow skeletons by tracing the call chain deterministically:
+
+        Route (method + path)
+          → Controller class::method          (via route.handler FQN)
+            → Injected services               (via service_deps, depth ≤ 3)
+              → SQL operations                (via sql_queries.file ∩ reachable)
+              → Redirect                      (via redirects.file ∩ reachable)
+
+    Fires for any project that has explicit FQN-style route handlers, regardless
+    of framework.  Routes already covered by Tier-0 (laravel_skeletons) are
+    skipped to avoid duplication.
+
+    Returns a list of skeleton dicts in the same format as Tier-0, ready to
+    pass through _stitch_execution_paths() unchanged.
+    """
+    cm = ctx.code_map
+    if not cm:
+        return []
+
+    # ── Index supporting data ──────────────────────────────────────────────────
+    # Two-tier lookup: full FQN (exact) then short name (fallback).
+    # This prevents legacy classes from shadowing namespace-qualified ones when
+    # both share the same short name (e.g. two "UserPreferencesController"s).
+    fqn_to_file:   dict[str, str] = {}  # full FQN → file
+    class_to_file: dict[str, str] = {}  # short name → file (first-seen wins)
+    for c in list(cm.controllers or []) + list(cm.services or []):
+        fqn   = c.get("fqn", "")
+        short = c.get("name") or fqn.split("\\")[-1].split("/")[-1]
+        fpath = c.get("file", "")
+        if fqn and fpath:
+            fqn_to_file[fqn] = fpath
+        # First-seen wins — namespace-qualified classes appear earlier in the
+        # list because controllers are scanned before services.
+        if short and fpath and short not in class_to_file:
+            class_to_file[short] = fpath
+
+    # class short-name → set of injected dep class names (one-hop)
+    direct_deps: dict[str, set[str]] = defaultdict(set)
+    for d in (cm.service_deps or []):
+        cls = d.get("class", "")
+        dep = d.get("dep_class", "")
+        if cls and dep:
+            direct_deps[cls].add(dep)
+
+    # file path → list of SQL query dicts
+    file_to_sql: dict[str, list[dict]] = defaultdict(list)
+    for q in (cm.sql_queries or []):
+        if q.get("file"):
+            file_to_sql[q["file"]].append(q)
+
+    # file path → list of redirect dicts
+    file_to_redir: dict[str, list[dict]] = defaultdict(list)
+    for r in (cm.redirects or []):
+        if r.get("file"):
+            file_to_redir[r["file"]].append(r)
+
+    # ── URIs already handled by Tier-0 ────────────────────────────────────────
+    tier0_uris: set[str] = set()
+    for sk in already_built:
+        meta = sk.get("_laravel_meta", {})
+        if meta.get("uri"):
+            tier0_uris.add(meta["uri"])
+
+    skeletons: list[dict] = []
+
+    for route in (cm.routes or []):
+        method  = (route.get("method") or "").upper()
+        path    = route.get("path") or route.get("uri") or ""
+        handler = route.get("handler") or ""
+
+        # Skip non-HTTP entries, closures, and routes Tier-0 already built
+        if method in ("GROUP", "MIDDLEWARE", "PREFIX", ""):
+            continue
+        if not handler or handler in ("(closure)", "(group)", ""):
+            continue
+        if path in tier0_uris:
+            continue
+
+        # ── Parse handler → controller FQN + method name ──────────────────────
+        if "@" in handler:
+            ctrl_fqn, action_method = handler.rsplit("@", 1)
+        elif ":" in handler:
+            ctrl_fqn, action_method = handler.rsplit(":", 1)
+        else:
+            ctrl_fqn, action_method = handler, "index"
+
+        ctrl_short = ctrl_fqn.split("\\")[-1].split("/")[-1]
+        if not ctrl_short:
+            continue
+
+        ctrl_file = fqn_to_file.get(ctrl_fqn) or class_to_file.get(ctrl_short, "")
+
+        # ── Transitive closure over service_deps (BFS, depth ≤ 3) ────────────
+        MAX_DEPTH = 3
+        visited: set[str] = {ctrl_short}
+        queue: deque[tuple[str, int]] = deque([(ctrl_short, 0)])
+        reachable_files: list[str] = []
+        if ctrl_file:
+            reachable_files.append(ctrl_file)
+
+        while queue:
+            cls, depth = queue.popleft()
+            if depth >= MAX_DEPTH:
+                continue
+            for dep in direct_deps.get(cls, set()):
+                if dep in visited:
+                    continue
+                visited.add(dep)
+                queue.append((dep, depth + 1))
+                dep_file = class_to_file.get(dep, "")
+                if dep_file and dep_file not in reachable_files:
+                    reachable_files.append(dep_file)
+
+        # ── Collect SQL (deduplicated by op+table, capped at 6) ───────────────
+        # Skip internal/infrastructure table names that add noise without
+        # differentiating features across routes.
+        _SKIP_TABLES = {"", "unknown", "temp", "tmp", "dual"}
+        _sql_seen: set[tuple[str, str]] = set()
+        sql_steps: list[dict] = []
+        for fpath in reachable_files:
+            for q in file_to_sql.get(fpath, []):
+                op    = (q.get("operation") or "").upper()
+                table = (q.get("table")     or "").strip()
+                if not op or table.lower() in _SKIP_TABLES:
+                    continue
+                key = (op, table.lower())
+                if key not in _sql_seen:
+                    _sql_seen.add(key)
+                    sql_steps.append({"op": op, "table": table, "file": fpath})
+                if len(sql_steps) >= 6:
+                    break
+            if len(sql_steps) >= 6:
+                break
+
+        # ── Collect first redirect from controller file ────────────────────────
+        redirect_target: str = ""
+        for fpath in ([ctrl_file] if ctrl_file else []) + reachable_files:
+            redirs = file_to_redir.get(fpath, [])
+            if redirs:
+                redirect_target = redirs[0].get("target", "")
+                break
+
+        # ── Auth inference from middleware ────────────────────────────────────
+        middleware = route.get("middleware", [])
+        if isinstance(middleware, str):
+            middleware = [middleware]
+        auth_required = any(
+            mw in ("auth", "auth:sanctum", "auth:api", "verified", "login")
+            for mw in middleware
+        )
+
+        # ── Build FlowStep list ────────────────────────────────────────────────
+        steps: list[FlowStep] = []
+        step_num = 1
+
+        # Step 1 — Route entry
+        steps.append(FlowStep(
+            step_num     = step_num,
+            page         = path,
+            action       = f"{method} {path}",
+            http_method  = method,
+            auth_required= auth_required,
+            db_ops=[], inputs=[], outputs=[],
+        ))
+        step_num += 1
+
+        # Step 2 — Controller::method
+        if ctrl_file:
+            steps.append(FlowStep(
+                step_num     = step_num,
+                page         = Path(ctrl_file).name,
+                action       = f"{ctrl_short}::{action_method}",
+                http_method  = method,
+                auth_required= auth_required,
+                db_ops=[], inputs=[], outputs=[],
+            ))
+            step_num += 1
+
+        # Steps 3+: SQL operations (one step per distinct operation+table)
+        _sql_files_seen: set[str] = set()
+        for sql_item in sql_steps:
+            op_str   = f"{sql_item['op']} {sql_item['table']}"
+            sql_file = Path(sql_item["file"]).name
+            _sql_files_seen.add(sql_file)
+            steps.append(FlowStep(
+                step_num     = step_num,
+                page         = sql_file,
+                action       = op_str,
+                http_method  = None,
+                auth_required= False,
+                db_ops       = [op_str],
+                inputs=[], outputs=[],
+            ))
+            step_num += 1
+
+        # Last step — Redirect (if found and not a no-op)
+        if redirect_target and "?" not in redirect_target[:4]:
+            redir_page = Path(redirect_target.split("?")[0]).name or redirect_target
+            steps.append(FlowStep(
+                step_num     = step_num,
+                page         = redir_page,
+                action       = f"Redirect → {redirect_target[:80]}",
+                http_method  = None,
+                auth_required= False,
+                db_ops=[], inputs=[], outputs=[redirect_target[:80]],
+            ))
+
+        # ── Confidence ────────────────────────────────────────────────────────
+        confidence = _structured_route_confidence(
+            has_ctrl_file  = bool(ctrl_file),
+            has_services   = len(reachable_files) > (1 if ctrl_file else 0),
+            has_sql        = bool(sql_steps),
+            n_sql_tables   = len({s["table"].lower() for s in sql_steps}),
+            has_redirect   = bool(redirect_target),
+            has_auth       = auth_required,
+        )
+
+        # Only include if chain has at least controller + one more step
+        if len(steps) < 2:
+            continue
+
+        # Files for bounded-context assignment (controller + service files with SQL)
+        chain_files = [f for f in reachable_files if f]
+
+        skeletons.append({
+            "path_nodes":      [],
+            "files":           chain_files,
+            "steps":           steps,
+            "branches":        [],
+            "evidence_files":  chain_files,
+            "raw_confidence":  confidence,
+            "_structured_meta": {
+                "http_verb":   method,
+                "uri":         path,
+                "controller":  ctrl_short,
+                "method":      action_method,
+                "middleware":  middleware,
+                "sql_tables":  [s["table"] for s in sql_steps],
+                "redirect":    redirect_target,
+            },
+        })
+
+    return skeletons
+
+
+def _structured_route_confidence(
+    has_ctrl_file: bool,
+    has_services:  bool,
+    has_sql:       bool,
+    n_sql_tables:  int,
+    has_redirect:  bool,
+    has_auth:      bool,
+) -> float:
+    """Score a Tier-1 structured route skeleton 0.25–0.85."""
+    score = 0.25                        # base: route found
+    if has_ctrl_file:  score += 0.15   # controller resolved
+    if has_services:   score += 0.15   # at least one injected service
+    if has_sql:        score += 0.15   # SQL operations found
+    if n_sql_tables >= 2: score += 0.05  # multiple tables → richer op
+    if has_redirect:   score += 0.05   # output path found
+    if has_auth:       score += 0.05   # auth boundary documented
+    return round(min(0.85, score), 2)
 
 
 # ─── Pass A–C: Graph Traversal ────────────────────────────────────────────────
@@ -1329,6 +1612,17 @@ def _build_llm_user_prompt(
             parts.append(f"  Pattern match: {pattern}" + (f" — {desc}" if desc else ""))
             if pattern_obj and pattern_obj.term_hint:
                 parts.append(f"  Suggested termination: {pattern_obj.term_hint}")
+        # Tier-1 meta summary (route chain)
+        smeta = sk.get("_structured_meta", {})
+        if smeta:
+            parts.append(
+                f"  Route chain: {smeta.get('http_verb')} {smeta.get('uri')} "
+                f"→ {smeta.get('controller')}::{smeta.get('method')}"
+            )
+            if smeta.get("sql_tables"):
+                parts.append(f"  SQL tables: {', '.join(smeta['sql_tables'][:4])}")
+            if smeta.get("redirect"):
+                parts.append(f"  Redirect: {smeta['redirect'][:60]}")
         parts.append(f"  Files visited: {' → '.join(Path(f).name for f in sk['files'])}")
         for step in sk["steps"]:
             auth_tag = " [AUTH]" if step.auth_required else ""
