@@ -304,6 +304,8 @@ _STAGE_SUBDIRS: dict[str, str] = {
     "code_graph.gpickle":          "2_graph",
     "code_graph.json":             "2_graph",
     "code_graph.png":              "2_graph",
+    # Stage 2.5 — Behavior Graph
+    "behavior_graph.json":         "2.5_behavior",
     # Stage 3 — Vector Embeddings
     "chromadb":                    "3_embed",
     "chunks_manifest.json":        "3_embed",
@@ -372,6 +374,7 @@ class PipelineContext:
         "stage1_parse":         StageResult(),
         "stage15_paths":        StageResult(),
         "stage2_graph":         StageResult(),
+        "stage25_behavior":     StageResult(),   # behavior graph extraction
         "stage3_embed":         StageResult(),
         "stage35_preflight":    StageResult(),
         "stage4_domain":        StageResult(),
@@ -391,6 +394,7 @@ class PipelineContext:
 
     code_map:          Optional[CodeMap]                = None
     graph_meta:        Optional[GraphMeta]              = None
+    behavior_graph:    Optional[dict]                   = None   # Stage 2.5
     embedding_meta:    Optional[EmbeddingMeta]          = None
     preflight:         Optional[PreflightResult]        = None
     domain_model:      Optional[DomainModel]            = None

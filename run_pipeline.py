@@ -6,6 +6,7 @@ Stages (in execution order):
     Stage 1    parse          — PHP parsing (tree-sitter)
     Stage 1.5  paths          — execution-path / branch extraction
     Stage 2    graph          — knowledge graph (NetworkX)
+    Stage 2.5  behavior       — behavior graph extraction (Route→Ctrl→Service→SQL→Redirect)
     Stage 3    embed          — vector index (ChromaDB)
     Stage 3.5  preflight      — context pre-flight checks
     Stage 4    domain         — DomainAnalystAgent (LLM)
@@ -49,6 +50,7 @@ from pipeline.stage0_validate      import run as stage0
 from pipeline.stage1_parse         import run as stage1
 from pipeline.stage15_paths        import run as stage15
 from pipeline.stage2_graph         import run as stage2
+from pipeline.stage25_behavior     import run as stage25
 from pipeline.stage3_embed         import run as stage3
 from pipeline.stage35_preflight    import run as stage35
 from pipeline.stage4_domain        import run as stage4
@@ -69,6 +71,7 @@ STAGES: list[tuple[str, any]] = [
     ("stage1_parse",         stage1),
     ("stage15_paths",        stage15),  # execution-path extraction (feeds stage45 + stage5)
     ("stage2_graph",         stage2),
+    ("stage25_behavior",     stage25),  # behavior graph extraction (feeds stage45 + stage6)
     ("stage3_embed",         stage3),
     ("stage35_preflight",    stage35),
     ("stage4_domain",        stage4),
