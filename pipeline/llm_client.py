@@ -37,6 +37,13 @@ Environment variables:
                        small (2048–4096); set this to 16384 or 32768 when you
                        see truncated output with large batches:
                          export LOCAL_LLM_NUM_CTX=16384
+    LOCAL_LLM_THINKING "1" | "true" to enable Ollama extended-thinking mode
+                       for models that support it (e.g. qwen3, deepseek-r1).
+                       Disabled by default because thinking-only models set
+                       content="" and put all output in the "thinking" field,
+                       which breaks structured-output parsing.  The pipeline
+                       always uses explicit chain-of-thought prompting instead.
+                         export LOCAL_LLM_THINKING=1  # re-enable if needed
 
 Default models:
     Claude : claude-sonnet-4-20250514
@@ -458,6 +465,16 @@ def _call_local_ollama_native(
     if prefill:
         messages_payload.append({"role": "assistant", "content": prefill})
 
+    # Disable extended-thinking by default for Ollama thinking models
+    # (qwen3, deepseek-r1, etc.).  When thinking is active, Ollama puts the
+    # reasoning trace in message.thinking and leaves message.content empty,
+    # which breaks every structured-output parser downstream.  The pipeline
+    # uses explicit chain-of-thought system prompts instead.
+    # Set LOCAL_LLM_THINKING=1 to re-enable if you specifically want traces.
+    thinking_enabled = os.environ.get("LOCAL_LLM_THINKING", "").strip().lower() in (
+        "1", "true", "yes"
+    )
+
     payload = {
         "model":    model,
         "messages": messages_payload,
@@ -468,6 +485,10 @@ def _call_local_ollama_native(
             "temperature": temperature,
         },
     }
+    if not thinking_enabled:
+        # Ollama ≥0.6: top-level "think" key suppresses the reasoning trace
+        # and forces all output into message.content.
+        payload["think"] = False
     if json_mode:
         # Ollama native /api/chat uses a top-level "format" field (not inside
         # "options") to constrain output to valid JSON.
@@ -506,15 +527,29 @@ def _call_local_ollama_native(
     msg = data.get("message", {})
     content = (msg.get("content") or "").strip()
 
-    # Strip <think>...</think> from Qwen3 scratchpad
+    # Strip <think>...</think> from Qwen3 scratchpad (inline thinking tags)
     import re as _re
     content = _re.sub(r"<think>.*?</think>", "", content, flags=_re.DOTALL).strip()
 
     if not content:
-        raise _NonRetryableError(
-            f"Ollama /api/chat returned empty content.\n"
-            f"Full response: {json.dumps(data)[:300]}"
-        )
+        # Thinking models (qwen3, deepseek-r1) sometimes emit an empty content
+        # field and place the entire response inside message.thinking when the
+        # model ignores our think=false flag (older Ollama builds) or the model
+        # was custom-built without the no-think patch.
+        # Try to recover by using the thinking field as the response text.
+        thinking_fallback = (msg.get("thinking") or "").strip()
+        if thinking_fallback:
+            print(
+                "  [llm_client] ⚠ Ollama returned empty content but non-empty "
+                "thinking field — using thinking output as response fallback.\n"
+                "  Set LOCAL_LLM_THINKING=1 or upgrade Ollama to suppress this."
+            )
+            content = thinking_fallback
+        else:
+            raise _NonRetryableError(
+                f"Ollama /api/chat returned empty content.\n"
+                f"Full response: {json.dumps(data)[:300]}"
+            )
 
     done_reason = data.get("done_reason", "")
     if done_reason == "length":
