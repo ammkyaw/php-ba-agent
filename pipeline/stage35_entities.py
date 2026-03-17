@@ -1,5 +1,5 @@
 """
-pipeline/stage41_entities.py — Entity Extraction (Stage 4.1)
+pipeline/stage35_entities.py — Entity Extraction (Stage 3.5)
 
 Builds a catalogue of every business entity (DB table / ORM model) found
 in the codebase.  Fully static — no LLM.
@@ -20,9 +20,9 @@ is_system  Tables matching known infrastructure patterns (log_*, config*,
 is_pivot   Tables with exactly 2 columns that are both FK-pattern (*_id)
            and no other meaningful columns — junction tables for N:M.
 
-is_core    Populated as False initially; Stage 4.2 sets it to True on any
-           entity that gets at least one relationship. Stage 4.3 also marks
-           entities that have a state machine.  Stage 4.1 pre-marks entities
+is_core    Populated as False initially; Stage 3.6 sets it to True on any
+           entity that gets at least one relationship. Stage 3.7 also marks
+           entities that have a state machine.  Stage 3.5 pre-marks entities
            that appear in action clusters.
 
 Output
@@ -32,9 +32,9 @@ Output
 
 Consumed by
 -----------
-    Stage 4.2  (relationship reconstruction — needs entity list)
+    Stage 3.6  (relationship reconstruction — needs entity list)
     Stage 4    (domain model grounding)
-    Stage 4.3  (state machine entity labelling)
+    Stage 3.7  (state machine entity labelling)
     Stage 4.5  (flow validation — entity existence checks)
     Stage 6.7  (ER diagram node set)
     Stage 9    (knowledge graph entity nodes)
@@ -193,7 +193,7 @@ def _scan_php_for_table_bindings(php_project_path: str) -> dict[str, str]:
 def run(ctx: PipelineContext) -> None:
     cm = getattr(ctx, "code_map", None)
     if cm is None:
-        print("  [stage41] ⚠️  No code_map — skipping entity extraction.")
+        print("  [stage35] ⚠️  No code_map — skipping entity extraction.")
         ctx.entities = EntityCollection()
         return
 
@@ -232,7 +232,7 @@ def run(ctx: PipelineContext) -> None:
     orm_bindings = _scan_php_for_table_bindings(ctx.php_project_path)
     all_tables.update(orm_bindings.keys())
 
-    print(f"  [stage41] {len(all_tables)} unique table(s) discovered.")
+    print(f"  [stage35] {len(all_tables)} unique table(s) discovered.")
 
     # ── Build Entity objects ───────────────────────────────────────────────
     entities: list[Entity] = []
@@ -260,7 +260,7 @@ def run(ctx: PipelineContext) -> None:
         is_pivot   = _is_pivot_table(columns) if columns else False
         in_cluster = table in ac_cluster_tables
 
-        # is_core: pre-mark by cluster membership (stage42 will update further)
+        # is_core: pre-mark by cluster membership (stage36 will update further)
         is_core = in_cluster and not is_system
 
         bounded_context = _assign_context(table, ac_table_map)
@@ -299,7 +299,7 @@ def run(ctx: PipelineContext) -> None:
     # ── Print summary ─────────────────────────────────────────────────────
     system_count = sum(1 for e in entities if e.is_system)
     pivot_count  = sum(1 for e in entities if e.is_pivot)
-    print(f"  [stage41] Entity Extraction complete — {total} entities "
+    print(f"  [stage35] Entity Extraction complete — {total} entities "
           f"(core={core_count}, system={system_count}, pivot={pivot_count}).")
     for e in [x for x in entities if x.is_core][:20]:
         print(f"    {e.entity_id}  {e.name:<30} table={e.table}  cols={len(e.columns)}")
@@ -316,6 +316,6 @@ def run(ctx: PipelineContext) -> None:
         Path(out_path).parent.mkdir(parents=True, exist_ok=True)
         with open(out_path, "w", encoding="utf-8") as fh:
             json.dump(dataclasses.asdict(collection), fh, indent=2, ensure_ascii=False)
-        print(f"  [stage41] Saved → {out_path}")
+        print(f"  [stage35] Saved → {out_path}")
     except Exception as exc:
-        print(f"  [stage41] ⚠️  Could not save entity_catalog.json: {exc}")
+        print(f"  [stage35] ⚠️  Could not save entity_catalog.json: {exc}")

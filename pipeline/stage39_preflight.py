@@ -1,9 +1,10 @@
 """
-pipeline/stage35_preflight.py — Context Pre-flight Checks
+pipeline/stage39_preflight.py — Context Pre-flight Checks
 
 Runs a battery of fast, deterministic checks on the pipeline context
-(CodeMap + GraphMeta + EmbeddingMeta) BEFORE the expensive Claude API
-calls in Stage 4+. Acts as a safety gate to catch bad inputs early.
+(CodeMap + GraphMeta + EmbeddingMeta + static analysis outputs from
+Stages 3.5–3.8) BEFORE the expensive Claude API calls in Stage 4+.
+Acts as a comprehensive pre-LLM safety gate to catch bad inputs early.
 
 Two outcomes:
     PASS  — ctx.preflight.passed = True,  pipeline continues to Stage 4
@@ -34,6 +35,14 @@ WARNINGS (preflight.passed stays True — pipeline continues with caveats):
         → Some files may have been partially parsed
     W7. PHP version < 7.0 detected
         → Modern PHP patterns may not apply
+    W8. graph_rag_meta is None or graphrag index is empty (Stage 3.8)
+        → Stage 4 retrieval will fall back to raw ChromaDB only
+    W9. ctx.entities is None or zero entities extracted (Stage 3.5)
+        → Domain model will lack structured entity grounding
+    W10. ctx.relationships is None or zero relationships mapped (Stage 3.6)
+        → ER diagram and relationship context will be absent from Stage 4
+    W11. ctx.state_machines is None or zero machines found (Stage 3.7)
+        → State lifecycle section will be absent (may be expected for simple apps)
 
 Signal quality score
 --------------------
@@ -48,7 +57,7 @@ how confidently to phrase the generated BA documents.
 
 Resume behaviour
 ----------------
-If stage35_preflight is already COMPLETED and preflight_report.json exists,
+If stage39_preflight is already COMPLETED and preflight_report.json exists,
 the stage is skipped and ctx.preflight is restored from the report.
 """
 
@@ -68,13 +77,17 @@ MIN_TABLES_WARN          = 3      # warn if fewer unique DB tables
 MIN_CHUNKS               = 5      # block if ChromaDB has fewer chunks than this
 SANITY_QUERY_MAX_DIST    = 0.95   # block if best match distance > this (0=identical, 1=unrelated)
 SCORE_WEIGHTS = {
-    "has_sql":        25,   # SQL queries found
-    "has_tables":     20,   # DB table nodes in graph
-    "has_forms":      15,   # $_POST/$_GET reads
-    "has_auth":       10,   # session/redirect patterns
-    "has_functions":  10,   # user-defined functions
-    "has_graph":      10,   # knowledge graph built
-    "has_embeddings": 10,   # ChromaDB populated
+    "has_sql":          20,   # SQL queries found
+    "has_tables":       15,   # DB table nodes in graph
+    "has_forms":        10,   # $_POST/$_GET reads
+    "has_auth":         10,   # session/redirect patterns
+    "has_functions":    10,   # user-defined functions
+    "has_graph":         5,   # knowledge graph built
+    "has_embeddings":    5,   # ChromaDB populated
+    "has_graphrag":     10,   # graph-aware context index built (Stage 3.8)
+    "has_entities":      5,   # entities extracted (Stage 3.5)
+    "has_relationships": 5,   # relationships mapped (Stage 3.6)
+    "has_statemachines": 5,   # state machines found (Stage 3.7)
 }
 
 
@@ -82,7 +95,7 @@ SCORE_WEIGHTS = {
 
 def run(ctx: PipelineContext) -> None:
     """
-    Stage 3.5 entry point. Runs all preflight checks and populates
+    Stage 3.9 entry point. Runs all preflight checks and populates
     ctx.preflight. Raises PreflightBlocker if any hard blocker is found.
 
     Args:
@@ -95,14 +108,14 @@ def run(ctx: PipelineContext) -> None:
     report_path = ctx.output_path("preflight_report.json")
 
     # ── Resume check ─────────────────────────────────────────────────────────
-    if ctx.is_stage_done("stage35_preflight") and Path(report_path).exists():
+    if ctx.is_stage_done("stage39_preflight") and Path(report_path).exists():
         ctx.preflight = _restore_preflight(report_path)
-        print(f"  [stage35] Already completed — "
+        print(f"  [stage39] Already completed — "
               f"{'PASSED' if ctx.preflight.passed else 'FAILED'}, "
               f"{len(ctx.preflight.warnings)} warning(s).")
         return
 
-    print("  [stage35] Running preflight checks ...")
+    print("  [stage39] Running preflight checks ...")
 
     blockers: list[str] = []
     warnings: list[str] = []
@@ -365,6 +378,62 @@ def run(ctx: PipelineContext) -> None:
         except (ValueError, IndexError):
             pass
 
+    # ── W8–W11: Static analysis output checks (Stages 3.5–3.8) ───────────────
+
+    # W8: GraphRAG index (Stage 3.8)
+    if ctx.graph_rag_meta is None:
+        warnings.append(
+            "W8: graph_rag_meta is None — Stage 3.8 (graphrag) did not complete. "
+            "Stage 4 retrieval will fall back to raw ChromaDB only; "
+            "context quality will be lower."
+        )
+    else:
+        node_count = getattr(ctx.graph_rag_meta, "node_count", None)
+        if node_count is not None and node_count == 0:
+            warnings.append(
+                "W8: GraphRAG index was built but contains 0 nodes. "
+                "Re-run Stage 3.8 (graphrag) to rebuild the index."
+            )
+        else:
+            signals["has_graphrag"] = True
+            details["graphrag_nodes"] = node_count
+
+    # W9: Entity catalog (Stage 3.5)
+    entity_count = len(ctx.entities.entities) if ctx.entities else 0
+    if ctx.entities is None or entity_count == 0:
+        warnings.append(
+            "W9: No entities extracted (Stage 3.5). "
+            "Domain model will lack structured entity grounding. "
+            "Check that Stage 3.5 completed and code_map has DB tables."
+        )
+    else:
+        signals["has_entities"] = True
+        details["entity_count"] = entity_count
+
+    # W10: Relationship catalog (Stage 3.6)
+    rel_count = len(ctx.relationships.relationships) if ctx.relationships else 0
+    if ctx.relationships is None or rel_count == 0:
+        warnings.append(
+            "W10: No relationships mapped (Stage 3.6). "
+            "ER diagram and relationship context will be absent from Stage 4. "
+            "This is expected if the codebase has only one entity."
+        )
+    else:
+        signals["has_relationships"] = True
+        details["relationship_count"] = rel_count
+
+    # W11: State machine catalog (Stage 3.7)
+    sm_count = len(ctx.state_machines.machines) if ctx.state_machines else 0
+    if ctx.state_machines is None or sm_count == 0:
+        warnings.append(
+            "W11: No state machines found (Stage 3.7). "
+            "State lifecycle sections will be absent — this is expected for "
+            "simple CRUD apps with no explicit status/state fields."
+        )
+    else:
+        signals["has_statemachines"] = True
+        details["state_machine_count"] = sm_count
+
     # ── Compute signal quality score ──────────────────────────────────────────
     score = sum(SCORE_WEIGHTS[k] for k, v in signals.items() if v)
     details["signals"]       = signals
@@ -386,15 +455,15 @@ def run(ctx: PipelineContext) -> None:
     _save_report(report_path, passed, blockers, warnings, score, details)
 
     if passed:
-        ctx.stage("stage35_preflight").mark_completed(report_path)
+        ctx.stage("stage39_preflight").mark_completed(report_path)
         ctx.save()
     else:
-        ctx.stage("stage35_preflight").mark_failed(
+        ctx.stage("stage39_preflight").mark_failed(
             f"{len(blockers)} blocker(s): " + " | ".join(blockers)
         )
         ctx.save()
         raise PreflightBlocker(
-            f"[stage35] Preflight FAILED — {len(blockers)} blocker(s).\n"
+            f"[stage39] Preflight FAILED — {len(blockers)} blocker(s).\n"
             + "\n".join(f"  • {b}" for b in blockers)
             + f"\n\nFull report: {report_path}"
         )
@@ -486,12 +555,12 @@ def _get_chunk_types(ctx: PipelineContext) -> list[str]:
             all_keys: set[str] = set()
             for m in metadatas[:20]:
                 all_keys.update(m.keys())
-            print(f"  [stage35] W5 debug: no type key found in ChromaDB. "
+            print(f"  [stage39] W5 debug: no type key found in ChromaDB. "
                   f"Available metadata keys: {sorted(all_keys)}")
 
         return best
     except Exception as exc:
-        print(f"  [stage35] W5: chunk type lookup failed — {exc}")
+        print(f"  [stage39] W5: chunk type lookup failed — {exc}")
         return []
 
 
@@ -525,6 +594,10 @@ def _print_summary(
     print(f"  Chunks         : {details.get('total_chunks', '?')}")
     print(f"  Chunk types    : {', '.join(details.get('chunk_types', []))}")
     print(f"  Graph nodes    : {details.get('graph_nodes', '?')}")
+    print(f"  GraphRAG nodes : {details.get('graphrag_nodes', '?')}")
+    print(f"  Entities       : {details.get('entity_count', '?')}")
+    print(f"  Relationships  : {details.get('relationship_count', '?')}")
+    print(f"  State machines : {details.get('state_machine_count', '?')}")
 
     if details.get("unique_tables"):
         print(f"  Tables found   : {', '.join(details['unique_tables'])}")

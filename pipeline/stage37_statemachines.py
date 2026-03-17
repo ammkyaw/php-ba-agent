@@ -1,5 +1,5 @@
 """
-pipeline/stage43_statemachines.py — State Machine Reconstruction (Stage 4.3)
+pipeline/stage37_statemachines.py — State Machine Reconstruction (Stage 3.7)
 
 Detects entity lifecycle state machines from static signals only — no LLM.
 
@@ -685,7 +685,7 @@ def _build_machines(
 def run(ctx: PipelineContext) -> None:
     cm = getattr(ctx, "code_map", None)
     if cm is None:
-        print("  [stage43] ⚠️  No code_map — skipping state machine reconstruction.")
+        print("  [stage37] ⚠️  No code_map — skipping state machine reconstruction.")
         ctx.state_machines = StateMachineCollection()
         return
 
@@ -700,12 +700,12 @@ def run(ctx: PipelineContext) -> None:
 
     # ── Phase 1 ───────────────────────────────────────────────────────────────
     state_fields = _detect_state_fields(cm, invariant_rules)
-    print(f"  [stage43] Phase 1 — {len(state_fields)} state field(s) detected.")
+    print(f"  [stage37] Phase 1 — {len(state_fields)} state field(s) detected.")
 
     # ── Phase 2 ───────────────────────────────────────────────────────────────
     values_by_tf = _extract_state_values(cm, state_fields, ctx.php_project_path)
     total_vals = sum(len(v) for v in values_by_tf.values())
-    print(f"  [stage43] Phase 2 — {total_vals} state value(s) extracted "
+    print(f"  [stage37] Phase 2 — {total_vals} state value(s) extracted "
           f"across {len(values_by_tf)} field(s).")
 
     # ── Phase 3 ───────────────────────────────────────────────────────────────
@@ -714,7 +714,7 @@ def run(ctx: PipelineContext) -> None:
     raw_C = _detect_transitions_proximity(cm, state_fields, ctx.php_project_path)
 
     all_raw = _merge_transitions(raw_A + raw_B + raw_C)
-    print(f"  [stage43] Phase 3 — {len(all_raw)} unique transition(s) "
+    print(f"  [stage37] Phase 3 — {len(all_raw)} unique transition(s) "
           f"(A={len(raw_A)}, B={len(raw_B)}, C={len(raw_C)}).")
 
     # Group transitions by (table, field)
@@ -734,7 +734,7 @@ def run(ctx: PipelineContext) -> None:
     collection = StateMachineCollection(machines=machines, total=total)
 
     # ── Print summary ──────────────────────────────────────────────────────────
-    print(f"\n  [stage43] State Machine Reconstruction complete — {total} machine(s):")
+    print(f"\n  [stage37] State Machine Reconstruction complete — {total} machine(s):")
     for sm in machines:
         print(f"    [{sm.machine_id}] {sm.entity}.{sm.field:<20} "
               f"{len(sm.states):>2} states  "
@@ -751,7 +751,7 @@ def run(ctx: PipelineContext) -> None:
         Path(out_path).parent.mkdir(parents=True, exist_ok=True)
         with open(out_path, "w", encoding="utf-8") as fh:
             json.dump(dataclasses.asdict(collection), fh, indent=2, ensure_ascii=False)
-        print(f"  [stage43] Saved → {out_path}")
+        print(f"  [stage37] Saved → {out_path}")
 
         # Also write individual Mermaid files for Stage 6.7
         diag_dir = Path(out_path).parent / "mermaid"
@@ -760,6 +760,6 @@ def run(ctx: PipelineContext) -> None:
             fname = f"{sm.table}_{sm.field}.mmd"
             (diag_dir / fname).write_text(sm.mermaid, encoding="utf-8")
         if machines:
-            print(f"  [stage43] Mermaid files → {diag_dir}/")
+            print(f"  [stage37] Mermaid files → {diag_dir}/")
     except Exception as exc:
-        print(f"  [stage43] ⚠️  Could not save state_machine_catalog.json: {exc}")
+        print(f"  [stage37] ⚠️  Could not save state_machine_catalog.json: {exc}")
