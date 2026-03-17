@@ -146,9 +146,11 @@ def run_validation(ctx: Any) -> dict:
     file_to_sql    = _build_file_sql_index(cm)
     file_to_redir  = _build_file_redir_index(cm)
 
-    # flow_pages: file basenames that appear in any step.page
-    # flow_paths: raw step.page values (for route path matching)
-    # flow_evidence: basenames in evidence_files
+    # flow_pages    : file basenames from step.page values
+    # flow_paths    : raw step.page values, lowercase (route path matching)
+    # flow_evidence : file basenames from flow.evidence_files
+    #                 ← for MVC apps these are the controller/service files that
+    #                   handle routes; must be included in all coverage checks
     flow_pages, flow_paths, flow_evidence = _build_flow_pivot(flow_list)
 
     # ── Run checks ────────────────────────────────────────────────────────────
@@ -156,9 +158,9 @@ def run_validation(ctx: Any) -> dict:
     v02 = _check_hallucinated_steps(flow_list, known_files, known_routes, known_tables)
     v03 = _check_broken_flows(flow_list, known_files, known_routes)
     v04 = _check_missing_branches(flow_list, file_to_redir)
-    v05 = _check_route_coverage(cm, flow_pages, flow_paths)
-    v06 = _check_db_write_coverage(cm, flow_pages)
-    v07 = _check_form_coverage(cm, flow_pages)
+    v05 = _check_route_coverage(cm, flow_pages, flow_paths, flow_evidence)
+    v06 = _check_db_write_coverage(cm, flow_pages, flow_evidence)
+    v07 = _check_form_coverage(cm, flow_pages, flow_paths, flow_evidence)
     v08 = _check_flow_confidence(flow_list, known_files, known_routes)
 
     checks = {
@@ -350,9 +352,14 @@ def _check_missing_flows(
         ffile = ff.get("file", "")
         fname = Path(ffile).name.lower() if ffile else ""
         fmethod = (ff.get("method") or "GET").upper()
-        if fname and fname not in flow_pages and fname not in flow_evidence:
+        action = (ff.get("action") or "").strip().lower().split("?")[0]
+        action_norm = _normalize_route(action) if action else ""
+        action_covered = (
+            (action and action in flow_paths)
+            or (action_norm and action_norm in {_normalize_route(p) for p in flow_paths})
+        )
+        if fname and fname not in flow_pages and fname not in flow_evidence and not action_covered:
             sev = "major" if fmethod == "POST" else "minor"
-            action = ff.get("action", "")
             items.append({
                 "type":       "form",
                 "identifier": f"{fmethod} form → {action or '(same page)'}",
@@ -413,6 +420,31 @@ def _check_missing_flows(
 
 # ─── V-02: Fake / Hallucinated Steps ──────────────────────────────────────────
 
+def _normalize_route(path: str) -> str:
+    """
+    Normalise a route path so that concrete parameter values and framework
+    placeholder syntax both collapse to the same token, enabling comparison
+    between:
+      - registered routes:  /users/{id}/edit   /api/orders/:id
+      - flow step pages:    /users/42/edit     /api/orders/abc-123
+    Replacements (applied in order):
+      1. Laravel/Slim {param} and {param?}    → {*}
+      2. Express/Symfony :param               → {*}
+      3. Numeric-only segments                → {*}
+      4. UUID-like segments (8+ hex+dash)     → {*}
+    """
+    # 1. {param} / {param?}
+    path = re.sub(r"\{[^/}]+\??\}", "{*}", path)
+    # 2. :param (Express / Symfony style)
+    path = re.sub(r"(?<=/):([A-Za-z_][A-Za-z0-9_]*)", "{*}", path)
+    # 3. Numeric segments  /42/  or  /42
+    path = re.sub(r"(?<=/)\d+(?=/|$)", "{*}", path)
+    # 4. UUID-like segments
+    path = re.sub(r"(?<=/)[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}(?=/|$)",
+                  "{*}", path, flags=re.IGNORECASE)
+    return path
+
+
 def _check_hallucinated_steps(
     flow_list:    list,
     known_files:  set[str],
@@ -420,6 +452,9 @@ def _check_hallucinated_steps(
     known_tables: set[str],
 ) -> dict:
     """Flow steps referencing files, routes, or tables that don't exist."""
+    # Build a normalised version of every known route for parametric matching
+    known_routes_norm: set[str] = {_normalize_route(r) for r in known_routes}
+
     items: list[dict] = []
 
     for flow in flow_list:
@@ -439,12 +474,15 @@ def _check_hallucinated_steps(
             elif page.startswith("/") and not page.endswith(".php"):
                 path_clean = page.split("?")[0].lower()
                 if path_clean not in known_routes:
-                    # Partial match: check if any known route starts with this prefix
-                    if not any(r.startswith(path_clean) or path_clean.startswith(r)
-                               for r in known_routes if r):
-                        issues_for_step.append(
-                            f"Route path '{page}' not found in registered routes"
-                        )
+                    # Normalise both sides and retry (handles {param} / numeric segs)
+                    path_norm = _normalize_route(path_clean)
+                    if path_norm not in known_routes_norm:
+                        # Partial prefix match as last resort
+                        if not any(r.startswith(path_clean) or path_clean.startswith(r)
+                                   for r in known_routes if r):
+                            issues_for_step.append(
+                                f"Route path '{page}' not found in registered routes"
+                            )
 
             # ── DB ops check: tables mentioned in step.db_ops ─────────────────
             for db_op in (step.db_ops or []):
@@ -635,9 +673,10 @@ def _check_missing_branches(
 # ─── V-05: Route Coverage ─────────────────────────────────────────────────────
 
 def _check_route_coverage(
-    cm:         Any,
-    flow_pages: set[str],
-    flow_paths: set[str],
+    cm:            Any,
+    flow_pages:    set[str],
+    flow_paths:    set[str],
+    flow_evidence: set[str],
 ) -> dict:
     """% of HTTP routes (by path) covered by at least one flow step."""
     seen_paths: set[str] = set()
@@ -658,7 +697,7 @@ def _check_route_coverage(
             continue
         seen_paths.add(key)
 
-        in_flow = _route_in_flows(path, rname, flow_pages, flow_paths, set())
+        in_flow = _route_in_flows(path, rname, flow_pages, flow_paths, flow_evidence)
 
         if in_flow:
             covered.append({"method": method, "path": path, "file": rfile})
@@ -696,8 +735,9 @@ def _check_route_coverage(
 # ─── V-06: Database Write Operation Coverage ──────────────────────────────────
 
 def _check_db_write_coverage(
-    cm:         Any,
-    flow_pages: set[str],
+    cm:            Any,
+    flow_pages:    set[str],
+    flow_evidence: set[str],
 ) -> dict:
     """% of SQL write ops (INSERT/UPDATE/DELETE/REPLACE) covered by flows."""
     seen: set[tuple[str, str]] = set()
@@ -720,7 +760,10 @@ def _check_db_write_coverage(
             continue
         seen.add(key)
 
-        if qname and qname in flow_pages:
+        # A DB write is covered if its source file appears in flow step pages
+        # OR in flow evidence_files (covers MVC apps where controllers are in
+        # evidence_files but not necessarily in step.page).
+        if qname and (qname in flow_pages or qname in flow_evidence):
             covered_count += 1
         else:
             sev = "critical" if op == "DELETE" else "major"
@@ -751,10 +794,19 @@ def _check_db_write_coverage(
 # ─── V-07: Form Coverage ──────────────────────────────────────────────────────
 
 def _check_form_coverage(
-    cm:         Any,
-    flow_pages: set[str],
+    cm:            Any,
+    flow_pages:    set[str],
+    flow_paths:    set[str],
+    flow_evidence: set[str],
 ) -> dict:
-    """% of HTML forms covered by at least one flow step."""
+    """% of HTML forms covered by at least one flow step.
+
+    A form is considered covered if ANY of these match:
+      1. The form's source file basename appears in flow step pages (classic PHP)
+      2. The form's source file basename appears in flow evidence_files (MVC views)
+      3. The form's action URL (normalised) appears in flow_paths (MVC routes)
+         — covers Laravel Blade forms whose action points to a covered route
+    """
     seen:  set[str]  = set()
     covered_count    = 0
     uncovered: list[dict] = []
@@ -762,11 +814,22 @@ def _check_form_coverage(
     for ff in (getattr(cm, "form_fields", None) or []):
         ffile  = ff.get("file", "")
         fname  = Path(ffile).name.lower() if ffile else ""
+        action = (ff.get("action") or "").strip().lower().split("?")[0]
         if not fname or fname in seen:
             continue
         seen.add(fname)
 
-        if fname in flow_pages:
+        # Normalise action for parametric route matching
+        action_norm = _normalize_route(action) if action else ""
+
+        in_flow = (
+            (fname in flow_pages)
+            or (fname in flow_evidence)
+            or (action and action in flow_paths)
+            or (action_norm and action_norm in {_normalize_route(p) for p in flow_paths})
+        )
+
+        if in_flow:
             covered_count += 1
         else:
             method = (ff.get("method") or "GET").upper()
