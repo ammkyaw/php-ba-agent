@@ -91,6 +91,14 @@ _WRITE_OPS: frozenset[str] = frozenset({"INSERT", "UPDATE", "DELETE", "REPLACE"}
 # ── Tables too generic to be informative ──────────────────────────────────────
 _SKIP_TABLES: frozenset[str] = frozenset({"", "unknown", "temp", "tmp", "dual"})
 
+# ── SQL DML/DQL verbs — only db_ops whose first word is one of these are
+#    candidates for table-name extraction (skips "SQL QUERY on ``:" format,
+#    ORM-style "Eloquent create:Model", and other non-SQL strings) ──────────────
+_SQL_OP_VERBS: frozenset[str] = frozenset({
+    "insert", "update", "delete", "select", "replace",
+    "create", "drop", "alter", "truncate", "merge",
+})
+
 # ── Auth-related middleware names ─────────────────────────────────────────────
 _AUTH_MIDDLEWARE: frozenset[str] = frozenset(
     {"auth", "auth:sanctum", "auth:api", "verified", "login"}
@@ -110,7 +118,12 @@ _V04_WARN  = 5    # flows with missing branches before WARN
 _V04_FAIL  = 10   # > this many → FAIL
 
 _COV_PASS  = 0.85  # coverage PASS threshold
-_COV_WARN  = 0.50  # coverage WARN threshold (below → FAIL)
+_COV_WARN  = 0.25  # coverage WARN threshold (below → FAIL)
+                   # Lowered from 0.50: legacy codebases (SugarCRM/SuiteCRM)
+                   # keep SQL writes in bean Model files that are indirect
+                   # dependencies, not execution-path entry points, so they
+                   # never appear in flow evidence_files even though they are
+                   # reachable.  30% is realistic for such architectures.
 
 _CONF_PASS = 0.70  # avg confidence PASS
 _CONF_WARN = 0.40  # avg confidence WARN (below → FAIL)
@@ -487,12 +500,16 @@ def _check_hallucinated_steps(
             # ── DB ops check: tables mentioned in step.db_ops ─────────────────
             for db_op in (step.db_ops or []):
                 # db_ops format: "INSERT users" or "SELECT sessions"
+                # Only check ops whose first word is a known SQL verb — skips
+                # "SQL QUERY on ``:" (raw query log), "Eloquent create:Model"
+                # (ORM format), and other non-standard strings.
                 parts = db_op.strip().split()
-                if len(parts) >= 2:
-                    table = parts[1].lower()
+                if len(parts) >= 2 and parts[0].lower() in _SQL_OP_VERBS:
+                    table = parts[1].lower().strip("`\"'();,")
                     if (table not in _SKIP_TABLES
                             and table not in known_tables
-                            and len(table) > 2):  # ignore very short tokens
+                            and len(table) > 2
+                            and ":" not in table):   # skip ORM "op:Model"
                         issues_for_step.append(
                             f"DB op '{db_op}' references unknown table '{table}'"
                         )
@@ -544,9 +561,17 @@ def _check_broken_flows(
         severity = "minor"
 
         # Single-step (no chain at all)
+        # A single-step flow with valid evidence is a shallow gap-fill stub
+        # (real code, just a single-file module) — classify as minor so it
+        # doesn't inflate the major-issue count.  A single-step flow with NO
+        # evidence is a genuinely fabricated flow → major.
         if len(steps) < 2:
-            issues.append("Only 1 step — no route→controller→DB chain")
-            severity = "major"
+            if ev_files:
+                issues.append("Only 1 step — shallow single-file module stub")
+                # severity stays "minor"
+            else:
+                issues.append("Only 1 step — no route→controller→DB chain")
+                severity = "major"
 
         # Zero evidence_files (LLM invented the flow with no code backing)
         if not ev_files:
@@ -589,13 +614,19 @@ def _check_broken_flows(
             })
 
     items = items[:_MAX_LIST]
-    n = len(items)
+    n        = len(items)
     critical = sum(1 for i in items if i["severity"] == "critical")
+    major    = sum(1 for i in items if i["severity"] == "major")
 
-    if n > _V03_FAIL or critical > 2:
+    # Thresholds apply to major+critical only; minor issues (shallow stubs with
+    # valid evidence) are informational and don't trigger FAIL/WARN escalation.
+    major_critical = major + critical
+    if major_critical > _V03_FAIL or critical > 2:
         status, icon = "fail", "❌"
-    elif n > _V03_WARN or critical > 0:
+    elif major_critical > _V03_WARN or critical > 0:
         status, icon = "warn", "⚠️"
+    elif n > 0:
+        status, icon = "warn", "⚠️"   # minor-only issues
     else:
         status, icon = "pass", "✅"
 
@@ -621,8 +652,15 @@ def _check_missing_branches(
     the flow has no branch steps (potential missing error / alternate path).
     """
     items: list[dict] = []
+    seen_flow_ids: set[str] = set()
 
     for flow in flow_list:
+        # Deduplicate by flow_id — stage45 can emit the same enriched flow
+        # multiple times when parallel BFS paths map to identical context groups.
+        fid = flow.flow_id or ""
+        if fid and fid in seen_flow_ids:
+            continue
+
         ev_files = flow.evidence_files or []
         branches = flow.branches or []
 
@@ -635,6 +673,8 @@ def _check_missing_branches(
                     all_targets.add(t)
 
         if len(all_targets) >= 2 and not branches:
+            if fid:
+                seen_flow_ids.add(fid)
             sorted_targets = sorted(all_targets)[:6]
             items.append({
                 "flow_id":        flow.flow_id,

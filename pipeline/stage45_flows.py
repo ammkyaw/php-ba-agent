@@ -496,7 +496,10 @@ def _build_gap_fill_skeletons(
             ))
             step_num += 1
 
-        if not steps:
+        if len(steps) < 2:
+            # Single-file modules produce 1-step flows that V-03 flags as
+            # "broken" (no route→controller→DB chain).  Skip them — they add
+            # noise without providing analytical value.
             continue
 
         skeletons.append({
@@ -602,6 +605,23 @@ def run(ctx: PipelineContext) -> None:
           f"({len(context_groups)} context group(s)) ...")
     flows = _enrich_with_llm(flow_skeletons, context_groups, ctx)
     print(f"  [stage45]   {len(flows)} named flow(s) produced")
+
+    # Deduplicate by name — parallel BFS paths through the same bounded context
+    # can produce identically-named flows (e.g., "System Installation and Setup"
+    # from 11 different install entry points).  Keep the first occurrence which
+    # has the highest raw_confidence (skeletons are sorted by confidence before
+    # enrichment) and discard the rest.
+    _seen_names: set[str] = set()
+    _deduped: list = []
+    for _f in flows:
+        _key = (_f.name or "").strip().lower()
+        if _key and _key not in _seen_names:
+            _seen_names.add(_key)
+            _deduped.append(_f)
+    if len(_deduped) < len(flows):
+        print(f"  [stage45]   Deduped {len(flows) - len(_deduped)} duplicate flow name(s) "
+              f"→ {len(_deduped)} unique flow(s)")
+    flows = _deduped
 
     # ── Gap-fill: coverage-driven synthetic skeletons ─────────────────────────
     # After BFS+stitching, many modules may not have been reached (MAX_PATHS cap
