@@ -702,19 +702,6 @@ _STAGE_SUBDIRS: dict[str, str] = {
     "action_clusters.json":        "2.8_clusters",
     # Stage 2.9 — Invariant Detection
     "rule_catalog.json":           "2.9_invariants",
-    # Stage 4.1 — Entity Extraction
-    "entity_catalog.json":         "4.1_entities",
-    # Stage 4.2 — Entity Relationship Reconstruction
-    "relationship_catalog.json":   "4.2_relationships",
-    # Stage 4.3 — State Machine Reconstruction
-    "state_machine_catalog.json":  "4.3_statemachines",
-    # Stage 4.6 — Specification Mining
-    "spec_rules.json":             "4.6_specrules",
-    # Stage 4.8 — Evidence Triangulation
-    "evidence_triangulation.json": "4.8_triangulate",
-    # Stage 5.5 — Automated Traceability Matrix
-    "traceability_matrix.json":    "5.5_traceability",
-    "traceability_report.md":      "5.5_traceability",
     # Stage 3 — Vector Embeddings
     "chromadb":                    "3_embed",
     "chunks_manifest.json":        "3_embed",
@@ -725,17 +712,30 @@ _STAGE_SUBDIRS: dict[str, str] = {
     # Stage 4 — Domain Model
     "domain_model.json":           "4_domain",
     "coverage_report.json":        "4_domain",
+    # Stage 4.1 — Entity Extraction
+    "entity_catalog.json":         "4.1_entities",
+    # Stage 4.2 — Entity Relationship Reconstruction
+    "relationship_catalog.json":   "4.2_relationships",
+    # Stage 4.3 — State Machine Reconstruction
+    "state_machine_catalog.json":  "4.3_statemachines",
     # Stage 4.5 — Business Flows
     "business_flows.json":         "4.5_flows",
     "flow_coverage.json":          "4.5_flows",
+    # Stage 4.6 — Specification Mining
+    "spec_rules.json":             "4.6_specrules",
     # Stage 4.7 — Behavioral Validation
     "flow_validation.json":        "4.7_validation",
     "flow_validation.md":          "4.7_validation",
+    # Stage 4.8 — Evidence Triangulation
+    "evidence_triangulation.json": "4.8_triangulate",
     # Stage 5 — BA Documents (Markdown)
     "brd.md":                      "5_documents",
     "srs.md":                      "5_documents",
     "ac.md":                       "5_documents",
     "user_stories.md":             "5_documents",
+    # Stage 5.5 — Automated Traceability Matrix
+    "traceability_matrix.json":    "5.5_traceability",
+    "traceability_report.md":      "5.5_traceability",
     # Stage 5.9 — Document Coverage Audit
     "doc_coverage.json":           "5.9_doccoverage",
     "doc_coverage_summary.md":     "5.9_doccoverage",
@@ -787,37 +787,37 @@ class PipelineContext:
     created_at:       str = field(default_factory=lambda: datetime.utcnow().isoformat())
 
     stages: dict[str, StageResult] = field(default_factory=lambda: {
-        "stage0_validate":      StageResult(),
-        "stage1_parse":         StageResult(),
-        "stage15_paths":        StageResult(),
-        "stage2_graph":         StageResult(),
-        "stage25_behavior":     StageResult(),   # behavior graph extraction
-        "stage27_semanticroles": StageResult(),  # semantic role tagging (static)
-        "stage28_clusters":     StageResult(),   # action clustering (similarity)
-        "stage29_invariants":   StageResult(),   # business rule / invariant detection
-        "stage3_embed":         StageResult(),
-        "stage35_preflight":    StageResult(),
-        "stage37_graphrag":     StageResult(),  # graph-aware context index (static)
-        "stage41_entities":     StageResult(),  # entity extraction (static)
-        "stage42_relationships": StageResult(), # entity relationship reconstruction (static)
-        "stage4_domain":        StageResult(),
-        "stage43_statemachines": StageResult(),  # state machine reconstruction
-        "stage45_flows":        StageResult(),
-        "stage46_specrules":    StageResult(),  # specification mining (business rule synthesis)
-        "stage48_triangulate":  StageResult(),  # evidence triangulation (static)
-        "stage47_validate":     StageResult(),   # behavioral flow validation
-        "stage5_brd":           StageResult(),
-        "stage5_srs":           StageResult(),
-        "stage5_ac":            StageResult(),
-        "stage5_userstories":   StageResult(),
-        "stage55_traceability": StageResult(),  # automated traceability matrix (static)
-        "stage59_doccoverage":  StageResult(),  # document coverage audit (static)
-        "stage6_qa":            StageResult(),
-        "stage62_architecture": StageResult(),  # architecture reconstruction (LLM)
-        "stage65_postprocess":  StageResult(),
-        "stage67_diagrams":     StageResult(),
-        "stage7_pdf":           StageResult(),
-        "stage8_tests":         StageResult(),  # test case generator
+        "stage0_validate":        StageResult(),
+        "stage1_parse":           StageResult(),
+        "stage15_paths":          StageResult(),
+        "stage2_graph":           StageResult(),
+        "stage25_behavior":       StageResult(),  # behavior graph extraction
+        "stage27_semanticroles":  StageResult(),  # semantic role tagging (static)
+        "stage28_clusters":       StageResult(),  # action clustering (similarity)
+        "stage29_invariants":     StageResult(),  # business rule / invariant detection
+        "stage3_embed":           StageResult(),
+        "stage35_preflight":      StageResult(),
+        "stage37_graphrag":       StageResult(),  # graph-aware context index (static)
+        "stage4_domain":          StageResult(),
+        "stage41_entities":       StageResult(),  # entity extraction (static)
+        "stage42_relationships":  StageResult(),  # entity relationship reconstruction (static)
+        "stage43_statemachines":  StageResult(),  # state machine reconstruction
+        "stage45_flows":          StageResult(),
+        "stage46_specrules":      StageResult(),  # specification mining (business rule synthesis)
+        "stage47_validate":       StageResult(),  # behavioral flow validation
+        "stage48_triangulate":    StageResult(),  # evidence triangulation (static)
+        "stage5_brd":             StageResult(),
+        "stage5_srs":             StageResult(),
+        "stage5_ac":              StageResult(),
+        "stage5_userstories":     StageResult(),
+        "stage55_traceability":   StageResult(),  # automated traceability matrix (static)
+        "stage59_doccoverage":    StageResult(),  # document coverage audit (static)
+        "stage6_qa":              StageResult(),
+        "stage62_architecture":   StageResult(),  # architecture reconstruction (LLM)
+        "stage65_postprocess":    StageResult(),
+        "stage67_diagrams":       StageResult(),
+        "stage7_pdf":             StageResult(),
+        "stage8_tests":           StageResult(),  # test case generator
         "stage9_knowledge_graph": StageResult(),  # system knowledge graph builder
     })
 
