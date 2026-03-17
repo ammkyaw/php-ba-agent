@@ -1,5 +1,5 @@
 """
-pipeline/stage59_doccoverage.py — Document Coverage Audit (Stage 5.9)
+pipeline/stage58_doccoverage.py — Document Coverage Audit (Stage 5.8)
 
 Fully static stage that runs after Stage 5 (documents generated) and before
 Stage 6 (QA review).  It checks whether every signal discovered by the static
@@ -27,8 +27,8 @@ Outputs
 
 Resume behaviour
 ----------------
-If stage59_doccoverage is COMPLETED and doc_coverage.json exists, the stage is
-skipped.  Use --force stage59_doccoverage to re-run.
+If stage58_doccoverage is COMPLETED and doc_coverage.json exists, the stage is
+skipped.  Use --force stage58_doccoverage to re-run.
 """
 
 from __future__ import annotations
@@ -78,23 +78,23 @@ class DocCoverageResult:
 
 def run(ctx: PipelineContext) -> None:
     """
-    Stage 5.9 entry point.  Checks document coverage for all static-analysis
+    Stage 5.8 entry point.  Checks document coverage for all static-analysis
     signals and saves doc_coverage.json + doc_coverage_summary.md.
     """
     cov_path = ctx.output_path(COV_FILE)
 
     # ── Resume check ─────────────────────────────────────────────────────────
-    if ctx.is_stage_done("stage59_doccoverage") and Path(cov_path).exists():
-        print("  [stage59] Already completed — skipping.")
+    if ctx.is_stage_done("stage58_doccoverage") and Path(cov_path).exists():
+        print("  [stage58] Already completed — skipping.")
         return
 
     # ── Load documents ────────────────────────────────────────────────────────
     docs = _load_documents(ctx)
     if not docs:
-        print("  [stage59] ⚠️  No BA documents found — skipping coverage audit.")
+        print("  [stage58] ⚠️  No BA documents found — skipping coverage audit.")
         return
 
-    print(f"  [stage59] Auditing {len(docs)} document(s) against static signals ...")
+    print(f"  [stage58] Auditing {len(docs)} document(s) against static signals ...")
 
     dims: list[DimCoverage] = []
 
@@ -102,35 +102,35 @@ def run(ctx: PipelineContext) -> None:
     if ctx.entities and ctx.entities.entities:
         dim = _check_entities(ctx, docs)
         dims.append(dim)
-        print(f"  [stage59] Entities   → SRS : {dim.covered}/{dim.total} "
+        print(f"  [stage58] Entities   → SRS : {dim.covered}/{dim.total} "
               f"({dim.pct:.0%})  [{dim.status.upper()}]")
 
     # ── 2. Flows → BRD ────────────────────────────────────────────────────────
     if ctx.business_flows and ctx.business_flows.flows:
         dim = _check_flows(ctx, docs)
         dims.append(dim)
-        print(f"  [stage59] Flows      → BRD : {dim.covered}/{dim.total} "
+        print(f"  [stage58] Flows      → BRD : {dim.covered}/{dim.total} "
               f"({dim.pct:.0%})  [{dim.status.upper()}]")
 
     # ── 3. Spec Rules → SRS + BRD ─────────────────────────────────────────────
     if ctx.spec_rules and ctx.spec_rules.rules:
         dim = _check_spec_rules(ctx, docs)
         dims.append(dim)
-        print(f"  [stage59] SpecRules  → docs: {dim.covered}/{dim.total} "
+        print(f"  [stage58] SpecRules  → docs: {dim.covered}/{dim.total} "
               f"({dim.pct:.0%})  [{dim.status.upper()}]")
 
     # ── 4. State machines → SRS ───────────────────────────────────────────────
     if ctx.state_machines and ctx.state_machines.machines:
         dim = _check_state_machines(ctx, docs)
         dims.append(dim)
-        print(f"  [stage59] States     → SRS : {dim.covered}/{dim.total} "
+        print(f"  [stage58] States     → SRS : {dim.covered}/{dim.total} "
               f"({dim.pct:.0%})  [{dim.status.upper()}]")
 
     # ── 5. Relationships → SRS ────────────────────────────────────────────────
     if ctx.relationships and ctx.relationships.relationships:
         dim = _check_relationships(ctx, docs)
         dims.append(dim)
-        print(f"  [stage59] Relations  → SRS : {dim.covered}/{dim.total} "
+        print(f"  [stage58] Relations  → SRS : {dim.covered}/{dim.total} "
               f"({dim.pct:.0%})  [{dim.status.upper()}]")
 
     # ── Aggregate ─────────────────────────────────────────────────────────────
@@ -158,15 +158,15 @@ def run(ctx: PipelineContext) -> None:
     _save_markdown(result, ctx, md_path)
 
     ctx.doc_coverage = result
-    ctx.stage("stage59_doccoverage").mark_completed(cov_path)
+    ctx.stage("stage58_doccoverage").mark_completed(cov_path)
     ctx.save()
 
     icon = {"pass": "✅", "warn": "⚠️", "fail": "❌"}.get(overall_status, "?")
-    print(f"  [stage59] Overall coverage: {overall_pct:.0%} {icon}  "
+    print(f"  [stage58] Overall coverage: {overall_pct:.0%} {icon}  "
           f"({covered_items}/{total_items} items across {len(dims)} dimension(s))")
-    print(f"  [stage59] Saved → {cov_path}")
+    print(f"  [stage58] Saved → {cov_path}")
     if gap_summary:
-        print(f"  [stage59] Gaps:")
+        print(f"  [stage58] Gaps:")
         for line in gap_summary[:6]:
             print(f"    • {line}")
         if len(gap_summary) > 6:
@@ -406,7 +406,7 @@ def _save_json(result: DocCoverageResult, path: str) -> None:
 
 def _save_markdown(result: DocCoverageResult, ctx: PipelineContext, path: str) -> None:
     lines: list[str] = [
-        "# Document Coverage Audit — Stage 5.9",
+        "# Document Coverage Audit — Stage 5.8",
         "",
         f"**Overall**: {result.overall_pct:.0%}  "
         f"[{result.overall_status.upper()}]",
@@ -439,7 +439,7 @@ def _save_markdown(result: DocCoverageResult, ctx: PipelineContext, path: str) -
         lines.append("")
 
     lines += [
-        f"*Generated by Stage 5.9 at {result.generated_at}*",
+        f"*Generated by Stage 5.8 at {result.generated_at}*",
     ]
 
     Path(path).parent.mkdir(parents=True, exist_ok=True)
