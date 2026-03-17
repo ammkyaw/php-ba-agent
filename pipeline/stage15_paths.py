@@ -100,6 +100,26 @@ def run(ctx: PipelineContext) -> None:
     php_files = _collect_php_files(ctx.php_project_path)
     print(f"  [stage15] Found {len(php_files)} PHP file(s) to analyse.")
 
+    # ── Augment with Stage 1.3 entry-point catalog ────────────────────────────
+    # Include handler files from the entry-point catalog that weren't picked up
+    # by _collect_php_files (e.g. CLI-only queue workers, cron scripts deep in
+    # subdirectories that the HTTP-focused collector skips).
+    _ep_type_by_abs: dict[str, str] = {}   # abs_path → ep_type
+    if ctx.entry_point_catalog and ctx.entry_point_catalog.entry_points:
+        root = Path(ctx.php_project_path)
+        php_files_set = set(php_files)
+        added = 0
+        for ep in ctx.entry_point_catalog.entry_points:
+            abs_path = str((root / ep.handler_file).resolve())
+            _ep_type_by_abs[abs_path] = ep.ep_type
+            if abs_path not in php_files_set and Path(abs_path).exists():
+                php_files.append(abs_path)
+                php_files_set.add(abs_path)
+                added += 1
+        if added:
+            print(f"  [stage15] Entry-point catalog: added {added} "
+                  f"additional handler file(s) for analysis.")
+
     # ── Analyse each file ─────────────────────────────────────────────────────
     all_paths: list[dict[str, Any]] = []
     errors:    list[dict[str, str]] = []
@@ -108,6 +128,10 @@ def run(ctx: PipelineContext) -> None:
         try:
             result = analyse_file(php_file, ctx.php_project_path, framework)
             if result:
+                # Tag ep_type from Stage 1.3 catalog when available
+                ep_type = _ep_type_by_abs.get(str(Path(php_file).resolve()))
+                if ep_type and ep_type != "http":
+                    result["ep_type"] = ep_type
                 all_paths.append(result)
         except Exception as exc:                              # noqa: BLE001
             # Capture full traceback — the old code swallowed these silently
