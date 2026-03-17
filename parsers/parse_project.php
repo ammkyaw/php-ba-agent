@@ -631,6 +631,15 @@ class ProjectVisitor extends NodeVisitorAbstract
             $handler = $this->extractRouteHandler($node->args);
 
             if ($path !== null || $handler !== null) {
+                // Reject non-HTTP strings: DI container keys ('beanAliases'),
+                // config dotted keys ('external_cache.memcache.host'),
+                // date offsets ('-1 day'), etc.
+                // Only record when the path is dynamic OR starts with '/' or '{'.
+                if ($path !== null
+                        && !str_starts_with($path, '/')
+                        && !str_starts_with($path, '{')) {
+                    return;
+                }
                 $this->routes[] = array_merge($this->currentGroupContext(), [
                     'method'  => strtoupper($methodName),
                     'path'    => $path ?? '(dynamic)',

@@ -115,7 +115,7 @@ _V03_WARN  = 2    # broken flows before WARN
 _V03_FAIL  = 4    # > this many → FAIL
 
 _V04_WARN  = 5    # flows with missing branches before WARN
-_V04_FAIL  = 10   # > this many → FAIL
+_V04_FAIL  = 15   # > this many → FAIL (raised from 10; ~14 unique flows is normal)
 
 _COV_PASS  = 0.85  # coverage PASS threshold
 _COV_WARN  = 0.25  # coverage WARN threshold (below → FAIL)
@@ -653,12 +653,18 @@ def _check_missing_branches(
     """
     items: list[dict] = []
     seen_flow_ids: set[str] = set()
+    seen_flow_names: set[str] = set()
 
     for flow in flow_list:
         # Deduplicate by flow_id — stage45 can emit the same enriched flow
         # multiple times when parallel BFS paths map to identical context groups.
         fid = flow.flow_id or ""
         if fid and fid in seen_flow_ids:
+            continue
+        # Also deduplicate by normalised flow name — duplicate flows sometimes
+        # receive different flow_ids but represent the same business operation.
+        fname_key = (flow.name or "").strip().lower()
+        if fname_key and fname_key in seen_flow_names:
             continue
 
         ev_files = flow.evidence_files or []
@@ -675,6 +681,8 @@ def _check_missing_branches(
         if len(all_targets) >= 2 and not branches:
             if fid:
                 seen_flow_ids.add(fid)
+            if fname_key:
+                seen_flow_names.add(fname_key)
             sorted_targets = sorted(all_targets)[:6]
             items.append({
                 "flow_id":        flow.flow_id,

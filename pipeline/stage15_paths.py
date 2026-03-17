@@ -239,6 +239,12 @@ def analyse_file(
             if result:
                 return result
 
+    # ── SuiteCRM / SugarCRM bean files ────────────────────────────────────────
+    if _is_sugarcrm_bean(php_file, source):
+        result = _SugarCRMBeanAnalyser(source, rel).analyse()
+        if result:
+            return result
+
     # ── Raw PHP / legacy fallback ─────────────────────────────────────────────
     return _FileAnalyser(source, rel).analyse()
 
@@ -259,6 +265,138 @@ def _is_laravel_controller(php_file: str, source: str) -> bool:
         or "Controllers" in str(p)
         or re.search(r'extends\s+\w*Controller', source) is not None
     )
+
+
+# ─── SuiteCRM / SugarCRM Bean Detection Helpers ───────────────────────────────
+
+def _is_sugarcrm_bean(php_file: str, source: str) -> bool:
+    """Return True if this file is a SuiteCRM/SugarCRM bean/model file.
+
+    Detection heuristics (any one is sufficient):
+    - File path matches modules/<ModuleName>/<ClassName>.php
+    - Source contains 'extends SugarBean' / 'extends Basic' / etc.
+    - Source contains '$this->db->query(' — characteristic SugarCRM DB call
+    """
+    p = Path(php_file)
+    # Path heuristic: modules/<Module>/<File>.php
+    parts = p.parts
+    try:
+        mod_idx = next(i for i, pt in enumerate(parts) if pt == "modules")
+        if len(parts) - mod_idx >= 3:  # modules/<Mod>/<File>.php
+            return True
+    except StopIteration:
+        pass
+    # Source heuristics
+    if re.search(
+        r'\bextends\s+(?:SugarBean|Basic|Person|Company|SugarObject|'
+        r'VardefManager|SugarLogger|SugarView)\b',
+        source, re.IGNORECASE,
+    ):
+        return True
+    if re.search(r'\$this\s*->\s*db\s*->\s*(?:query|insertRecord|updateRecord'
+                 r'|deleteRecord|insert|update|delete)\s*\(', source, re.IGNORECASE):
+        return True
+    return False
+
+
+class _SugarCRMBeanAnalyser:
+    """
+    Analyses SuiteCRM/SugarCRM bean files for SQL operations.
+
+    Bean files (e.g. modules/Accounts/Account.php) extend SugarBean and
+    interact with the database via ``$this->db->query()``,
+    ``$this->db->insertRecord()``, ``DBManager::getInstance()->query()``,
+    ``$this->save()``, etc.
+
+    These files are never web entry points (no ``$_POST``, ``header()`` calls)
+    so ``_FileAnalyser`` returns ``None`` for them.  This analyser emits a
+    minimal path record so bean files appear in ``execution_paths`` and V-06
+    can count their SQL write ops as covered by flows that reference the module.
+    """
+
+    _DB_CALL_PAT = re.compile(
+        r'(?:'
+        r'\$this\s*->\s*db\s*->\s*(?:query|limitQuery|prepare|'
+        r'insertRecord|updateRecord|deleteRecord|insert|update|delete|fetchByAssoc)'
+        r'|DBManager\s*::\s*getInstance\s*\(\s*\)\s*->\s*(?:query|insert|update|delete)'
+        r'|\$(?:db|conn|pdo)\s*->\s*(?:query|insertRecord|updateRecord|deleteRecord|'
+        r'insert|update|delete|prepare)'
+        r')\s*\(',
+        re.IGNORECASE,
+    )
+    _INLINE_SQL_PAT = re.compile(
+        r'''['"]([ \t]*(?:SELECT|INSERT|UPDATE|DELETE|REPLACE|CREATE|DROP|ALTER|TRUNCATE)\b[^'"]{4,})['"]''',
+        re.IGNORECASE,
+    )
+    _SAVE_PAT = re.compile(r'\$this\s*->\s*save\s*\(\s*\)', re.IGNORECASE)
+
+    def __init__(self, source: str, filename: str) -> None:
+        self.source   = source
+        self.filename = filename
+
+    def analyse(self) -> dict[str, Any] | None:
+        data_flows: list[dict[str, Any]] = []
+        seen_keys: set[tuple[str, str]] = set()
+
+        for m in self._DB_CALL_PAT.finditer(self.source):
+            # Scan ahead up to 300 chars for an inline SQL string
+            region = self.source[m.start(): m.start() + 300]
+            sql_m  = self._INLINE_SQL_PAT.search(region)
+            if sql_m:
+                sql_frag = sql_m.group(1).strip()[:120]
+                op       = _classify_sql_op(sql_frag)
+                tbl      = _extract_table_name(sql_frag)
+                key      = (op, tbl)
+                if key not in seen_keys:
+                    seen_keys.add(key)
+                    data_flows.append({
+                        "source":    "sugarcrm_db",
+                        "sql":       sql_frag[:80],
+                        "operation": op.upper(),
+                        "table":     tbl,
+                    })
+            else:
+                # No inline string — record the call site without a table name
+                call_snippet = self.source[m.start(): m.end() + 30].strip()[:60]
+                op_key = ("query", "")
+                if op_key not in seen_keys:
+                    seen_keys.add(op_key)
+                    data_flows.append({
+                        "source":    "sugarcrm_db",
+                        "sql":       call_snippet,
+                        "operation": "QUERY",
+                        "table":     "",
+                    })
+
+        # $this->save() → SugarBean ORM INSERT/UPDATE
+        save_count = len(self._SAVE_PAT.findall(self.source))
+        if save_count:
+            bean_table = Path(self.filename).stem.lower()
+            data_flows.append({
+                "source":    "sugarcrm_save",
+                "sql":       f"$this->save() ×{save_count}",
+                "operation": "INSERT/UPDATE",
+                "table":     bean_table,
+            })
+
+        if not data_flows:
+            return None
+
+        happy_path = [
+            (f"DB {df['operation']} on `{df['table']}`" if df["table"]
+             else f"DB {df['operation']}")
+            for df in data_flows[:6]
+        ]
+
+        return {
+            "file":             self.filename,
+            "type":             "sugarcrm_bean",
+            "entry_conditions": [],
+            "branches":         [],
+            "data_flows":       data_flows,
+            "auth_guard":       None,
+            "happy_path":       happy_path,
+        }
 
 
 # ─── Laravel Route File Analyser ──────────────────────────────────────────────
