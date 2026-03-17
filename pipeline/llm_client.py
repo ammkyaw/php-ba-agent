@@ -29,6 +29,14 @@ Environment variables:
                        LM Studio: exact model filename shown in the UI
     LOCAL_LLM_API_KEY  optional bearer token (LM Studio supports this)
                        Ollama does not require an API key
+    LOCAL_LLM_NUM_CTX  Ollama-only: total context window size (input + output
+                       tokens).  When set, the request is sent to Ollama's
+                       native /api/chat endpoint (not /v1/chat/completions)
+                       which is the only path that accepts num_ctx at runtime.
+                       Ollama's default num_ctx is model-dependent and often
+                       small (2048–4096); set this to 16384 or 32768 when you
+                       see truncated output with large batches:
+                         export LOCAL_LLM_NUM_CTX=16384
 
 Default models:
     Claude : claude-sonnet-4-20250514
@@ -279,26 +287,34 @@ def _call_local(
     prefill:       str = "",
 ) -> str:
     """
-    Call a local LLM server via its OpenAI-compatible /v1/chat/completions endpoint.
+    Call a local LLM server.
 
-    Supports any server that implements the OpenAI Chat Completions API:
-      - Ollama       (default port 11434) — https://ollama.com
-      - LM Studio    (default port 1234)  — https://lmstudio.ai
-      - llama.cpp    (default port 8080)  — https://github.com/ggerganov/llama.cpp
-
-    All three expose POST /v1/chat/completions with the same request/response
-    shape as the OpenAI API, so a single implementation covers all of them.
+    Routing:
+      - LOCAL_LLM_NUM_CTX set → Ollama native /api/chat (supports num_ctx)
+      - Otherwise            → OpenAI-compatible /v1/chat/completions
+                               (Ollama, LM Studio, llama.cpp)
 
     No external SDK required — uses only the Python standard library (urllib).
 
     Environment variables consumed:
         LOCAL_LLM_URL      Base URL  (default: http://localhost:11434)
         LOCAL_LLM_MODEL    Model name (required — e.g. "llama3.2")
-        LOCAL_LLM_API_KEY  Bearer token (optional — LM Studio supports this)
+        LOCAL_LLM_API_KEY  Bearer token (optional)
+        LOCAL_LLM_NUM_CTX  Ollama only: total context window tokens; when set,
+                           the native /api/chat endpoint is used so that Ollama
+                           loads the model with this context size at request time.
+                           Recommended: 16384 or 32768 for large batch workloads.
     """
     import json
     import urllib.error
     import urllib.request
+
+    num_ctx = int(os.environ.get("LOCAL_LLM_NUM_CTX", "0") or "0")
+    if num_ctx > 0:
+        return _call_local_ollama_native(
+            system_prompt, user_prompt, max_tokens, temperature,
+            model, num_ctx, prefill,
+        )
 
     base_url = get_local_url()
     endpoint = f"{base_url}/v1/chat/completions"
@@ -402,6 +418,106 @@ def _call_local(
         )
 
     # Restore prefill so the caller sees the complete value
+    return (prefill + content) if prefill else content
+
+
+def _call_local_ollama_native(
+    system_prompt: str,
+    user_prompt:   str,
+    max_tokens:    int,
+    temperature:   float,
+    model:         str,
+    num_ctx:       int,
+    prefill:       str = "",
+) -> str:
+    """
+    Call Ollama via its native /api/chat endpoint.
+
+    The OpenAI-compat /v1/chat/completions endpoint silently ignores num_ctx;
+    the native endpoint accepts it under options.num_ctx and reloads the model
+    context if needed.  This is the only reliable way to override the default
+    context window (often 2048–4096) for large-batch workloads.
+
+    Response shape differs from OpenAI:
+        { "message": { "role": "assistant", "content": "..." },
+          "done": true, "done_reason": "stop" }
+    """
+    import json
+    import urllib.error
+    import urllib.request
+
+    base_url = get_local_url()
+    endpoint = f"{base_url}/api/chat"
+    api_key  = os.environ.get("LOCAL_LLM_API_KEY", "").strip()
+
+    messages_payload: list[dict] = [
+        {"role": "system", "content": system_prompt},
+        {"role": "user",   "content": user_prompt},
+    ]
+    if prefill:
+        messages_payload.append({"role": "assistant", "content": prefill})
+
+    payload = {
+        "model":    model,
+        "messages": messages_payload,
+        "stream":   False,
+        "options": {
+            "num_predict": max_tokens,
+            "num_ctx":     num_ctx,
+            "temperature": temperature,
+        },
+    }
+
+    body    = json.dumps(payload).encode("utf-8")
+    headers = {"Content-Type": "application/json"}
+    if api_key:
+        headers["Authorization"] = f"Bearer {api_key}"
+
+    req = urllib.request.Request(endpoint, data=body, headers=headers, method="POST")
+    try:
+        with urllib.request.urlopen(req, timeout=LOCAL_LLM_TIMEOUT) as resp:
+            raw = resp.read().decode("utf-8")
+    except urllib.error.HTTPError as exc:
+        _handle_local_http_error(exc, base_url, model)
+    except urllib.error.URLError as exc:
+        raise RuntimeError(
+            f"Cannot connect to Ollama at {base_url}.\n"
+            f"Is 'ollama serve' running?\n"
+            f"Original error: {exc.reason}"
+        )
+    except TimeoutError:
+        raise RuntimeError(
+            f"Ollama request timed out after {LOCAL_LLM_TIMEOUT}s."
+        )
+
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(
+            f"Ollama returned non-JSON.\nRaw: {raw[:200]!r}\nError: {exc}"
+        )
+
+    # Native /api/chat response: data["message"]["content"]
+    msg = data.get("message", {})
+    content = (msg.get("content") or "").strip()
+
+    # Strip <think>...</think> from Qwen3 scratchpad
+    import re as _re
+    content = _re.sub(r"<think>.*?</think>", "", content, flags=_re.DOTALL).strip()
+
+    if not content:
+        raise _NonRetryableError(
+            f"Ollama /api/chat returned empty content.\n"
+            f"Full response: {json.dumps(data)[:300]}"
+        )
+
+    done_reason = data.get("done_reason", "")
+    if done_reason == "length":
+        print(
+            f"  Warning: Ollama hit num_predict limit ({max_tokens}) "
+            f"with num_ctx={num_ctx}. Response: {len(content)} chars."
+        )
+
     return (prefill + content) if prefill else content
 
 
