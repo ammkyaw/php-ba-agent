@@ -20,6 +20,7 @@ Stages (in execution order):
     Stage 4.8  triangulate    — Evidence Triangulation (static)
     Stage 4.7  validate       — Behavioral Flow Validation (deterministic)
     Stage 5    brd/srs/ac/us  — parallel BA document agents (LLM)
+    Stage 5.5  traceability   — Automated Traceability Matrix (static)
     Stage 5.9  doccoverage    — Document Coverage Audit (static)
     Stage 6    qa             — QAReviewAgent (LLM)
     Stage 6.2  architecture   — ArchitectureReconstructionAgent (LLM)
@@ -75,6 +76,7 @@ from pipeline.stage46_specrules    import run as stage46
 from pipeline.stage48_triangulate  import run as stage48
 from pipeline.stage47_validate_flows import run as stage47
 from pipeline.stage5_workers       import run as stage5
+from pipeline.stage55_traceability import run as stage55
 from pipeline.stage59_doccoverage  import run as stage59
 from pipeline.stage6_qa            import run as stage6
 from pipeline.stage62_architecture import run as stage62
@@ -110,6 +112,7 @@ STAGES: list[tuple[str, any]] = [
     ("stage5_srs",           None),
     ("stage5_ac",            None),
     ("stage5_userstories",   None),
+    ("stage55_traceability", stage55),  # automated traceability matrix (static)
     ("stage59_doccoverage",  stage59),  # document coverage audit — signals vs documents (static)
     ("stage6_qa",            stage6),
     ("stage62_architecture", stage62),  # architecture reconstruction (feeds stage65 + stage67)

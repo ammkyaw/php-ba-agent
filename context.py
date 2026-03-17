@@ -562,6 +562,55 @@ class TriangulationReport:
 
 
 @dataclass
+class TraceableRequirement:
+    """
+    A single traceable requirement produced by Stage 5.5.
+
+    Forward links  (code → req): populated from spec_rules source catalogs.
+    Backward links (doc  → req): populated from [BR-XXX] citations or keyword overlap.
+    """
+    tr_id:                str        = ""        # e.g. "TR-BR-001"
+    source_type:          str        = ""        # "spec_rule" | "business_flow" | "entity" | "state_machine"
+    source_id:            str        = ""        # original catalog ID (rule_id / flow_id / …)
+    title:                str        = ""
+    category:             str        = ""
+    bounded_context:      str        = ""
+    # Forward links: code artifacts that provide evidence for this requirement
+    code_artifacts:       list       = field(default_factory=list)   # list[dict]
+    # Backward links: sections in generated docs that cite this requirement
+    document_citations:   list       = field(default_factory=list)   # list[dict]
+    covered_in_brd:       bool       = False
+    covered_in_srs:       bool       = False
+    covered_in_ac:        bool       = False
+    covered_in_us:        bool       = False
+    doc_coverage_score:   float      = 0.0       # fraction of docs that cover this req
+    code_link_count:      int        = 0
+    triangulation_status: str        = ""        # "STRONG" | "MODERATE" | "WEAK" | ""
+
+
+@dataclass
+class TraceabilityMeta:
+    """
+    Summary metadata for the Automated Traceability Matrix (Stage 5.5).
+
+    The full matrix lives in traceability_matrix.json; the human report in
+    traceability_report.md.  Downstream stages consume uncited_ids and
+    coverage percentages.
+    """
+    matrix_path:        str        = ""
+    report_path:        str        = ""
+    total_requirements: int        = 0
+    covered_brd:        float      = 0.0   # fraction of reqs cited in BRD
+    covered_srs:        float      = 0.0
+    covered_ac:         float      = 0.0
+    covered_us:         float      = 0.0
+    avg_code_links:     float      = 0.0
+    uncited_count:      int        = 0
+    uncited_ids:        list       = field(default_factory=list)   # list[str]
+    generated_at:       str        = field(default_factory=lambda: datetime.utcnow().isoformat())
+
+
+@dataclass
 class DocCoverageResult:
     """
     Document coverage audit produced by Stage 5.9.
@@ -642,6 +691,9 @@ _STAGE_SUBDIRS: dict[str, str] = {
     "spec_rules.json":             "4.6_specrules",
     # Stage 4.8 — Evidence Triangulation
     "evidence_triangulation.json": "4.8_triangulate",
+    # Stage 5.5 — Automated Traceability Matrix
+    "traceability_matrix.json":    "5.5_traceability",
+    "traceability_report.md":      "5.5_traceability",
     # Stage 3 — Vector Embeddings
     "chromadb":                    "3_embed",
     "chunks_manifest.json":        "3_embed",
@@ -737,6 +789,7 @@ class PipelineContext:
         "stage5_srs":           StageResult(),
         "stage5_ac":            StageResult(),
         "stage5_userstories":   StageResult(),
+        "stage55_traceability": StageResult(),  # automated traceability matrix (static)
         "stage59_doccoverage":  StageResult(),  # document coverage audit (static)
         "stage6_qa":            StageResult(),
         "stage62_architecture": StageResult(),  # architecture reconstruction (LLM)
@@ -765,6 +818,7 @@ class PipelineContext:
     business_flows:    Optional[BusinessFlowCollection] = None
     flow_validation:   Optional[dict]                   = None   # Stage 4.7
     ba_artifacts:      Optional[BAArtifacts]            = None
+    traceability_meta: Optional[TraceabilityMeta]        = None  # Stage 5.5
     doc_coverage:      Optional[DocCoverageResult]      = None  # Stage 5.9
     qa_result:         Optional[QAResult]               = None
     architecture_meta: Optional[ArchitectureMeta]       = None  # Stage 6.2
@@ -1282,6 +1336,22 @@ class PipelineContext:
                 weak_rule_ids       = d.get("weak_rule_ids", []),
                 contradiction_ids   = d.get("contradiction_ids", []),
                 generated_at        = d.get("generated_at", ""),
+            )
+
+        if data.get("traceability_meta") is not None:
+            d = data["traceability_meta"]
+            ctx.traceability_meta = TraceabilityMeta(
+                matrix_path        = d.get("matrix_path", ""),
+                report_path        = d.get("report_path", ""),
+                total_requirements = d.get("total_requirements", 0),
+                covered_brd        = d.get("covered_brd", 0.0),
+                covered_srs        = d.get("covered_srs", 0.0),
+                covered_ac         = d.get("covered_ac", 0.0),
+                covered_us         = d.get("covered_us", 0.0),
+                avg_code_links     = d.get("avg_code_links", 0.0),
+                uncited_count      = d.get("uncited_count", 0),
+                uncited_ids        = d.get("uncited_ids", []),
+                generated_at       = d.get("generated_at", ""),
             )
 
         return ctx
