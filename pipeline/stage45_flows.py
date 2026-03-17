@@ -1084,7 +1084,7 @@ def _traverse_laravel_routes(G, ctx) -> list:
                 "files":          [ctrl_ep.get("file", f"{ctrl_name}.php")],
                 "steps":          steps,
                 "branches":       [],
-                "evidence_files": [ctrl_ep.get("file", "")] if ctrl_ep else [],
+                "evidence_files": [ctrl_ep.get("file", f"{ctrl_name}.php")],
                 "raw_confidence": confidence,
                 "_laravel_meta": {
                     "http_verb": http_verb, "uri": uri,
