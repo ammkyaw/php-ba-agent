@@ -41,6 +41,12 @@ Eight checks
         For every flow, compute what fraction of its steps are backed by
         a real code artifact; grade as HIGH/MEDIUM/LOW.
 
+  V-09  Auth Guard Coverage
+        For every execution path / auth signal whose source file carries an
+        auth_guard in the parsed code, verify at least one covering flow
+        declares auth_required.  Flags auth requirements that the LLM
+        silently dropped when generating business flows.
+
 Output schema
 -------------
   The return value of ``run_validation()`` is a dict::
@@ -128,6 +134,9 @@ _COV_WARN  = 0.25  # coverage WARN threshold (below → FAIL)
 _CONF_PASS = 0.70  # avg confidence PASS
 _CONF_WARN = 0.40  # avg confidence WARN (below → FAIL)
 
+_V09_WARN  = 3    # major unguarded auth files before WARN
+_V09_FAIL  = 7    # > this many → FAIL
+
 # Max items stored in uncovered lists (avoids huge JSON)
 _MAX_LIST  = 50
 
@@ -136,7 +145,7 @@ _MAX_LIST  = 50
 
 def run_validation(ctx: Any) -> dict:
     """
-    Run all 8 behavioral validation checks and return the full report dict.
+    Run all 9 behavioral validation checks and return the full report dict.
 
     Parameters
     ----------
@@ -175,10 +184,12 @@ def run_validation(ctx: Any) -> dict:
     v06 = _check_db_write_coverage(cm, flow_pages, flow_evidence)
     v07 = _check_form_coverage(cm, flow_pages, flow_paths, flow_evidence)
     v08 = _check_flow_confidence(flow_list, known_files, known_routes)
+    v09 = _check_auth_guard_coverage(cm, flow_list, flow_pages, flow_evidence)
 
     checks = {
         "V-01": v01, "V-02": v02, "V-03": v03, "V-04": v04,
         "V-05": v05, "V-06": v06, "V-07": v07, "V-08": v08,
+        "V-09": v09,
     }
 
     # ── Summary ────────────────────────────────────────────────────────────────
@@ -200,7 +211,7 @@ def run_validation(ctx: Any) -> dict:
         scores.append(float(chk.get("pct", 0.0)))
     scores.append(float(v08.get("avg_confidence", 0.0)))
     # Boolean checks: 1.0 if pass, 0.5 if warn, 0.0 if fail
-    for chk in [v01, v02, v03, v04]:
+    for chk in [v01, v02, v03, v04, v09]:
         st = chk.get("status", "pass")
         scores.append(1.0 if st == "pass" else 0.5 if st == "warn" else 0.0)
     overall_score = round(sum(scores) / len(scores), 3) if scores else 0.0
@@ -258,6 +269,7 @@ def format_report_md(report: dict) -> str:
         ("V-06", "Database Write Coverage"),
         ("V-07", "Form Coverage"),
         ("V-08", "Flow Confidence Scoring"),
+        ("V-09", "Auth Guard Coverage"),
     ]
     for cid, cname in chk_meta:
         chk = report["checks"].get(cid, {})
@@ -275,6 +287,8 @@ def format_report_md(report: dict) -> str:
             score_str = f"{chk['broken_count']} broken"
         elif "branch_count" in chk:
             score_str = f"{chk['branch_count']} flows"
+        elif "ungaurded_count" in chk:
+            score_str = f"{chk['ungaurded_count']} unguarded"
         else:
             score_str = "—"
         lines.append(f"| {cid} | {cname} | {icon} | {score_str} |")
@@ -301,6 +315,7 @@ def format_report_md(report: dict) -> str:
     lines += _section_cov("V-07", "Form Coverage",
                           report["checks"].get("V-07", {}), "form", "method", "action")
     lines += _section_v08(report["checks"].get("V-08", {}))
+    lines += _section_v09(report["checks"].get("V-09", {}))
 
     return "\n".join(lines)
 
@@ -1014,6 +1029,137 @@ def _check_flow_confidence(
     }
 
 
+# ─── V-09: Auth Guard Coverage ────────────────────────────────────────────────
+
+def _check_auth_guard_coverage(
+    cm:            Any,
+    flow_list:     list,
+    flow_pages:    set[str],
+    flow_evidence: set[str],
+) -> dict:
+    """
+    V-09: Auth Guard Coverage
+
+    For every execution path that carries an ``auth_guard`` in the parsed
+    source code (stage15), verify that at least one business flow covering
+    that file declares ``auth_required`` (either at the flow level or on
+    any step).
+
+    Unguarded paths indicate the LLM missed the authentication requirement
+    when generating flows — the BA documents will silently omit access
+    control details for those screens.
+
+    Also cross-checks ``code_map.auth_signals`` (session checks, role gates,
+    redirect guards from stage15) for files that appear in flows but whose
+    covering flows are not marked auth-aware.
+    """
+    # Build the set of file basenames covered by auth-aware flows
+    auth_covered_files: set[str] = set()
+    for flow in flow_list:
+        flow_auth = getattr(flow, "auth_required", False)
+        if not flow_auth:
+            flow_auth = any(
+                getattr(step, "auth_required", False)
+                for step in (flow.steps or [])
+            )
+        if flow_auth:
+            for step in (flow.steps or []):
+                page = (step.page or "").split("?")[0].strip()
+                if page:
+                    auth_covered_files.add(Path(page).name.lower())
+            for fpath in (flow.evidence_files or []):
+                if fpath:
+                    auth_covered_files.add(Path(fpath).name.lower())
+
+    items:       list[dict] = []
+    seen_files:  set[str]   = set()
+
+    # ── Pass 1: execution_paths with auth_guard ────────────────────────────────
+    for ep in (getattr(cm, "execution_paths", None) or []):
+        if not ep.get("auth_guard"):
+            continue
+        efile = ep.get("file", "")
+        ename = Path(efile).name.lower() if efile else ""
+        if not ename or ename in seen_files:
+            continue
+        seen_files.add(ename)
+
+        in_any_flow  = ename in flow_pages or ename in flow_evidence
+        in_auth_flow = ename in auth_covered_files
+
+        if not in_auth_flow:
+            auth_guard = ep.get("auth_guard") or {}
+            guard_type = (
+                auth_guard.get("type", "unknown")
+                if isinstance(auth_guard, dict)
+                else str(auth_guard)
+            )
+            severity = "major" if in_any_flow else "minor"
+            reason = (
+                f"File has {guard_type} auth guard in code but "
+                + ("flow covers it without auth_required"
+                   if in_any_flow
+                   else "no flow covers this file")
+            )
+            items.append({
+                "file":       efile,
+                "basename":   ename,
+                "guard_type": guard_type,
+                "in_flow":    in_any_flow,
+                "severity":   severity,
+                "reason":     reason,
+            })
+
+    # ── Pass 2: auth_signals for files already in flows but not auth-covered ───
+    for sig in (getattr(cm, "auth_signals", None) or []):
+        sigfile = sig.get("file", "")
+        signame = Path(sigfile).name.lower() if sigfile else ""
+        if not signame or signame in seen_files:
+            continue
+        seen_files.add(signame)
+
+        in_any_flow  = signame in flow_pages or signame in flow_evidence
+        in_auth_flow = signame in auth_covered_files
+
+        # Only flag files that are in flows (non-flow files are already caught
+        # by Pass 1 via missing-flow checks; reporting them twice is noisy).
+        if in_any_flow and not in_auth_flow:
+            items.append({
+                "file":       sigfile,
+                "basename":   signame,
+                "guard_type": sig.get("type", "auth_signal"),
+                "in_flow":    True,
+                "severity":   "major",
+                "reason":     (f"File has {sig.get('type','auth')} guard in code "
+                               f"but covering flow lacks auth_required"),
+            })
+
+    items = items[:_MAX_LIST]
+    n           = len(items)
+    major_count = sum(1 for i in items if i["severity"] == "major")
+
+    if major_count > _V09_FAIL:
+        status, icon = "fail", "❌"
+    elif major_count > _V09_WARN or n > _V09_FAIL:
+        status, icon = "warn", "⚠️"
+    elif n > 0:
+        status, icon = "warn", "⚠️"
+    else:
+        status, icon = "pass", "✅"
+
+    return {
+        "name":            "Auth Guard Coverage",
+        "status":          status,
+        "icon":            icon,
+        "ungaurded_count": n,
+        "detail":          (
+            "All auth-guarded files are covered by auth-aware flows" if n == 0
+            else f"{n} file(s) have auth guards in code but no auth_required flow"
+        ),
+        "items":           items,
+    }
+
+
 # ─── Markdown section renderers ───────────────────────────────────────────────
 
 def _section_v01(chk: dict) -> list[str]:
@@ -1186,6 +1332,36 @@ def _section_v08(chk: dict) -> list[str]:
             f"| {note} |"
         )
     lines.append("")
+    return lines
+
+
+def _section_v09(chk: dict) -> list[str]:
+    lines = [
+        "## V-09: Auth Guard Coverage",
+        "",
+        f"**Status:** {chk.get('icon','')} {chk.get('status','').upper()}  "
+        f"│  **Unguarded:** {chk.get('ungaurded_count', 0)}",
+        "",
+        f"> {chk.get('detail', '')}",
+        "",
+    ]
+    items = chk.get("items", [])
+    if items:
+        lines += [
+            "| File | Guard Type | In Flow? | Severity | Reason |",
+            "|------|-----------|----------|----------|--------|",
+        ]
+        for it in items:
+            fname     = Path(it.get("file", "")).name or "—"
+            in_flow_s = "✓" if it.get("in_flow") else "✗"
+            lines.append(
+                f"| {fname} "
+                f"| {it.get('guard_type', '')} "
+                f"| {in_flow_s} "
+                f"| {it.get('severity', '')} "
+                f"| {it.get('reason', '')} |"
+            )
+        lines.append("")
     return lines
 
 

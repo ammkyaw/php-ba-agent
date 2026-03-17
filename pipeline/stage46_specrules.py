@@ -606,6 +606,209 @@ def _pass4_from_relationships(ctx: PipelineContext) -> list[dict]:
     return results
 
 
+# ── Pass 5 — Mine auth signals (static) ──────────────────────────────────────
+
+def _pass5_from_auth_signals(ctx: PipelineContext) -> list[dict]:
+    """
+    Mine AUTHORIZATION rules directly from code_map.auth_signals.
+
+    auth_signals are extracted by stage15 from every PHP file that has
+    session checks, redirect guards, or role gates — they are the raw
+    code-level authentication patterns, more granular than what pass3
+    derives from flow steps.
+
+    Produces one AUTHORIZATION rule per unique (type, pattern) pair with
+    the source file attached so traceability links back to exact PHP guards.
+    """
+    cm = getattr(ctx, "code_map", None)
+    if not cm:
+        return []
+    auth_signals = getattr(cm, "auth_signals", None) or []
+    if not auth_signals:
+        return []
+
+    results: list[dict] = []
+    seen_fps: set[str] = set()
+
+    for sig in auth_signals:
+        sig_type    = sig.get("type", "")
+        pattern     = sig.get("pattern", "")
+        detail      = sig.get("detail", "")
+        fpath       = sig.get("file", "")
+        context_key = Path(fpath).stem.replace("_", " ").title() if fpath else "System"
+
+        if not pattern:
+            continue
+
+        # Map signal type to human-readable guard description
+        if sig_type == "session_check":
+            desc  = f"Access to '{context_key}' requires an authenticated session (checks {pattern})"
+            given = f"Given a user attempts to access '{context_key}'"
+            when  = f"When the system checks session variable '{pattern}'"
+            then  = "Then the user must be authenticated; unauthenticated users are redirected"
+            conf  = 0.85
+        elif sig_type == "role_check":
+            desc  = f"Access to '{context_key}' is restricted to role: {detail or pattern}"
+            given = f"Given a user attempts to access '{context_key}'"
+            when  = f"When the system checks the user's role ({pattern})"
+            then  = f"Then only users with role '{detail or pattern}' are permitted"
+            conf  = 0.88
+        elif sig_type == "redirect_guard":
+            desc  = f"'{context_key}' redirects unauthorised users to: {detail or pattern}"
+            given = f"Given an unauthenticated user requests '{context_key}'"
+            when  = f"When the authentication guard evaluates '{pattern}'"
+            then  = f"Then the user is redirected to '{detail or pattern}'"
+            conf  = 0.80
+        else:
+            desc  = f"'{context_key}' enforces auth guard: {pattern}"
+            given = f"Given a user accesses '{context_key}'"
+            when  = f"When the system evaluates guard '{pattern}'"
+            then  = "Then the system enforces the authentication requirement"
+            conf  = 0.72
+
+        fp = _fingerprint("AUTHORIZATION", context_key, desc[:60])
+        if fp in seen_fps:
+            continue
+        seen_fps.add(fp)
+
+        results.append({
+            "category":        "AUTHORIZATION",
+            "title":           f"Auth guard: {context_key[:45]}",
+            "description":     desc,
+            "given":           given,
+            "when":            when,
+            "then":            then,
+            "entities":        [],
+            "bounded_context": context_key,
+            "source_invariants": [],
+            "source_machines":   [],
+            "source_flows":      [],
+            "source_files":      [fpath] if fpath else [],
+            "confidence":        conf,
+            "tags":              ["authorization", sig_type, "auth-guard"],
+            "pass_origin":       "pass5_auth_signal",
+            "_fp": fp,
+        })
+
+    return results
+
+
+# ── Pass 6 — Mine integration rules from service_deps + external systems ──────
+
+def _pass6_from_integrations(ctx: PipelineContext) -> list[dict]:
+    """
+    Mine INTEGRATION rules from:
+      - ctx.semantic_roles.external_systems  (detected external services)
+      - code_map.service_deps                (class-level dependency graph)
+
+    Produces one INTEGRATION rule per detected external system describing
+    the integration contract — previously these were completely ignored by
+    stage46, leaving the BRD/SRS without any integration-boundary rules.
+    """
+    results: list[dict] = []
+    seen_fps: set[str] = set()
+
+    # ── External systems from semantic_roles ──────────────────────────────────
+    sr = getattr(ctx, "semantic_roles", None)
+    ext_systems = (sr.external_systems if sr else []) or []
+
+    _CATEGORY_DESC: dict[str, str] = {
+        "PAYMENT":    "payment processing",
+        "EMAIL":      "email delivery",
+        "STORAGE":    "file/object storage",
+        "SMS_PUSH":   "SMS / push notifications",
+        "AUTH_OAUTH": "OAuth / SSO authentication",
+        "MONITORING": "monitoring / observability",
+        "CRM":        "CRM / customer data",
+        "ERP":        "ERP / enterprise data",
+        "INFRA":      "infrastructure (cache / queue / search)",
+    }
+
+    for ext in ext_systems:
+        name     = ext.name or "External Service"
+        cat      = ext.category or "INTEGRATION"
+        cat_desc = _CATEGORY_DESC.get(cat, "external service integration")
+        env_note = (f"; configured via {', '.join(ext.env_keys[:3])}"
+                    if ext.env_keys else "")
+        class_note = (f" (class: {', '.join(ext.class_hints[:2])})"
+                      if ext.class_hints else "")
+
+        desc  = (f"The system integrates with {name} for {cat_desc}"
+                 f"{env_note}{class_note}")
+        given = f"Given the system needs to perform a {cat_desc} operation"
+        when  = f"When the integration with {name} is invoked"
+        then  = (f"Then the system must have valid {name} credentials configured"
+                 f"{env_note} and handle integration failures gracefully")
+
+        fp = _fingerprint("INTEGRATION", name, desc[:60])
+        if fp in seen_fps:
+            continue
+        seen_fps.add(fp)
+
+        results.append({
+            "category":        "INTEGRATION",
+            "title":           f"{name} integration ({cat})",
+            "description":     desc,
+            "given":           given,
+            "when":            when,
+            "then":            then,
+            "entities":        [],
+            "bounded_context": name,
+            "source_invariants": [],
+            "source_machines":   [],
+            "source_flows":      [],
+            "source_files":      [],
+            "confidence":        0.82,
+            "tags":              ["integration", cat.lower(), name.lower()],
+            "pass_origin":       "pass6_integration",
+            "_fp": fp,
+        })
+
+    return results
+
+
+# ── Behavior-graph confidence boost ──────────────────────────────────────────
+
+def _boost_by_behavior_graph(
+    rules_raw: list[dict],
+    behavior_graph: dict | None,
+) -> list[dict]:
+    """
+    After dedup, boost rule confidence for rules whose source_files appear
+    in high-confidence behavior_graph paths.
+
+    A rule backed by high-confidence route→controller→SQL paths has stronger
+    code evidence than one derived from a single low-confidence path.  Boost
+    capped at +0.08 so no rule exceeds 0.97.
+    """
+    if not behavior_graph:
+        return rules_raw
+
+    # Build file-name → max path confidence index
+    _file_conf: dict[str, float] = {}
+    for bp in (behavior_graph.get("paths") or []):
+        _conf = bp.get("confidence", 0.0)
+        for _rf in (bp.get("reachable_files") or []):
+            _fname = Path(_rf).name.lower()
+            if _conf > _file_conf.get(_fname, 0.0):
+                _file_conf[_fname] = _conf
+
+    if not _file_conf:
+        return rules_raw
+
+    for rule in rules_raw:
+        src_fnames = {Path(f).name.lower() for f in (rule.get("source_files") or [])}
+        if not src_fnames:
+            continue
+        max_bg_conf = max((_file_conf.get(fn, 0.0) for fn in src_fnames), default=0.0)
+        if max_bg_conf >= 0.75:
+            rule["confidence"] = min(rule["confidence"] + 0.08, 0.97)
+        elif max_bg_conf >= 0.50:
+            rule["confidence"] = min(rule["confidence"] + 0.04, 0.97)
+
+    return rules_raw
+
+
 # ── Deduplication & collection building ──────────────────────────────────────
 
 def _dedup(all_raw: list[dict]) -> list[dict]:
@@ -761,9 +964,29 @@ def run(ctx: PipelineContext) -> None:
     raw_p4 = _pass4_from_relationships(ctx)
     print(f"  [stage46] Pass 4 complete — {len(raw_p4)} rule(s) from relationships.")
 
+    # ── Pass 5: Auth signals (static) ─────────────────────────────────────
+    # Mine AUTHORIZATION rules from raw code_map.auth_signals — the actual
+    # session checks, redirect guards, and role gates extracted by stage15.
+    # Previously ignored; surfaces grounded auth rules that pass3 may miss.
+    raw_p5 = _pass5_from_auth_signals(ctx)
+    print(f"  [stage46] Pass 5 complete — {len(raw_p5)} rule(s) from auth signals.")
+
+    # ── Pass 6: External integrations (static) ────────────────────────────
+    # Mine INTEGRATION rules from external systems detected by stage27 and
+    # class-level service dependencies from stage1.
+    raw_p6 = _pass6_from_integrations(ctx)
+    print(f"  [stage46] Pass 6 complete — {len(raw_p6)} rule(s) from integrations.")
+
     # ── Deduplication ──────────────────────────────────────────────────────
-    all_raw = _dedup(raw_p1 + raw_p2 + raw_p3 + raw_p4)
+    all_raw = _dedup(raw_p1 + raw_p2 + raw_p3 + raw_p4 + raw_p5 + raw_p6)
     print(f"  [stage46] After deduplication — {len(all_raw)} unique rule(s).")
+
+    # ── Behavior-graph confidence boost ───────────────────────────────────
+    # Rules whose source_files appear in high-confidence behavior_graph paths
+    # get a small confidence boost (≤ +0.08) — stronger code backing = higher
+    # rule trust.  ctx.behavior_graph was previously ignored entirely here.
+    all_raw = _boost_by_behavior_graph(all_raw, getattr(ctx, "behavior_graph", None))
+    print(f"  [stage46] Behavior-graph confidence boost applied.")
 
     # ── Build collection ───────────────────────────────────────────────────
     collection = _build_collection(all_raw)

@@ -296,16 +296,34 @@ def run(ctx: PipelineContext) -> None:
 
     # ── Persist matrix JSON ───────────────────────────────────────────────────
     matrix_path = ctx.output_path(MATRIX_FILE)
-    matrix_data = {
+    matrix_data: dict = {
         "meta":         dataclasses.asdict(meta),
         "requirements": [dataclasses.asdict(r) for r in requirements],
     }
+
+    # ── Append domain-model coverage stats (from stage4 gap-fill) ────────────
+    # domain_coverage tracks how many execution paths / tables / pages the
+    # domain model actually covers after LLM extraction + gap-fill.  Surfacing
+    # it here lets the traceability matrix flag unmapped code artifacts alongside
+    # uncited requirements, giving QA engineers a single place to look.
+    domain_cov = getattr(ctx, "domain_coverage", None) or {}
+    if domain_cov:
+        matrix_data["domain_coverage"] = {
+            "exec_coverage":    domain_cov.get("exec_coverage",  None),
+            "page_coverage":    domain_cov.get("page_coverage",  None),
+            "table_coverage":   domain_cov.get("table_coverage", None),
+            "field_coverage":   domain_cov.get("field_coverage", None),
+            "exec_uncovered":   domain_cov.get("exec_uncovered",   [])[:50],
+            "tables_uncovered": domain_cov.get("tables_uncovered", [])[:50],
+            "pages_uncovered":  domain_cov.get("pages_uncovered",  [])[:50],
+        }
+
     with open(matrix_path, "w", encoding="utf-8") as f:
         json.dump(matrix_data, f, indent=2)
 
     # ── Persist Markdown report ───────────────────────────────────────────────
     report_path = ctx.output_path(REPORT_FILE)
-    _write_report(report_path, requirements, meta)
+    _write_report(report_path, requirements, meta, domain_cov=domain_cov)
 
     # ── Attach to context ─────────────────────────────────────────────────────
     meta.matrix_path = matrix_path
@@ -321,6 +339,13 @@ def run(ctx: PipelineContext) -> None:
     if uncited_ids:
         print(f"           ⚠ Uncited: {', '.join(uncited_ids[:10])}"
               + (" …" if len(uncited_ids) > 10 else ""))
+    if domain_cov:
+        def _pct(v: object) -> str:
+            return f"{v:.0%}" if isinstance(v, float) else "?"
+        print(f"           domain coverage — "
+              f"exec: {_pct(domain_cov.get('exec_coverage'))}  "
+              f"tables: {_pct(domain_cov.get('table_coverage'))}  "
+              f"pages: {_pct(domain_cov.get('page_coverage'))}")
 
     ctx.save()
     stage.mark_completed(output_path=matrix_path)
@@ -430,6 +455,7 @@ def _write_report(
     report_path: str,
     requirements: list[TraceableRequirement],
     meta: TraceabilityMeta,
+    domain_cov: dict | None = None,
 ) -> None:
     """Write the human-readable Markdown traceability report."""
     lines: list[str] = []
@@ -449,6 +475,54 @@ def _write_report(
     lines.append(f"| Avg code links     | {meta.avg_code_links:.1f} |")
     lines.append(f"| Uncited count      | {meta.uncited_count} |")
     lines.append("")
+
+    # ── Domain-model coverage (from stage4 gap-fill) ────────────────────────
+    if domain_cov:
+        lines.append("## Domain-Model Coverage (Stage 4)\n")
+        lines.append("_How much of the parsed codebase is reflected in the domain model._\n")
+        lines.append(f"| Metric | Coverage | Uncovered count |")
+        lines.append(f"|--------|----------|-----------------|")
+        ec = domain_cov.get("exec_coverage")
+        pc = domain_cov.get("page_coverage")
+        tc = domain_cov.get("table_coverage")
+        fc = domain_cov.get("field_coverage")
+        eu = len(domain_cov.get("exec_uncovered",   []))
+        pu = len(domain_cov.get("pages_uncovered",  []))
+        tu = len(domain_cov.get("tables_uncovered", []))
+        if ec is not None:
+            lines.append(f"| Execution paths | {ec:.1%} | {eu} |")
+        if pc is not None:
+            lines.append(f"| HTML pages      | {pc:.1%} | {pu} |")
+        if tc is not None:
+            lines.append(f"| DB tables       | {tc:.1%} | {tu} |")
+        if fc is not None:
+            lines.append(f"| POST fields     | {fc:.1%} | — |")
+        lines.append("")
+
+        # List uncovered exec-paths (most actionable for gap-fill follow-up)
+        exec_unc = domain_cov.get("exec_uncovered", [])
+        if exec_unc:
+            lines.append("### Unmapped Execution Paths\n")
+            lines.append(
+                "_These controller/handler files have no corresponding domain feature._\n"
+            )
+            for fname in exec_unc[:30]:
+                lines.append(f"- `{fname}`")
+            if len(exec_unc) > 30:
+                lines.append(f"- _… {len(exec_unc) - 30} more not shown_")
+            lines.append("")
+
+        tables_unc = domain_cov.get("tables_uncovered", [])
+        if tables_unc:
+            lines.append("### Unmapped DB Tables\n")
+            lines.append(
+                "_These tables appear in SQL queries but are not referenced in any feature._\n"
+            )
+            for tname in tables_unc[:30]:
+                lines.append(f"- `{tname}`")
+            if len(tables_unc) > 30:
+                lines.append(f"- _… {len(tables_unc) - 30} more not shown_")
+            lines.append("")
 
     # ── Full matrix table ───────────────────────────────────────────────────
     lines.append("## Full Traceability Matrix\n")
