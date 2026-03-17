@@ -10,6 +10,7 @@ Stages (in execution order):
     Stage 2.7  semanticroles — semantic role tagging (action type + external systems)
     Stage 3    embed          — vector index (ChromaDB)
     Stage 3.5  preflight      — context pre-flight checks
+    Stage 3.7  graphrag       — graph-aware context index (static)
     Stage 4.1  entities       — Entity Extraction (static)
     Stage 4.2  relationships  — Entity Relationship Reconstruction (static)
     Stage 4    domain         — DomainAnalystAgent (LLM)
@@ -63,6 +64,7 @@ from pipeline.stage28_clusters     import run as stage28
 from pipeline.stage29_invariants   import run as stage29
 from pipeline.stage3_embed         import run as stage3
 from pipeline.stage35_preflight    import run as stage35
+from pipeline.stage37_graphrag     import run as stage37
 from pipeline.stage41_entities      import run as stage41
 from pipeline.stage42_relationships import run as stage42
 from pipeline.stage4_domain        import run as stage4
@@ -93,6 +95,7 @@ STAGES: list[tuple[str, any]] = [
     ("stage29_invariants",   stage29),  # business rule extraction (feeds stage3 chunks + stage4 grounding)
     ("stage3_embed",         stage3),
     ("stage35_preflight",    stage35),
+    ("stage37_graphrag",     stage37),  # graph-aware context index (feeds stage4 + stage45 + stage5 retrieval)
     ("stage41_entities",     stage41),  # entity extraction (feeds stage42 + stage4 grounding)
     ("stage42_relationships", stage42), # relationship reconstruction (feeds stage4 + stage67 ER diagram)
     ("stage4_domain",        stage4),

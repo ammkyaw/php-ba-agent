@@ -543,6 +543,22 @@ class DocCoverageResult:
 
 
 @dataclass
+class GraphRAGMeta:
+    """
+    Metadata for the Graph-Aware Context Index produced by Stage 3.7.
+
+    The full index lives in graph_context_index.json; this dataclass carries
+    only the path and node counts.  Downstream stages call ctx.graph_query()
+    which lazily loads and caches the index from index_path.
+    """
+    index_path:    str = ""
+    file_count:    int = 0
+    entity_count:  int = 0
+    cluster_count: int = 0
+    generated_at:  str = field(default_factory=lambda: datetime.utcnow().isoformat())
+
+
+@dataclass
 class ArchitectureMeta:
     """
     Lightweight summary of the architecture reconstruction produced by Stage 6.2.
@@ -594,6 +610,8 @@ _STAGE_SUBDIRS: dict[str, str] = {
     "chunks_manifest.json":        "3_embed",
     # Stage 3.5 — Preflight
     "preflight_report.json":       "3.5_preflight",
+    # Stage 3.7 — Graph-Aware Context Index
+    "graph_context_index.json":    "3.7_graphrag",
     # Stage 4 — Domain Model
     "domain_model.json":           "4_domain",
     "coverage_report.json":        "4_domain",
@@ -669,6 +687,7 @@ class PipelineContext:
         "stage29_invariants":   StageResult(),   # business rule / invariant detection
         "stage3_embed":         StageResult(),
         "stage35_preflight":    StageResult(),
+        "stage37_graphrag":     StageResult(),  # graph-aware context index (static)
         "stage41_entities":     StageResult(),  # entity extraction (static)
         "stage42_relationships": StageResult(), # entity relationship reconstruction (static)
         "stage4_domain":        StageResult(),
@@ -702,6 +721,7 @@ class PipelineContext:
     spec_rules:        Optional[SpecRuleCollection]        = None  # Stage 4.6
     embedding_meta:    Optional[EmbeddingMeta]          = None
     preflight:         Optional[PreflightResult]        = None
+    graph_rag_meta:    Optional[GraphRAGMeta]           = None  # Stage 3.7
     domain_model:      Optional[DomainModel]            = None
     business_flows:    Optional[BusinessFlowCollection] = None
     flow_validation:   Optional[dict]                   = None   # Stage 4.7
@@ -750,6 +770,25 @@ class PipelineContext:
 
     def is_stage_done(self, name: str) -> bool:
         return self.stage(name).status == StageStatus.COMPLETED
+
+    def graph_query(self, topic: str, depth: int = 2, max_chars: int = 3000) -> str:
+        """
+        Graph-aware context retrieval using the Stage 3.7 index.
+
+        Returns a structured Markdown context block suitable for LLM prompt
+        injection.  Empty string if the index was not built or the topic has no
+        matching nodes.
+
+        The index JSON is loaded lazily on the first call and cached on a
+        transient ``_graph_rag_cache`` attribute (not serialised to context.json).
+        """
+        if not self.graph_rag_meta or not self.graph_rag_meta.index_path:
+            return ""
+        # Late import to avoid circular dependency (stage37 imports from context).
+        from pipeline.stage37_graphrag import load_index, query_graph  # noqa: PLC0415
+        if not hasattr(self, "_graph_rag_cache"):
+            self._graph_rag_cache = load_index(self.graph_rag_meta.index_path)
+        return query_graph(self._graph_rag_cache, topic, depth=depth, max_chars=max_chars)
 
     def output_path(self, filename: str) -> str:
         stage_subdir = _STAGE_SUBDIRS.get(filename)
@@ -1166,6 +1205,16 @@ class PipelineContext:
                 edge_count       = d.get("edge_count", 0),
                 node_types       = d.get("node_types", []),
                 edge_type_counts = d.get("edge_type_counts", {}),
+            )
+
+        if data.get("graph_rag_meta") is not None:
+            d = data["graph_rag_meta"]
+            ctx.graph_rag_meta = GraphRAGMeta(
+                index_path    = d.get("index_path", ""),
+                file_count    = d.get("file_count", 0),
+                entity_count  = d.get("entity_count", 0),
+                cluster_count = d.get("cluster_count", 0),
+                generated_at  = d.get("generated_at", ""),
             )
 
         return ctx
