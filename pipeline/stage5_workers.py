@@ -266,6 +266,7 @@ Business Rules:
 {rule_lines}
 {_format_spec_rules_for_prompt(ctx)}
 {_format_plain_english_rules(ctx)}
+{_format_background_flows(ctx)}
 
 CRITICAL: Section 5 MUST use EXACTLY these {n_features} subsection headings in order.
 Do NOT rename, merge, skip, or reorder them. Fill in the Priority and Acceptance fields.
@@ -777,6 +778,89 @@ def _format_plain_english_rules(ctx: PipelineContext, max_rules: int = 40) -> st
         lines.append(f"\n[{cat}]")
         for r in rs:
             lines.append(f"  • {r.plain_english}")
+    return "\n".join(lines)
+
+
+def _format_background_flows(ctx: PipelineContext, max_flows: int = 15) -> str:
+    """
+    Return a structured block describing non-HTTP entry points (cron jobs, CLI
+    commands, webhooks, queue workers) for injection into the BRD writer prompt.
+
+    These flows are invisible to user-journey analysis but represent real system
+    behaviour that belongs in the BRD's Background Processing / Integration
+    Requirements sections.
+
+    Sources (in priority order):
+      1. BusinessFlows with flow_type != "http" (Stage 4.5 tagged from Stage 1.3)
+      2. EntryPointCatalog directly (Stage 1.3, for types not yet in any flow)
+
+    Returns empty string when no non-HTTP entry points are found.
+    """
+    # Collect typed flows from Stage 4.5
+    bfc = getattr(ctx, "business_flows", None)
+    bg_flows = [
+        f for f in (bfc.flows if bfc else [])
+        if getattr(f, "flow_type", "http") != "http"
+    ]
+
+    # Collect raw entry points from Stage 1.3 NOT already represented by a flow
+    ep_cat  = getattr(ctx, "entry_point_catalog", None)
+    flow_files: set[str] = set()
+    for f in bg_flows:
+        for ev in f.evidence_files:
+            flow_files.add(ev)
+
+    raw_eps = []
+    if ep_cat:
+        for ep in ep_cat.entry_points:
+            if ep.ep_type != "http" and ep.handler_file not in flow_files:
+                raw_eps.append(ep)
+
+    if not bg_flows and not raw_eps:
+        return ""
+
+    _TYPE_LABELS = {
+        "scheduled":    "Scheduled / Cron",
+        "cli":          "CLI / Admin Command",
+        "webhook":      "Webhook Receiver",
+        "queue_worker": "Queue Worker",
+    }
+
+    lines = [
+        "\n=== BACKGROUND OPERATIONS (Stage 1.3 + Stage 4.5) ===",
+        "The system has the following non-HTTP entry points. Include them in:",
+        "  • BRD Section 3 (Scope) — list each as an 'In Scope' integration",
+        "  • BRD Section 5 (Business Requirements) — add a sub-section per type",
+        "  • BRD Section 8 (Assumptions) — note scheduling and queue infrastructure",
+    ]
+
+    # Group: typed flows first
+    if bg_flows:
+        lines.append("\n[Flows with non-HTTP triggers]")
+        for f in bg_flows[:max_flows]:
+            label = _TYPE_LABELS.get(f.flow_type, f.flow_type.replace("_", " ").title())
+            lines.append(
+                f"  [{label}] {f.name}"
+                f"  | trigger: {f.trigger}"
+            )
+            if getattr(f, "schedule", None) or (
+                hasattr(ctx, "entry_point_catalog") and ctx.entry_point_catalog
+            ):
+                # Try to find schedule from catalog
+                for ep in (ep_cat.entry_points if ep_cat else []):
+                    if any(ep.handler_file in ev for ev in f.evidence_files) and ep.schedule:
+                        lines.append(f"    schedule: {ep.schedule}")
+                        break
+            lines.append(f"    termination: {f.termination}")
+
+    # Raw entry points not covered by any flow
+    if raw_eps:
+        lines.append("\n[Additional entry points (no flow extracted yet)]")
+        for ep in raw_eps[:max(0, max_flows - len(bg_flows))]:
+            label = _TYPE_LABELS.get(ep.ep_type, ep.ep_type)
+            sched = f"  | schedule: {ep.schedule}" if ep.schedule else ""
+            lines.append(f"  [{label}] {ep.name}  | {ep.trigger}{sched}")
+
     return "\n".join(lines)
 
 

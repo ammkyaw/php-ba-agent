@@ -4,6 +4,7 @@ run_pipeline.py — PHP-BA Agent Pipeline Entry Point
 Stages (in execution order):
     Stage 0    validate       — input validation
     Stage 1    parse          — PHP parsing (tree-sitter)
+    Stage 1.3  entrypoints    — system entry-point catalog (cron/CLI/webhook/queue, static)
     Stage 1.5  paths          — execution-path / branch extraction
     Stage 2    graph          — knowledge graph (NetworkX)
     Stage 2.5  behavior       — behavior graph extraction (Route→Ctrl→Service→SQL→Redirect)
@@ -58,6 +59,7 @@ from context import PipelineContext, StageStatus
 # Stage imports (each is a self-contained module)
 from pipeline.stage0_validate      import run as stage0
 from pipeline.stage1_parse         import run as stage1
+from pipeline.stage13_entrypoints  import run as stage13
 from pipeline.stage15_paths        import run as stage15
 from pipeline.stage2_graph         import run as stage2
 from pipeline.stage25_behavior     import run as stage25
@@ -91,6 +93,7 @@ from pipeline.stage9_knowledge_graph import run as stage9
 STAGES: list[tuple[str, any]] = [
     ("stage0_validate",      stage0),
     ("stage1_parse",         stage1),
+    ("stage13_entrypoints",  stage13),  # entry-point catalog: cron/cli/webhook/queue (feeds stage15 + stage45 + stage5)
     ("stage15_paths",        stage15),  # execution-path extraction (feeds stage45 + stage5)
     ("stage2_graph",         stage2),
     ("stage25_behavior",     stage25),  # behavior graph extraction (feeds stage45 + stage6)

@@ -218,6 +218,7 @@ class BusinessFlow:
     termination:       str                   # Success end-state description
     evidence_files:    list[str]             # Source PHP files that back this flow
     confidence:        float = 1.0           # 0.0-1.0
+    flow_type:         str   = "http"        # "http"|"scheduled"|"cli"|"webhook"|"queue_worker"
     replaces_workflow: Optional[str] = None  # domain_model.workflow it supersedes
 
 
@@ -228,6 +229,45 @@ class BusinessFlowCollection:
     total:        int                  = 0
     by_context:   dict[str, list[str]] = field(default_factory=dict)
     by_actor:     dict[str, list[str]] = field(default_factory=dict)
+    generated_at: str                  = field(default_factory=lambda: datetime.utcnow().isoformat())
+
+
+@dataclass
+class EntryPoint:
+    """
+    One non-HTTP system entry point discovered by Stage 1.3.
+
+    Types
+    -----
+    http         — Standard browser-facing page; also covers webhook receivers
+                   that arrive via HTTP POST from an external system
+    scheduled    — Cron job or scheduled console command
+    cli          — Admin / maintenance CLI script (artisan command, bin/*.php)
+    webhook      — Incoming HTTP callback from an external system (Stripe, etc.)
+    queue_worker — Async queue / message-queue job handler
+    """
+    ep_id:        str   = ""       # e.g. "ep_001"
+    ep_type:      str   = "http"   # "http"|"scheduled"|"cli"|"webhook"|"queue_worker"
+    handler_file: str   = ""       # path relative to php_project_path
+    name:         str   = ""       # human-readable, e.g. "Send Nightly Digest"
+    schedule:     str   = ""       # cron expression or "" (non-scheduled types)
+    trigger:      str   = ""       # e.g. "POST /webhook/stripe" | "php artisan cmd:name"
+    confidence:   float = 0.8      # 1.0=config-backed, 0.8=pattern, 0.6=heuristic
+
+
+@dataclass
+class EntryPointCatalog:
+    """
+    Complete catalog of all system entry points produced by Stage 1.3.
+
+    Consumed by:
+      Stage 1.5  — seeds execution-path analysis from non-HTTP handlers
+      Stage 4.5  — tags BusinessFlow.flow_type from source file → entry point type
+      Stage 5    — injects background operation descriptions into BRD
+    """
+    entry_points: list[EntryPoint]     = field(default_factory=list)
+    by_type:      dict[str, list[str]] = field(default_factory=dict)   # ep_type → [ep_id]
+    total:        int                  = 0
     generated_at: str                  = field(default_factory=lambda: datetime.utcnow().isoformat())
 
 
@@ -688,6 +728,8 @@ _STAGE_SUBDIRS: dict[str, str] = {
     "validation_report.json":      "0_validation",
     # Stage 1 — PHP Parsing
     "code_map.json":               "1_parse",
+    # Stage 1.3 — Entry-Point Catalog
+    "entry_point_catalog.json":    "1.3_entrypoints",
     # Stage 1.5 — Execution Paths
     "execution_paths.json":        "1.5_paths",
     "execution_paths_errors.json": "1.5_paths",
@@ -791,6 +833,7 @@ class PipelineContext:
     stages: dict[str, StageResult] = field(default_factory=lambda: {
         "stage0_validate":        StageResult(),
         "stage1_parse":           StageResult(),
+        "stage13_entrypoints":    StageResult(),  # system entry-point catalog (static)
         "stage15_paths":          StageResult(),
         "stage2_graph":           StageResult(),
         "stage25_behavior":       StageResult(),  # behavior graph extraction
@@ -823,8 +866,9 @@ class PipelineContext:
         "stage9_knowledge_graph": StageResult(),  # system knowledge graph builder
     })
 
-    code_map:          Optional[CodeMap]                = None
-    graph_meta:        Optional[GraphMeta]              = None
+    code_map:              Optional[CodeMap]             = None
+    entry_point_catalog:   Optional[EntryPointCatalog]  = None  # Stage 1.3
+    graph_meta:            Optional[GraphMeta]           = None
     behavior_graph:    Optional[dict]                   = None   # Stage 2.5
     semantic_roles:    Optional[SemanticRoleIndex]       = None  # Stage 2.7
     action_clusters:   Optional[ActionClusterCollection] = None  # Stage 2.8
@@ -1045,6 +1089,7 @@ class PipelineContext:
                     termination       = f.get("termination", ""),
                     evidence_files    = f.get("evidence_files", []),
                     confidence        = f.get("confidence", 1.0),
+                    flow_type         = f.get("flow_type", "http"),
                     replaces_workflow = f.get("replaces_workflow"),
                 )
                 for f in d.get("flows", [])
@@ -1054,6 +1099,26 @@ class PipelineContext:
                 total        = d.get("total", len(flows)),
                 by_context   = d.get("by_context", {}),
                 by_actor     = d.get("by_actor", {}),
+                generated_at = d.get("generated_at", ""),
+            )
+
+        if data.get("entry_point_catalog") is not None:
+            d = data["entry_point_catalog"]
+            ctx.entry_point_catalog = EntryPointCatalog(
+                entry_points = [
+                    EntryPoint(
+                        ep_id        = ep.get("ep_id", ""),
+                        ep_type      = ep.get("ep_type", "http"),
+                        handler_file = ep.get("handler_file", ""),
+                        name         = ep.get("name", ""),
+                        schedule     = ep.get("schedule", ""),
+                        trigger      = ep.get("trigger", ""),
+                        confidence   = ep.get("confidence", 0.8),
+                    )
+                    for ep in d.get("entry_points", [])
+                ],
+                by_type      = d.get("by_type", {}),
+                total        = d.get("total", 0),
                 generated_at = d.get("generated_at", ""),
             )
 

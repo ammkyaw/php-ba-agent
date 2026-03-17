@@ -718,6 +718,9 @@ def run(ctx: PipelineContext) -> None:
         else:
             _dir_empty_rounds = 0
 
+    # ── Tag flow_type from Stage 1.3 entry-point catalog ─────────────────────
+    _tag_flow_types(flows, ctx)
+
     print("  [stage45] Pass I: Updating domain_model.workflows ...")
     collection = _build_collection(flows)
     _patch_domain_workflows(ctx, flows)
@@ -742,6 +745,51 @@ def run(ctx: PipelineContext) -> None:
 
 
 # ─── Prerequisites ─────────────────────────────────────────────────────────────
+
+def _tag_flow_types(flows: list[BusinessFlow], ctx: PipelineContext) -> None:
+    """
+    Assign flow_type to each BusinessFlow based on the Stage 1.3 entry-point catalog.
+
+    For each flow, inspect its evidence_files.  If any evidence file matches an
+    entry point in the catalog with a non-http ep_type, tag the flow with that
+    type.  When multiple types are found, prefer the most specific:
+      queue_worker > scheduled > cli > webhook > http
+
+    No-op if ctx.entry_point_catalog is not populated (Stage 1.3 not run).
+    """
+    if not ctx.entry_point_catalog or not ctx.entry_point_catalog.entry_points:
+        return
+
+    _PRIORITY = {"queue_worker": 4, "scheduled": 3, "cli": 2, "webhook": 1, "http": 0}
+
+    # Build a set of {basename → ep_type} for fast lookup
+    ep_by_name: dict[str, str] = {}
+    ep_by_rel:  dict[str, str] = {}
+    for ep in ctx.entry_point_catalog.entry_points:
+        ep_by_name[Path(ep.handler_file).name] = ep.ep_type
+        ep_by_rel[ep.handler_file] = ep.ep_type
+
+    tagged = 0
+    for flow in flows:
+        best_type = "http"
+        best_pri  = 0
+        for ev_file in flow.evidence_files:
+            rel  = Path(ev_file).as_posix()
+            name = Path(ev_file).name
+            ep_type = ep_by_rel.get(rel) or ep_by_name.get(name)
+            if ep_type:
+                pri = _PRIORITY.get(ep_type, 0)
+                if pri > best_pri:
+                    best_type = ep_type
+                    best_pri  = pri
+        if best_type != "http":
+            flow.flow_type = best_type
+            tagged += 1
+
+    if tagged:
+        print(f"  [stage45] Tagged {tagged} flow(s) with non-HTTP flow_type "
+              f"from Stage 1.3 entry-point catalog.")
+
 
 def _assert_prerequisites(ctx: PipelineContext) -> None:
     """Raise RuntimeError if required upstream outputs are missing."""
@@ -806,13 +854,38 @@ def _write_gherkin_stubs(flows: list[BusinessFlow], ctx: PipelineContext) -> Non
             trigger   = (flow.trigger   or "the user starts").strip().rstrip(".")
             term      = (flow.termination or "the operation completes").strip().rstrip(".")
             actor     = (flow.actor or "the user").strip()
+            flow_type = getattr(flow, "flow_type", "http")
 
-            # Happy-path scenario
-            lines += [
-                f"  # {flow.flow_id}: {flow.name}",
-                f"  Scenario: {flow.name}",
-                f"    Given {actor} initiates {trigger.lower()}",
-            ]
+            # flow_type → Gherkin tag + Given phrasing
+            _TYPE_TAG: dict[str, str] = {
+                "scheduled":    "@scheduled",
+                "cli":          "@cli",
+                "webhook":      "@webhook",
+                "queue_worker": "@queue",
+            }
+            _TYPE_GIVEN: dict[str, str] = {
+                "scheduled":    f"the system clock reaches the scheduled trigger for",
+                "cli":          f"an operator runs the CLI command for",
+                "webhook":      f"an external system posts a webhook to",
+                "queue_worker": f"a queue message is dispatched for",
+            }
+            flow_tag   = _TYPE_TAG.get(flow_type, "")
+            given_pfx  = _TYPE_GIVEN.get(flow_type, f"{actor} initiates")
+
+            # Build Given line
+            if flow_type in _TYPE_GIVEN:
+                given_line = f"    Given {given_pfx} {flow.name.lower()}"
+            else:
+                given_line = f"    Given {actor} initiates {trigger.lower()}"
+
+            # Happy-path scenario (with optional type tag)
+            scenario_lines = [f"  # {flow.flow_id}: {flow.name}"]
+            if flow_tag:
+                scenario_lines.append(f"  {flow_tag}")
+            scenario_lines.append(f"  Scenario: {flow.name}")
+            scenario_lines.append(given_line)
+
+            lines += scenario_lines
             for step in flow.steps:
                 if not step.is_branch:
                     action = (step.action or "").strip().rstrip(".")
@@ -832,11 +905,15 @@ def _write_gherkin_stubs(flows: list[BusinessFlow], ctx: PipelineContext) -> Non
                 branch_type  = branch.get("type", "alternative")
                 branch_steps = branch.get("steps", [])
 
-                lines += [
+                branch_lines = []
+                if flow_tag:
+                    branch_lines.append(f"  {flow_tag}")
+                branch_lines += [
                     f"  @{branch_type}",
                     f"  Scenario: {flow.name} — {branch_desc}",
-                    f"    Given {actor} initiates {trigger.lower()}",
+                    given_line,
                 ]
+                lines += branch_lines
                 if branch_steps:
                     for bs in branch_steps[:4]:
                         bs_action = (bs.get("action") or bs.get("page") or "").strip().rstrip(".")
