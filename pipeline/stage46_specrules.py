@@ -52,10 +52,12 @@ from context import PipelineContext, SpecRule, SpecRuleCollection
 
 # ── Tunables ──────────────────────────────────────────────────────────────────
 MIN_INVARIANT_CONF   = 0.60   # minimum Stage 2.9 confidence to promote
-LLM_BATCH_SIZE       = 25     # rules per LLM call (token budget)
+LLM_BATCH_SIZE       = 15     # rules per LLM call (token budget)
+                               # 25 → consistent truncation at item 24 (model output
+                               # limit hit); 15 × ~280 chars/rule ≈ 4 200 chars —
+                               # comfortably under any local-model output budget.
+                               # Auto-split still catches edge-case overruns.
 LLM_MAX_TOKENS       = 8192   # response budget per batch
-                               # 25 rules × ~250 chars of GWT each ≈ 6 000+ chars;
-                               # 4096 tokens was too tight and triggered truncation
 MERGE_CONF_THRESHOLD = 0.65   # minimum confidence to keep in final collection
 
 # ── Static GWT templates for Pass 1 fallback ─────────────────────────────────
@@ -196,17 +198,18 @@ def _extract_json_array(raw: str) -> list | None:
     candidate = clean if clean.startswith("[") else raw
     if candidate.startswith("["):
         # 4a. Last object IS complete but closing "]" is missing — just append it.
-        #     Handles single-item sub-batches: '[{...}' → '[{...}]'
+        #     The model generated all items correctly but omitted the final "]".
+        #     Zero data loss — no warning needed.
         try:
             parsed = json.loads(candidate.rstrip() + "]")
             if isinstance(parsed, list) and _is_rule_list(parsed):
-                print(f"  [stage46]   ⚠️  Truncated response — recovered {len(parsed)} item(s).")
                 return parsed
         except json.JSONDecodeError:
             pass
 
-        # 4b. Array cut mid-object — drop the last incomplete element and close.
+        # 4b. Array cut mid-object — the last element is incomplete; drop it.
         #     Handles: '[{...}, {...}, {...'  →  '[{...}, {...}]'
+        #     Real truncation: one item is lost and retried via auto-split.
         brace_open = candidate.rfind("{")
         if brace_open > 0:
             truncated = candidate[:brace_open].rstrip().rstrip(",") + "]"
@@ -278,9 +281,6 @@ def _llm_formalize_batch(candidates: list[dict], batch_num: int) -> list[dict]:
         if not raw or not raw.strip():
             print(f"  [stage46] ⚠️  LLM batch {batch_num} returned empty response; using static fallback.")
         else:
-            # Diagnostic: confirm prefill took effect ('[' = yes)
-            first_char = raw.strip()[0]
-            print(f"  [stage46]   Response starts with {first_char!r}, length={len(raw)} chars")
             parsed = _extract_json_array(raw)
             if parsed is not None:
                 # Check for truncation: find candidate IDs not in the LLM output
