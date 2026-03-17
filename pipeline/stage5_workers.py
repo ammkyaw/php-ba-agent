@@ -1,5 +1,5 @@
 """
-pipeline/stage5_workers.py — Parallel BA Document Generation
+pipeline/stage5_workers.py — Stage 5.0 Critic-Augmented BA Document Generation
 
 Runs four LLM agents concurrently using asyncio, each producing one
 BA artefact from the shared DomainModel built in Stage 4.
@@ -11,6 +11,17 @@ Agents
     ACAgent         Acceptance Criteria             → ac.md
     UserStoryAgent  User Stories (Gherkin-style)    → user_stories.md
 
+Critic loop (Stage 5.0 enhancement)
+------------------------------------
+After each writer produces a draft, stage5_critic.run_critic_loop() is called:
+    Turn 1  → writer draft
+    Critic  → structured JSON: score + uncovered rules + hallucinated entities
+    Turn 2  → refiner makes targeted edits (only if score < CRITIC_THRESHOLD)
+              (at most 1 extra LLM call per document; 0 extra if draft passes)
+CriticPass results are stored in ctx.ba_artifacts.critic_passes for Stage 6.
+
+Set STAGE5_SKIP_CRITIC=1 in environment to disable the critic loop (fast mode).
+
 Execution model
 ---------------
 All four agents run concurrently via asyncio.gather(). Each agent:
@@ -18,12 +29,9 @@ All four agents run concurrently via asyncio.gather(). Each agent:
     2. Builds a document-specific system prompt
     3. Assembles a user prompt from ctx.domain_model
     4. Calls llm_client.call_llm() in a thread pool (blocking SDK → async)
-    5. Writes the Markdown output to the run directory
-    6. Marks its stage as COMPLETED in ctx
-
-The Gemini free tier allows 15 RPM. With 4 concurrent calls each taking
-~5-10s, we stay well within limits. llm_client already adds a 4s delay
-per call, so worst-case 4 × 4s = 16s of rate-limit padding.
+    5. Runs the Critic loop on the draft (optional, see above)
+    6. Writes the final Markdown output to the run directory
+    7. Marks its stage as COMPLETED in ctx
 
 Resume behaviour
 ----------------
@@ -41,6 +49,7 @@ Output files
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 import os
 from pathlib import Path
 from typing import Callable
@@ -49,6 +58,18 @@ from context import BAArtifacts, DomainModel, PipelineContext
 
 # ── Token budget ───────────────────────────────────────────────────────────────
 MAX_TOKENS = 8192
+
+# ── Critic loop feature flag ───────────────────────────────────────────────────
+# Set STAGE5_SKIP_CRITIC=1 to disable the critic loop (e.g. for fast local runs)
+_CRITIC_ENABLED = os.environ.get("STAGE5_SKIP_CRITIC", "0").strip() != "1"
+
+# Doc-type key mapping: stage_name → critic doc_type string
+_STAGE_TO_DOC_TYPE = {
+    "stage5_brd":         "brd",
+    "stage5_srs":         "srs",
+    "stage5_ac":          "ac",
+    "stage5_userstories": "us",
+}
 
 
 # ─── Public Entry Point ────────────────────────────────────────────────────────
@@ -146,6 +167,23 @@ async def _run_agent(
     # (especially when the response is long). Unescape before writing.
     if "\\n" in content and content.count("\n") < 10:
         content = content.replace("\\n", "\n").replace("\\t", "\t")
+
+    # ── Critic loop (Stage 5.0) ────────────────────────────────────────────
+    if _CRITIC_ENABLED:
+        doc_type = _STAGE_TO_DOC_TYPE.get(stage_name)
+        if doc_type:
+            from pipeline.stage5_critic import run_critic_loop
+            content, passes = await loop.run_in_executor(
+                None,
+                lambda: run_critic_loop(doc_type, content, ctx)
+            )
+            # Persist CriticPass results on ctx for Stage 6 consumption
+            if ctx.ba_artifacts is None:
+                ctx.ba_artifacts = BAArtifacts()
+            ctx.ba_artifacts.critic_passes[doc_type] = [
+                dataclasses.asdict(p) for p in passes
+            ]
+
     Path(output_path).write_text(content, encoding="utf-8")
     print(f"  [stage5] {stage_name} → {Path(output_path).name} "
           f"({len(content):,} chars)")
@@ -265,7 +303,7 @@ Numbered list of all rules from the features above.
 ## 9. Glossary
 Markdown table: Term | Definition"""
 
-    return call_llm(system, user, max_tokens=MAX_TOKENS, label="stage5_brd")
+    return call_llm(_append_traceability_hints(system), user, max_tokens=MAX_TOKENS, label="stage5_brd")
 
 
 # ─── SRS Agent ────────────────────────────────────────────────────────────────
@@ -360,7 +398,7 @@ Describe each table, its purpose, and key fields inferred from the codebase.
 ## 6. System Constraints
 Technical and business constraints on the implementation."""
 
-    return call_llm(system, user, max_tokens=MAX_TOKENS, label="stage5_srs")
+    return call_llm(_append_traceability_hints(system), user, max_tokens=MAX_TOKENS, label="stage5_srs")
 
 
 # ─── AC Agent ─────────────────────────────────────────────────────────────────
@@ -444,7 +482,7 @@ Brief description of how acceptance testing should be approached for this system
 ## Test Data Requirements
 What test data is needed to execute these criteria."""
 
-    return call_llm(system, user, max_tokens=MAX_TOKENS, label="stage5_ac")
+    return call_llm(_append_traceability_hints(system), user, max_tokens=MAX_TOKENS, label="stage5_ac")
 
 
 # ─── User Story Agent ──────────────────────────────────────────────────────────
@@ -538,7 +576,7 @@ Status for all stories should be "To Do"
 ## Total Story Points
 Sum by priority band."""
 
-    return call_llm(system, user, max_tokens=MAX_TOKENS, label="stage5_userstories")
+    return call_llm(_append_traceability_hints(system), user, max_tokens=MAX_TOKENS, label="stage5_userstories")
 
 
 # ─── Helpers ───────────────────────────────────────────────────────────────────
@@ -697,6 +735,18 @@ def _format_execution_paths_for_prompt(ctx: PipelineContext) -> str:
                     lines.append(f"      ✗ {e}")
 
     return "\n".join(lines)
+
+
+def _append_traceability_hints(system_prompt: str) -> str:
+    """
+    Append [BR-XXX] citation instructions to a Stage 5 system prompt.
+
+    When Stage 5.5 Traceability is enabled the writer is instructed to embed
+    rule citations so that Pass B backward-linking can achieve exact matches
+    instead of falling back to keyword guessing.
+    """
+    from pipeline.stage55_traceability import traceability_hints
+    return system_prompt + "\n\n" + traceability_hints()
 
 
 def _to_str_list(items: list) -> list[str]:
