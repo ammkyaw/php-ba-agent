@@ -65,13 +65,18 @@ def run(ctx: PipelineContext) -> None:
     flows = (ctx.business_flows.flows if ctx.business_flows else [])
     cm    = ctx.code_map
 
+    # ctx.domain_coverage is set by stage4 after gap-fill (previously discarded).
+    # It carries exec-path / page / table / field coverage from the domain model
+    # extraction phase — used here to enrich the Coverage Gaps section.
+    domain_cov = getattr(ctx, "domain_coverage", None) or {}
+
     # ── Derive report data ────────────────────────────────────────────────────
     score        = _composite_score(v47, cov)
     checks       = _extract_checks(v47)
     doc_dims     = _extract_doc_dims(cov)
     module_rows  = _build_module_matrix(cm, flows, v47)
     flow_cards   = _build_flow_cards(flows, trace)
-    gaps         = _build_gaps(v47, cov)
+    gaps         = _build_gaps(v47, cov, domain_cov)
     risks        = _build_risks(v47)
 
     stats = {
@@ -350,8 +355,9 @@ def _build_flow_cards(flows: list, trace: dict) -> list[dict]:
     return cards
 
 
-def _build_gaps(v47: dict, cov: dict) -> dict:
-    """Collect all gap lists from V-05/V-06/V-07 and doc coverage dimensions."""
+def _build_gaps(v47: dict, cov: dict, domain_cov: dict | None = None) -> dict:
+    """Collect all gap lists from V-05/V-06/V-07, doc coverage dimensions,
+    and the domain-model exec-path / table / field coverage report."""
     checks = v47.get("checks", {})
 
     uncov_routes = checks.get("V-05", {}).get("uncovered") or []
@@ -368,11 +374,30 @@ def _build_gaps(v47: dict, cov: dict) -> dict:
                 "name": name,
             })
 
+    # Domain-model coverage gaps — pages / tables / fields the domain model
+    # did not map to any feature (from ctx.domain_coverage set by stage4).
+    # Previously this data was computed and then discarded; now surfaces here.
+    uncov_pages  = (domain_cov or {}).get("pages_uncovered", []) if domain_cov else []
+    uncov_tables = (domain_cov or {}).get("tables_uncovered", []) if domain_cov else []
+    uncov_fields = (domain_cov or {}).get("fields_uncovered", []) if domain_cov else []
+    domain_cov_summary = {}
+    if domain_cov:
+        domain_cov_summary = {
+            "exec_coverage":  domain_cov.get("exec_coverage", 0.0),
+            "page_coverage":  domain_cov.get("page_coverage", 0.0),
+            "table_coverage": domain_cov.get("table_coverage", 0.0),
+            "field_coverage": domain_cov.get("field_coverage", 0.0),
+        }
+
     return {
-        "routes": uncov_routes,
-        "writes": uncov_writes,
-        "forms":  uncov_forms,
-        "docs":   doc_gaps,
+        "routes":       uncov_routes,
+        "writes":       uncov_writes,
+        "forms":        uncov_forms,
+        "docs":         doc_gaps,
+        "pages":        uncov_pages,
+        "tables":       uncov_tables,
+        "fields":       uncov_fields,
+        "domain_stats": domain_cov_summary,
     }
 
 
@@ -610,6 +635,42 @@ def _render_gaps(gaps: dict) -> str:
             f'<div class="doc-gaps">{grp_html}</div>'
         )
 
+    # Domain-model coverage gaps (from ctx.domain_coverage — stage4 final pass)
+    # Surfaces exec-paths, tables, and POST fields not mapped to any feature.
+    ds = gaps.get("domain_stats", {})
+    if ds:
+        stat_html = (
+            f'<div class="dom-cov-stats">'
+            f'<span title="Exec-path coverage">Exec-paths: <strong>{ds.get("exec_coverage",0):.0%}</strong></span> &nbsp;|&nbsp; '
+            f'<span title="HTML page coverage">Pages: <strong>{ds.get("page_coverage",0):.0%}</strong></span> &nbsp;|&nbsp; '
+            f'<span title="Table coverage">Tables: <strong>{ds.get("table_coverage",0):.0%}</strong></span> &nbsp;|&nbsp; '
+            f'<span title="POST field coverage">Fields: <strong>{ds.get("field_coverage",0):.0%}</strong></span>'
+            f'</div>'
+        )
+        uncov_pages  = gaps.get("pages", [])
+        uncov_tables = gaps.get("tables", [])
+        uncov_fields = gaps.get("fields", [])
+        detail_html = ""
+        if uncov_pages:
+            tags = " ".join(f'<span class="ev-tag warn">{_e(p)}</span>' for p in uncov_pages[:30])
+            more = f" <em>+{len(uncov_pages)-30} more</em>" if len(uncov_pages) > 30 else ""
+            detail_html += f'<p><strong>Uncovered exec-paths / pages:</strong> {tags}{more}</p>'
+        if uncov_tables:
+            tags = " ".join(f'<span class="ev-tag warn">{_e(t)}</span>' for t in uncov_tables[:30])
+            more = f" <em>+{len(uncov_tables)-30} more</em>" if len(uncov_tables) > 30 else ""
+            detail_html += f'<p><strong>Uncovered tables:</strong> {tags}{more}</p>'
+        if uncov_fields:
+            tags = " ".join(f'<span class="ev-tag warn">{_e(f)}</span>' for f in uncov_fields[:30])
+            more = f" <em>+{len(uncov_fields)-30} more</em>" if len(uncov_fields) > 30 else ""
+            detail_html += f'<p><strong>Uncovered POST fields:</strong> {tags}{more}</p>'
+        if stat_html or detail_html:
+            sections.append(
+                f'<h3>📊 Domain-model coverage after gap-fill</h3>'
+                f'<p class="hint">Coverage of codebase artefacts by the domain model '
+                f'features generated in Stage 4 (post gap-fill pass).</p>'
+                f'{stat_html}{detail_html}'
+            )
+
     if not sections:
         return '<p class="empty pass-txt">✅ No coverage gaps detected.</p>'
     return "\n".join(sections)
@@ -696,7 +757,8 @@ def _render_html(
 
     total_gaps = (
         len(gaps["routes"]) + len(gaps["writes"]) +
-        len(gaps["forms"]) + len(gaps["docs"])
+        len(gaps["forms"]) + len(gaps["docs"]) +
+        len(gaps.get("pages", [])) + len(gaps.get("tables", []))
     )
     total_risks = (
         len(risks["hallucinated"]) + len(risks["broken"]) + len(risks["low_conf"])

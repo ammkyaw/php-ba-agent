@@ -203,8 +203,10 @@ def run(ctx: PipelineContext) -> None:
     )
 
     # ── Post-gap-fill coverage (shows improvement vs initial report) ───────────
+    # Store result on ctx so stage58/stage59 can reference final coverage data
+    # without re-running the computation.  Also writes coverage_report.json.
     print(f"  [stage4] Coverage after gap-fill:")
-    _compute_coverage(ctx, domain_model, debug_dir)
+    ctx.domain_coverage = _compute_coverage(ctx, domain_model, debug_dir)
 
     # ── Save ──────────────────────────────────────────────────────────────────
     _save_domain_model(domain_model, output_path)
@@ -768,6 +770,58 @@ def _build_user_prompt(ctx: PipelineContext, chunks: list[dict]) -> str:
         for prefix in sorted(by_prefix):
             parts.append(f"  {prefix}_*: {', '.join(sorted(set(by_prefix[prefix])))}")
 
+    # ── Semantic actor roles (stage27) ───────────────────────────────────────
+    # Pre-computed actor/role tags from SemanticRoleIndex — gives the LLM
+    # grounded user-role names instead of having to guess from file names.
+    # Also exposes detected external integrations (Stripe, email, S3, …).
+    sr = getattr(ctx, "semantic_roles", None)
+    if sr:
+        biz_actions = [t for t in (sr.actions or [])
+                       if t.role == "BUSINESS_ACTION" and t.confidence >= 0.70]
+        if biz_actions:
+            parts.append(f"\n=== SEMANTIC ACTOR ROLES — STAGE 2.7 ===")
+            parts.append(
+                "These actors were pre-computed from route/controller semantic analysis. "
+                "Use them to name user roles in bounded_contexts accurately."
+            )
+            from collections import defaultdict as _dd27
+            _by_actor: dict = _dd27(list)
+            for _t in biz_actions:
+                _actor = _t.actor or "User"
+                _by_actor[_actor].append(_t.symbol)
+            for _actor, _syms in sorted(_by_actor.items()):
+                parts.append(f"  Actor '{_actor}': {', '.join(_syms[:6])}"
+                             + (" …" if len(_syms) > 6 else ""))
+        if sr.external_systems:
+            parts.append(f"\n=== EXTERNAL SYSTEM INTEGRATIONS — STAGE 2.7 ===")
+            parts.append(
+                "These external systems were detected from env-var keys, class names, "
+                "and service dependencies. Document their integration contracts."
+            )
+            for _ext in sr.external_systems:
+                _env = f"  env_keys=[{', '.join(_ext.env_keys[:3])}]" if _ext.env_keys else ""
+                parts.append(f"  {_ext.name} [{_ext.category}]{_env}")
+
+    # ── DB schema / migrations (stage1) ──────────────────────────────────────
+    # Migration history gives schema-evolution context: which tables were
+    # created/altered and with what columns — useful for entity lifecycle.
+    db_schema = getattr(cm, "db_schema", None) or []
+    if db_schema:
+        parts.append(f"\n=== DB SCHEMA / MIGRATIONS ({len(db_schema)} migration(s)) ===")
+        parts.append("Use for entity lifecycle, column-level data model, and schema evolution.")
+        _seen_mig: set = set()
+        for _mig in db_schema[:30]:
+            _op    = _mig.get("operation", "?")
+            _tbl   = _mig.get("table", "?")
+            _cols  = [c.get("name") or c if isinstance(c, str) else str(c)
+                      for c in (_mig.get("columns") or [])[:8]]
+            _key   = f"{_op}:{_tbl}"
+            if _key in _seen_mig:
+                continue
+            _seen_mig.add(_key)
+            _col_str = f"  cols=[{', '.join(_cols)}]" if _cols else ""
+            parts.append(f"  {_op} {_tbl}{_col_str}")
+
     # ── Auth signals ──────────────────────────────────────────────────────────
     auth_signals = getattr(cm, "auth_signals", None) or []
     if auth_signals:
@@ -1009,6 +1063,34 @@ def _build_user_prompt(ctx: PipelineContext, chunks: list[dict]) -> str:
             )
             if sm.dead_states:
                 parts.append(f"    (dead/unreachable: {', '.join(sm.dead_states)})")
+
+    # ── GraphRAG semantic context ─────────────────────────────────────────────
+    # ctx.graph_query() uses the community-graph-aware index built by stage38.
+    # Inject it so the LLM can validate entity relationships and cross-module
+    # operations that are not obvious from directory structure alone.
+    # Previously computed but never used in LLM prompts — wiring it here
+    # prevents the stage38 computation from being wasted.
+    if hasattr(ctx, "graph_query"):
+        _grag_topics = [
+            "user roles permissions authentication",
+            "business features workflows operations",
+        ]
+        _grag_hits: list[str] = []
+        for _topic in _grag_topics:
+            try:
+                _gc = ctx.graph_query(_topic)
+            except Exception:
+                _gc = None
+            if _gc and _gc.strip():
+                _grag_hits.append(_gc.strip())
+        if _grag_hits:
+            parts.append(f"\n=== GRAPH-AWARE SEMANTIC CONTEXT ===")
+            parts.append(
+                "The following was retrieved via graph-community-aware semantic search "
+                "(GraphRAG). Use it to validate entity relationships and identify "
+                "cross-module business operations not apparent from file structure alone."
+            )
+            parts.extend(_grag_hits)
 
     # ── Retrieved semantic chunks ─────────────────────────────────────────────
     parts.append(f"\n=== SEMANTIC CONTEXT ({len(chunks)} chunks) ===")

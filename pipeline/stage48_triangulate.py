@@ -279,6 +279,32 @@ def run(ctx: PipelineContext) -> None:
     )
     ctx.triangulation = report
 
+    # ── Re-weight spec_rule confidence based on triangulation status ──────────
+    # ctx.spec_rules was built by stage46 using only static heuristics.
+    # Now that we have multi-source evidence triangulation scores, update
+    # each rule's confidence so downstream stages (stage5, stage55, stage58)
+    # see accurate trustworthiness signals:
+    #   STRONG     → +0.05 (well-corroborated by multiple evidence streams)
+    #   MODERATE   → no change
+    #   WEAK       → −0.10 (scant code backing — flag as uncertain)
+    #   (contradicted rules already noted in contradiction_notes)
+    if ctx.spec_rules and ctx.spec_rules.rules:
+        _tri_by_id: dict[str, str] = {
+            r.rule_id: r.triangulation_status for r in triangulated
+        }
+        _adjusted = 0
+        for _sr in ctx.spec_rules.rules:
+            _status = _tri_by_id.get(_sr.rule_id, "")
+            if _status == "STRONG":
+                _sr.confidence = min(_sr.confidence + 0.05, 0.97)
+                _adjusted += 1
+            elif _status == "WEAK":
+                _sr.confidence = max(_sr.confidence - 0.10, 0.10)
+                _adjusted += 1
+        if _adjusted:
+            print(f"  [stage48] Re-weighted {_adjusted} spec_rule confidence(s) "
+                  f"from triangulation status.")
+
     # ── Persist ────────────────────────────────────────────────────────────────
     out_path = ctx.output_path(INDEX_FILE)
     with open(out_path, "w", encoding="utf-8") as f:

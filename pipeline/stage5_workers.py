@@ -226,7 +226,7 @@ When an Evidence block is provided under a feature, use those routes/SQL/fields 
 specific, grounded acceptance criteria and descriptions — not generic placeholders.
 Output ONLY the document — no preamble, no commentary after.
 
-Framework context: {hints.brd_note}"""
+Framework context: {hints.brd_note}{_preflight_system_note(ctx)}"""
 
     # Build explicit feature list for the BRD prompt so none get skipped
     all_feature_names = ", ".join(f['name'] for f in domain.features)
@@ -305,6 +305,24 @@ Numbered list of all rules from the features above.
 ## 9. Glossary
 Markdown table: Term | Definition"""
 
+    # ── GraphRAG semantic context ─────────────────────────────────────────────
+    # Inject graph-community-aware retrieval so the BRD is grounded in
+    # cross-module entity relationships not visible from the domain model alone.
+    if hasattr(ctx, "graph_query"):
+        try:
+            _gc_brd = ctx.graph_query(
+                "user roles business requirements workflows features"
+            )
+        except Exception:
+            _gc_brd = None
+        if _gc_brd and _gc_brd.strip():
+            user = (
+                user
+                + "\n\nGRAPH-AWARE SEMANTIC CONTEXT "
+                + "(use to validate stakeholder roles and feature descriptions):\n"
+                + _gc_brd.strip()
+            )
+
     return call_llm(_append_traceability_hints(system), user, max_tokens=MAX_TOKENS, label="stage5_brd")
 
 
@@ -326,7 +344,7 @@ When an Evidence block is provided under a feature, derive concrete Input/Proces
 values from it rather than using placeholders — reference actual route paths, table names, and
 form field names. Output clean Markdown only.
 
-{hints.srs_note}"""
+{hints.srs_note}{_preflight_system_note(ctx)}"""
 
     all_feature_names = ", ".join(f['name'] for f in domain.features)
     n_features = len(domain.features)
@@ -399,6 +417,50 @@ Describe each table, its purpose, and key fields inferred from the codebase.
 
 ## 6. System Constraints
 Technical and business constraints on the implementation."""
+
+    # ── GraphRAG semantic context ─────────────────────────────────────────────
+    # Cross-module functional/interface facts from the stage38 graph index.
+    if hasattr(ctx, "graph_query"):
+        try:
+            _gc_srs = ctx.graph_query(
+                "functional requirements system interface deployment"
+            )
+        except Exception:
+            _gc_srs = None
+        if _gc_srs and _gc_srs.strip():
+            user = (
+                user
+                + "\n\nGRAPH-AWARE SEMANTIC CONTEXT "
+                + "(use for sections 3 and 5 — functional and interface requirements):\n"
+                + _gc_srs.strip()
+            )
+
+    # ── Environment variables → Section 2.3 / Section 6 ─────────────────────
+    # env_vars carry deployment/config facts (DB host, mail server, API keys,
+    # feature flags) that belong in SRS Section 2.3 (Operating Environment)
+    # and Section 6 (System Constraints).  Previously ignored by stage5.
+    if ctx.code_map:
+        _env_vars = getattr(ctx.code_map, "env_vars", None) or []
+        if _env_vars:
+            from collections import defaultdict as _dd
+            _by_prefix: dict = _dd(list)
+            for ev in _env_vars:
+                key    = ev.get("key", "?")
+                prefix = key.split("_")[0] if "_" in key else "OTHER"
+                default = ev.get("default")
+                entry  = key if default is None else f"{key}={default!r}"
+                _by_prefix[prefix].append(entry)
+            env_lines = "\n".join(
+                f"  {pfx}_*: {', '.join(sorted(set(vs)))}"
+                for pfx, vs in sorted(_by_prefix.items())
+            )
+            user = (
+                user
+                + "\n\nENVIRONMENT VARIABLES "
+                + "(use for Section 2.3 Operating Environment and Section 6 System "
+                + "Constraints — describe each group's purpose and deployment impact):\n"
+                + env_lines
+            )
 
     return call_llm(_append_traceability_hints(system), user, max_tokens=MAX_TOKENS, label="stage5_srs")
 
@@ -862,6 +924,63 @@ def _format_background_flows(ctx: PipelineContext, max_flows: int = 15) -> str:
             lines.append(f"  [{label}] {ep.name}  | {ep.trigger}{sched}")
 
     return "\n".join(lines)
+
+
+def _preflight_system_note(ctx: PipelineContext) -> str:
+    """
+    Build a short system-prompt addendum from ctx.preflight warnings and
+    signal flags.  Previously ctx.preflight was consumed only for quality_score;
+    the richer warning/signal data was completely ignored by BA agents.
+
+    Returns an empty string if no preflight data or no actionable signals.
+
+    The note is injected into system prompts so the LLM knows up-front which
+    document sections will have thin evidence and how to handle them gracefully
+    (e.g. "no SQL found → data-model section will be sparse, use route evidence").
+    """
+    pf = getattr(ctx, "preflight", None)
+    if not pf:
+        return ""
+
+    notes: list[str] = []
+    signals: dict = getattr(pf, "signals", {}) or {}
+    warnings: list[str] = getattr(pf, "warnings", []) or []
+
+    # Signal-driven structural hints
+    if not signals.get("has_sql"):
+        notes.append(
+            "⚠ No SQL queries detected — the data model section will be sparse. "
+            "Infer entity structure from route names, form fields, and execution paths."
+        )
+    if not signals.get("has_forms"):
+        notes.append(
+            "⚠ No HTML forms detected — input/processing descriptions must be derived "
+            "from route parameters and execution path entry conditions."
+        )
+    if not signals.get("has_auth"):
+        notes.append(
+            "⚠ No authentication guards detected — omit auth-related acceptance criteria "
+            "or mark them as 'not applicable' rather than inventing session logic."
+        )
+    if not signals.get("has_graph"):
+        notes.append(
+            "⚠ Knowledge graph is absent — cross-module dependency reasoning will be limited."
+        )
+
+    # Surfaced preflight warnings (max 3 to keep prompt lean)
+    for w in warnings[:3]:
+        if w not in notes:
+            notes.append(f"ℹ {w}")
+
+    if not notes:
+        return ""
+
+    return (
+        "\n\nCODEBASE SIGNAL WARNINGS (from static pre-flight analysis):\n"
+        + "\n".join(f"  {n}" for n in notes)
+        + "\n\nWrite around these gaps — do not fabricate evidence for sections "
+        + "where signals are absent."
+    )
 
 
 def _append_traceability_hints(system_prompt: str) -> str:

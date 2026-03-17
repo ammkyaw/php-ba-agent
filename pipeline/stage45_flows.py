@@ -443,6 +443,7 @@ def _build_gap_fill_skeletons(
     uncovered_modules: dict[str, list[str]],
     exec_paths: list[dict],
     max_modules: int = GAP_FILL_MAX_MODULES_45,
+    call_graph: list[dict] | None = None,
 ) -> list[dict]:
     """
     Build synthetic flow skeletons directly from execution_paths data for
@@ -451,10 +452,27 @@ def _build_gap_fill_skeletons(
     Each skeleton represents the files in one module and carries whatever
     db_ops / auth / inputs data stage1.5 extracted — enough for LLM enrichment
     (Pass G-H) to produce a named BusinessFlow.
+
+    If call_graph is supplied (ctx.code_map.call_graph), the step action
+    descriptions are enriched with the first few callee function names from
+    that file, giving the LLM richer context for accurate flow naming.
     """
     ep_by_file: dict[str, dict] = {
         ep["file"]: ep for ep in exec_paths if ep.get("file")
     }
+
+    # Build call_graph index: file path → list of callee function names.
+    # Used to produce more descriptive step actions ("Process X via fn1, fn2")
+    # instead of generic "Process X" stubs.
+    _callees_by_file: dict[str, list[str]] = {}
+    if call_graph:
+        for _edge in call_graph:
+            _fpath  = _edge.get("file", "")
+            _callee = _edge.get("callee", "")
+            if _fpath and _callee:
+                if _fpath not in _callees_by_file:
+                    _callees_by_file[_fpath] = []
+                _callees_by_file[_fpath].append(_callee)
 
     skeletons: list[dict] = []
 
@@ -484,10 +502,20 @@ def _build_gap_fill_skeletons(
                 if ec.get("type") == "method_check":
                     http_method = ec.get("method")
 
+            # Enrich action description with callee function hints when available
+            _base_action = Path(fpath).stem.replace('_', ' ').title()
+            _callees = _callees_by_file.get(fpath, [])
+            if _callees:
+                # Deduplicate and take first 3 unique callee names as hints
+                _unique_callees = list(dict.fromkeys(_callees))[:3]
+                _action = f"Process {_base_action} via {', '.join(_unique_callees)}"
+            else:
+                _action = f"Process {_base_action}"
+
             steps.append(FlowStep(
                 step_num     = step_num,
                 page         = page,
-                action       = f"Process {Path(fpath).stem.replace('_', ' ').title()}",
+                action       = _action,
                 http_method  = http_method,
                 auth_required= auth_req,
                 db_ops       = db_ops[:3],
@@ -590,7 +618,7 @@ def run(ctx: PipelineContext) -> None:
     context_groups = _group_by_context(flow_skeletons, ctx)
 
     print(f"  [stage45] Pass F.5: Flow pattern mining ...")
-    patterns_found = _classify_patterns(flow_skeletons)
+    patterns_found = _classify_patterns(flow_skeletons, behavior_graph=ctx.behavior_graph)
     pattern_counts: dict[str, int] = {}
     for p in patterns_found:
         if p:
@@ -645,7 +673,8 @@ def run(ctx: PipelineContext) -> None:
             break
 
         gap_skeletons = _build_gap_fill_skeletons(
-            fresh_uncovered, exec_paths_list, max_modules=GAP_FILL_MAX_MODULES_45
+            fresh_uncovered, exec_paths_list, max_modules=GAP_FILL_MAX_MODULES_45,
+            call_graph=getattr(ctx.code_map, "call_graph", None),
         )
         if not gap_skeletons:
             break
@@ -661,7 +690,7 @@ def run(ctx: PipelineContext) -> None:
         )
 
         gap_context_groups = _group_by_context(gap_skeletons, ctx)
-        _classify_patterns(gap_skeletons)
+        _classify_patterns(gap_skeletons, behavior_graph=ctx.behavior_graph)
         gap_flows = _enrich_with_llm(gap_skeletons, gap_context_groups, ctx)
 
         # Merge new flows in (deduplicate by name)
@@ -708,7 +737,8 @@ def run(ctx: PipelineContext) -> None:
 
         # Re-use module skeleton builder — each "module" key is a dir path here
         gap_skeletons = _build_gap_fill_skeletons(
-            batch_dirs, exec_paths_list, max_modules=GAP_FILL_MAX_MODULES_45
+            batch_dirs, exec_paths_list, max_modules=GAP_FILL_MAX_MODULES_45,
+            call_graph=getattr(ctx.code_map, "call_graph", None),
         )
         if not gap_skeletons:
             break
@@ -718,7 +748,7 @@ def run(ctx: PipelineContext) -> None:
             f"{len(gap_skeletons)} skeleton(s) for {len(fresh_dirs)} uncovered dir(s)"
         )
         gap_context_groups = _group_by_context(gap_skeletons, ctx)
-        _classify_patterns(gap_skeletons)
+        _classify_patterns(gap_skeletons, behavior_graph=ctx.behavior_graph)
         gap_flows = _enrich_with_llm(gap_skeletons, gap_context_groups, ctx)
 
         existing_names_lower = {f.name.lower() for f in flows}
@@ -1917,6 +1947,7 @@ def _group_by_context(
 
 def _classify_patterns(
     skeletons: list[dict[str, Any]],
+    behavior_graph: dict | None = None,
 ) -> list[str | None]:
     """
     Pass F.5 — Algorithmic pattern mining.  No LLM required.
@@ -1927,6 +1958,12 @@ def _classify_patterns(
 
     The result is attached to each skeleton as skeleton["pattern"] and is
     passed to the LLM in Pass G so it can use the pattern as a naming hint.
+
+    If behavior_graph is supplied (ctx.behavior_graph from stage25), each
+    skeleton's signals are boosted with HTTP method, auth flags, and SQL
+    operations discovered by the route→controller→SQL tracing pass.  This
+    improves pattern hit rate for skeletons whose exec_paths lack HTTP/auth
+    metadata (e.g. raw-PHP flat files with no explicit method checks).
 
     Signal dict schema
     ------------------
@@ -1939,10 +1976,39 @@ def _classify_patterns(
     outputs           : list[str]   — all output strings across all steps
     steps_with_inputs : int         — number of steps that have at least one input
     """
+    # Build file-name → behavior_graph paths index for signal boosting.
+    # Paths from ctx.behavior_graph carry HTTP method, auth flags, and SQL
+    # operations discovered by stage25's route→controller→SQL tracing —
+    # these complement skeleton signals derived from static exec_paths.
+    _bg_by_fname: dict[str, list[dict]] = {}
+    if behavior_graph:
+        for _bp in (behavior_graph.get("paths") or []):
+            for _rf in (_bp.get("reachable_files") or []):
+                _bg_fname = Path(_rf).name.lower()
+                if _bg_fname not in _bg_by_fname:
+                    _bg_by_fname[_bg_fname] = []
+                _bg_by_fname[_bg_fname].append(_bp)
+
     results: list[str | None] = []
 
     for sk in skeletons:
         signals = _extract_signals(sk)
+
+        # Boost signals from behavior_graph paths that share files with
+        # this skeleton.  Only adds information not already in signals.
+        if _bg_by_fname:
+            _sk_fnames = {Path(f).name.lower() for f in sk.get("files", [])}
+            for _fname in _sk_fnames:
+                for _bp in _bg_by_fname.get(_fname, []):
+                    if _bp.get("route_method"):
+                        signals["http_methods"].add(_bp["route_method"].upper())
+                    if _bp.get("has_auth") and signals["auth_steps"] == 0:
+                        signals["auth_steps"] = 1
+                    for _sql in (_bp.get("sql_ops") or []):
+                        _op = _sql.get("op", "")
+                        if _op and _op not in signals["db_ops"]:
+                            signals["db_ops"].append(_op)
+
         best_name:  str | None = None
         best_score: int        = 0
 
