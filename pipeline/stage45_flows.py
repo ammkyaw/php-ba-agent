@@ -65,11 +65,11 @@ FLOWS_FILE     = "business_flows.json"
 
 # Graph traversal limits
 MAX_DEPTH      = 8    # max hops from an entry-point node
-MAX_PATHS      = 500  # cap on candidate paths before dedup (was 40 — too low for large apps)
+MAX_PATHS      = 1500  # cap on candidate paths before dedup (was 500 — raised for large apps)
 MAX_PATH_LEN   = 12   # max steps in a single flow
 
 # Gap-fill: modules per synthetic-skeleton call
-GAP_FILL_MAX_MODULES_45 = 20
+GAP_FILL_MAX_MODULES_45 = 50
 # Gap-fill: max rounds of coverage-driven flow generation
 MAX_GAP_ROUNDS_45 = 10
 
