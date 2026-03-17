@@ -53,7 +53,9 @@ from context import PipelineContext, SpecRule, SpecRuleCollection
 # ── Tunables ──────────────────────────────────────────────────────────────────
 MIN_INVARIANT_CONF   = 0.60   # minimum Stage 2.9 confidence to promote
 LLM_BATCH_SIZE       = 25     # rules per LLM call (token budget)
-LLM_MAX_TOKENS       = 4096   # response budget per batch
+LLM_MAX_TOKENS       = 8192   # response budget per batch
+                               # 25 rules × ~250 chars of GWT each ≈ 6 000+ chars;
+                               # 4096 tokens was too tight and triggered truncation
 MERGE_CONF_THRESHOLD = 0.65   # minimum confidence to keep in final collection
 
 # ── Static GWT templates for Pass 1 fallback ─────────────────────────────────
@@ -121,7 +123,10 @@ For EACH constraint in the input array produce a JSON object with these exact ke
   "confidence"  : float 0.0–1.0 (your assessment of this being a real business rule; lower if it looks like framework boilerplate)
   "tags"        : array of 1–4 lowercase keyword strings
 
-Respond with a JSON ARRAY only — no prose, no markdown fences.
+OUTPUT RULES (strictly enforced):
+- Respond with a JSON ARRAY only — your response must begin with [ and end with ]
+- No prose, no markdown fences, no explanation, no "Thinking Process", no reasoning
+- Do NOT write any text before or after the JSON array
 Keep technical jargon OUT of given/when/then; use business language.
 If a constraint is clearly boilerplate (deleted=0, internal routing), set confidence ≤ 0.3.
 """
@@ -134,18 +139,25 @@ def _extract_json_array(raw: str) -> list | None:
     Strategies (in order):
       1. Direct parse — model followed instructions exactly
       2. Strip ``` code fences, then parse
-      3. Regex scan for the first [...] block (handles prose preamble/postamble)
+      3. raw_decode scan — iterate every '[' position; stops at the end of the
+         first balanced JSON value, so it handles "Thinking Process:" preambles,
+         markdown bullets/links that contain '[', and trailing prose after array
       4. Truncation recovery — if the response was cut mid-array, close it and
          drop the last (incomplete) element before parsing
+      5. Dict wrapper — {"rules": [...]} etc.
     Returns the parsed list, or None if all strategies fail.
     """
     raw = raw.strip()
+
+    def _is_rule_list(lst: list) -> bool:
+        """True if lst looks like the expected array of rule dicts (not a tags/string list)."""
+        return bool(lst) and isinstance(lst[0], dict)
 
     # 1. Direct parse
     if raw.startswith("["):
         try:
             parsed = json.loads(raw)
-            if isinstance(parsed, list):
+            if isinstance(parsed, list) and _is_rule_list(parsed):
                 return parsed
         except json.JSONDecodeError:
             pass  # may be truncated — fall through to recovery
@@ -158,20 +170,27 @@ def _extract_json_array(raw: str) -> list | None:
         if clean.startswith("["):
             try:
                 parsed = json.loads(clean)
-                if isinstance(parsed, list):
+                if isinstance(parsed, list) and _is_rule_list(parsed):
                     return parsed
             except json.JSONDecodeError:
                 pass
 
-    # 3. Find first JSON array anywhere in the response (handles preamble text)
-    match = re.search(r"(\[[\s\S]*\])", raw)
-    if match:
+    # 3. Find the first balanced JSON array of OBJECTS anywhere in the response.
+    #    Uses raw_decode (stops at the end of the first valid JSON value) so it
+    #    handles:
+    #      - "Thinking Process: ... \n[{...}]" preambles
+    #      - markdown that contains "[" (bullets, links, code refs)
+    #      - trailing prose / code fences after the array
+    #    Skips string/number arrays (e.g. "tags": ["kw1", "kw2"] inside objects)
+    #    because _is_rule_list requires the first element to be a dict.
+    _decoder = json.JSONDecoder()
+    for _m in re.finditer(r"\[", raw):
         try:
-            parsed = json.loads(match.group(1))
-            if isinstance(parsed, list):
-                return parsed
+            _parsed, _ = _decoder.raw_decode(raw, _m.start())
+            if isinstance(_parsed, list) and _is_rule_list(_parsed):
+                return _parsed
         except json.JSONDecodeError:
-            pass
+            continue
 
     # 4. Truncation recovery — close the array after the last complete object
     #    (handles MAX_TOKENS cut mid-element)
@@ -181,7 +200,7 @@ def _extract_json_array(raw: str) -> list | None:
         truncated = candidate[:brace_open].rstrip().rstrip(",") + "]"
         try:
             parsed = json.loads(truncated)
-            if isinstance(parsed, list) and parsed:
+            if isinstance(parsed, list) and _is_rule_list(parsed):
                 print(f"  [stage46]   ⚠️  Truncated response — recovered {len(parsed)} item(s).")
                 return parsed
         except json.JSONDecodeError:
@@ -192,44 +211,17 @@ def _extract_json_array(raw: str) -> list | None:
         parsed = json.loads(clean or raw)
         if isinstance(parsed, dict):
             for key in ("rules", "items", "results", "data"):
-                if isinstance(parsed.get(key), list):
-                    return parsed[key]
+                val = parsed.get(key)
+                if isinstance(val, list) and _is_rule_list(val):
+                    return val
     except json.JSONDecodeError:
         pass
 
     return None
 
 
-def _llm_formalize_batch(candidates: list[dict], batch_num: int) -> list[dict]:
-    """Send a batch of rule candidates to the LLM and return structured results.
-    Falls back to static GWT if LLM fails.
-    """
-    try:
-        from pipeline.llm_client import call_llm
-        user_payload = json.dumps(candidates, ensure_ascii=False)
-        raw = call_llm(
-            system_prompt = _LLM_SYSTEM,
-            user_prompt   = user_payload,
-            max_tokens    = LLM_MAX_TOKENS,
-            label         = f"spec_rules_batch_{batch_num}",
-        )
-
-        if not raw or not raw.strip():
-            print(f"  [stage46] ⚠️  LLM batch {batch_num} returned empty response; using static fallback.")
-        else:
-            parsed = _extract_json_array(raw)
-            if parsed is not None:
-                return parsed
-            # Log a snippet to help debug what the model actually returned
-            snippet = raw.strip()[:200].replace("\n", " ")
-            print(f"  [stage46] ⚠️  LLM batch {batch_num} — could not extract JSON array. "
-                  f"Response preview: {snippet!r}")
-            print(f"  [stage46]   Using static fallback.")
-
-    except Exception as exc:
-        print(f"  [stage46] ⚠️  LLM batch {batch_num} failed ({exc}); using static fallback.")
-
-    # Static fallback — build minimal GWT from existing description
+def _static_fallback_items(candidates: list[dict]) -> list[dict]:
+    """Build minimal static GWT for a list of candidates (used as fallback)."""
     results = []
     for c in candidates:
         cat  = c.get("category", "VALIDATION")
@@ -246,6 +238,74 @@ def _llm_formalize_batch(candidates: list[dict], batch_num: int) -> list[dict]:
             "tags":       [cat.lower()],
         })
     return results
+
+
+def _llm_formalize_batch(candidates: list[dict], batch_num: int) -> list[dict]:
+    """Send a batch of rule candidates to the LLM and return structured results.
+
+    If the model's response is truncated (some candidate IDs missing from the
+    output), the missing items are split in half and retried recursively.
+    This continues until every item is either LLM-enriched or falls back to
+    static GWT (when a single-item batch still fails).
+    """
+    if not candidates:
+        return []
+
+    try:
+        from pipeline.llm_client import call_llm
+        user_payload = json.dumps(candidates, ensure_ascii=False)
+        raw = call_llm(
+            system_prompt = _LLM_SYSTEM,
+            user_prompt   = user_payload,
+            max_tokens    = LLM_MAX_TOKENS,
+            label         = f"spec_rules_batch_{batch_num}",
+            prefill       = "[",   # force model to start JSON array immediately,
+                                   # preventing any "Thinking Process:" preamble
+        )
+
+        if not raw or not raw.strip():
+            print(f"  [stage46] ⚠️  LLM batch {batch_num} returned empty response; using static fallback.")
+        else:
+            # Diagnostic: confirm prefill took effect ('[' = yes)
+            first_char = raw.strip()[0]
+            print(f"  [stage46]   Response starts with {first_char!r}, length={len(raw)} chars")
+            parsed = _extract_json_array(raw)
+            if parsed is not None:
+                # Check for truncation: find candidate IDs not in the LLM output
+                returned_ids = {
+                    item.get("id", "") for item in parsed if isinstance(item, dict)
+                }
+                missed = [c for c in candidates if c["id"] not in returned_ids]
+
+                if not missed:
+                    return parsed   # all items accounted for ✓
+
+                # Some items were cut off — split and retry rather than
+                # silently falling back for the whole missed set
+                print(
+                    f"  [stage46]   ⚠️  {len(missed)} item(s) missing from batch "
+                    f"{batch_num} response; retrying in smaller sub-batches …"
+                )
+                results = list(parsed)
+                if len(missed) == 1:
+                    # Single missing item — recurse once; will fall back if needed
+                    results.extend(_llm_formalize_batch(missed, batch_num))
+                else:
+                    mid = len(missed) // 2
+                    results.extend(_llm_formalize_batch(missed[:mid], batch_num))
+                    results.extend(_llm_formalize_batch(missed[mid:], batch_num))
+                return results
+
+            # Could not extract any JSON array at all
+            snippet = raw.strip()[:400].replace("\n", " ")
+            print(f"  [stage46] ⚠️  LLM batch {batch_num} — could not extract JSON array. "
+                  f"Response preview: {snippet!r}")
+            print(f"  [stage46]   Using static fallback.")
+
+    except Exception as exc:
+        print(f"  [stage46] ⚠️  LLM batch {batch_num} failed ({exc}); using static fallback.")
+
+    return _static_fallback_items(candidates)
 
 
 def _pass1_from_invariants(ctx: PipelineContext) -> list[dict]:
@@ -278,8 +338,13 @@ def _pass1_from_invariants(ctx: PipelineContext) -> list[dict]:
         print(f"  [stage46]   batch {batch_num}/{len(batches)} ({len(batch)} rules) → LLM …")
         llm_out = _llm_formalize_batch(batch, batch_num)
 
-        # Build id → llm result map
-        llm_map = {item.get("id", ""): item for item in llm_out}
+        # Build id → llm result map — guard against non-dict elements
+        # (_extract_json_array now enforces this, but keep the check as safety net)
+        llm_map = {
+            item.get("id", ""): item
+            for item in llm_out
+            if isinstance(item, dict)
+        }
 
         for item in batch:
             orig    = rule_by_id[item["id"]]

@@ -176,6 +176,11 @@ def call_llm(
     temperature:   float = 0.2,
     label:         str = "",        # e.g. "stage4" — used in log messages
     json_mode:     bool = False,    # force JSON output (local provider only)
+    prefill:       str = "",        # assistant pre-fill text (Claude only)
+                                    # e.g. prefill="[" forces JSON array output,
+                                    # completely preventing any reasoning preamble.
+                                    # The prefill string is prepended to the
+                                    # returned text so callers see a complete value.
 ) -> str:
     """
     Call the configured LLM provider and return the response text.
@@ -189,9 +194,13 @@ def call_llm(
         max_tokens:    Maximum tokens in the response.
         temperature:   Sampling temperature (0.0–1.0).
         label:         Optional stage label for log messages.
+        prefill:       Optional assistant pre-fill (Claude only).  When set,
+                       the string is sent as the start of the assistant turn
+                       so the model must continue from that exact text —
+                       prevents any chain-of-thought preamble.
 
     Returns:
-        Raw response text from the model.
+        Raw response text from the model (with prefill prepended when used).
 
     Raises:
         RuntimeError: On non-retryable API error, or after all retries exhausted.
@@ -216,7 +225,11 @@ def call_llm(
         try:
             if provider == "local":
                 return _call_local(system_prompt, user_prompt, max_tokens,
-                                   temperature, model, json_mode=json_mode)
+                                   temperature, model, json_mode=json_mode,
+                                   prefill=prefill)
+            if provider == "claude":
+                return _call_claude(system_prompt, user_prompt, max_tokens,
+                                    temperature, model, prefill=prefill)
             return call_fn(system_prompt, user_prompt, max_tokens, temperature, model)
 
         except _NonRetryableError:
@@ -263,6 +276,7 @@ def _call_local(
     temperature:   float,
     model:         str,
     json_mode:     bool = False,
+    prefill:       str = "",
 ) -> str:
     """
     Call a local LLM server via its OpenAI-compatible /v1/chat/completions endpoint.
@@ -290,12 +304,18 @@ def _call_local(
     endpoint = f"{base_url}/v1/chat/completions"
     api_key  = os.environ.get("LOCAL_LLM_API_KEY", "").strip()
 
+    messages_payload: list[dict] = [
+        {"role": "system",    "content": system_prompt},
+        {"role": "user",      "content": user_prompt},
+    ]
+    if prefill:
+        # OpenAI-compatible servers (Ollama ≥ 0.1, LM Studio ≥ 0.2) support
+        # assistant pre-fill — the model continues from the given text.
+        messages_payload.append({"role": "assistant", "content": prefill})
+
     payload = {
         "model":       model,
-        "messages": [
-            {"role": "system", "content": system_prompt},
-            {"role": "user",   "content": user_prompt},
-        ],
+        "messages":    messages_payload,
         "max_tokens":  max_tokens,
         "temperature": temperature,
         "stream":      False,
@@ -381,7 +401,8 @@ def _call_local(
             f"Response length: {len(content)} chars."
         )
 
-    return content
+    # Restore prefill so the caller sees the complete value
+    return (prefill + content) if prefill else content
 
 
 def _handle_local_http_error(
@@ -445,8 +466,17 @@ def _call_claude(
     max_tokens:    int,
     temperature:   float,
     model:         str,
+    prefill:       str = "",
 ) -> str:
-    """Call Anthropic Claude API."""
+    """Call Anthropic Claude API.
+
+    When `prefill` is set it is appended as a partial assistant message so the
+    model must continue from that exact text.  The prefill string is prepended
+    to the returned text so callers see a complete response value.
+
+    Example — force immediate JSON array output (no chain-of-thought preamble):
+        _call_claude(..., prefill="[")
+    """
     try:
         import anthropic
     except ImportError:
@@ -462,18 +492,31 @@ def _call_claude(
             "Export it: export ANTHROPIC_API_KEY=sk-ant-..."
         )
 
+    messages: list[dict] = [{"role": "user", "content": user_prompt}]
+    if prefill:
+        messages.append({"role": "assistant", "content": prefill})
+
     client  = anthropic.Anthropic(api_key=api_key)
     message = client.messages.create(
         model      = model,
         max_tokens = max_tokens,
         system     = system_prompt,
-        messages   = [{"role": "user", "content": user_prompt}],
+        messages   = messages,
     )
 
     if not message.content:
         raise _NonRetryableError("Claude returned an empty response.")
 
-    return message.content[0].text
+    # Find the first text block (skip thinking blocks on extended-thinking models)
+    text = next(
+        (block.text for block in message.content if getattr(block, "type", "") == "text"),
+        None,
+    )
+    if text is None:
+        raise _NonRetryableError("Claude returned no text content block.")
+
+    # Restore prefill so the caller gets the complete value
+    return (prefill + text) if prefill else text
 
 
 # ─── Gemini ────────────────────────────────────────────────────────────────────
