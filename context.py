@@ -527,6 +527,41 @@ class SpecRuleCollection:
 
 
 @dataclass
+class TriangulatedRule:
+    """
+    Triangulation result for one SpecRule, produced by Stage 4.8.
+
+    corroborating_types — independent evidence streams that agree with the rule
+    contradicting_types — streams whose data actively conflicts with the rule
+    triangulation_score — corroborating / max_applicable  (0.0–1.0)
+    triangulation_status — STRONG (≥0.60) | MODERATE (≥0.33) | WEAK (<0.33)
+    """
+    rule_id:               str
+    title:                 str
+    category:              str
+    corroborating_types:   list[str]   # subset of 6 evidence type labels
+    contradicting_types:   list[str]
+    triangulation_score:   float
+    triangulation_status:  str         # "STRONG" | "MODERATE" | "WEAK"
+    max_applicable:        int         # denominator (category-dependent)
+    contradiction_notes:   list[str]   = field(default_factory=list)
+
+
+@dataclass
+class TriangulationReport:
+    """Container written to evidence_triangulation.json by Stage 4.8."""
+    rules:               list[TriangulatedRule] = field(default_factory=list)
+    total:               int                    = 0
+    strong_count:        int                    = 0
+    moderate_count:      int                    = 0
+    weak_count:          int                    = 0
+    contradiction_count: int                    = 0
+    weak_rule_ids:       list[str]              = field(default_factory=list)
+    contradiction_ids:   list[str]              = field(default_factory=list)
+    generated_at:        str                    = field(default_factory=lambda: datetime.utcnow().isoformat())
+
+
+@dataclass
 class DocCoverageResult:
     """
     Document coverage audit produced by Stage 5.9.
@@ -605,6 +640,8 @@ _STAGE_SUBDIRS: dict[str, str] = {
     "state_machine_catalog.json":  "4.3_statemachines",
     # Stage 4.6 — Specification Mining
     "spec_rules.json":             "4.6_specrules",
+    # Stage 4.8 — Evidence Triangulation
+    "evidence_triangulation.json": "4.8_triangulate",
     # Stage 3 — Vector Embeddings
     "chromadb":                    "3_embed",
     "chunks_manifest.json":        "3_embed",
@@ -694,6 +731,7 @@ class PipelineContext:
         "stage43_statemachines": StageResult(),  # state machine reconstruction
         "stage45_flows":        StageResult(),
         "stage46_specrules":    StageResult(),  # specification mining (business rule synthesis)
+        "stage48_triangulate":  StageResult(),  # evidence triangulation (static)
         "stage47_validate":     StageResult(),   # behavioral flow validation
         "stage5_brd":           StageResult(),
         "stage5_srs":           StageResult(),
@@ -719,6 +757,7 @@ class PipelineContext:
     relationships:     Optional[EntityRelationshipCollection] = None  # Stage 4.2
     state_machines:    Optional[StateMachineCollection]   = None  # Stage 4.3
     spec_rules:        Optional[SpecRuleCollection]        = None  # Stage 4.6
+    triangulation:     Optional[TriangulationReport]       = None  # Stage 4.8
     embedding_meta:    Optional[EmbeddingMeta]          = None
     preflight:         Optional[PreflightResult]        = None
     graph_rag_meta:    Optional[GraphRAGMeta]           = None  # Stage 3.7
@@ -1215,6 +1254,34 @@ class PipelineContext:
                 entity_count  = d.get("entity_count", 0),
                 cluster_count = d.get("cluster_count", 0),
                 generated_at  = d.get("generated_at", ""),
+            )
+
+        if data.get("triangulation") is not None:
+            d = data["triangulation"]
+            trules = [
+                TriangulatedRule(
+                    rule_id              = r["rule_id"],
+                    title                = r.get("title", ""),
+                    category             = r.get("category", ""),
+                    corroborating_types  = r.get("corroborating_types", []),
+                    contradicting_types  = r.get("contradicting_types", []),
+                    triangulation_score  = r.get("triangulation_score", 0.0),
+                    triangulation_status = r.get("triangulation_status", "WEAK"),
+                    max_applicable       = r.get("max_applicable", 4),
+                    contradiction_notes  = r.get("contradiction_notes", []),
+                )
+                for r in d.get("rules", [])
+            ]
+            ctx.triangulation = TriangulationReport(
+                rules               = trules,
+                total               = d.get("total", len(trules)),
+                strong_count        = d.get("strong_count", 0),
+                moderate_count      = d.get("moderate_count", 0),
+                weak_count          = d.get("weak_count", 0),
+                contradiction_count = d.get("contradiction_count", 0),
+                weak_rule_ids       = d.get("weak_rule_ids", []),
+                contradiction_ids   = d.get("contradiction_ids", []),
+                generated_at        = d.get("generated_at", ""),
             )
 
         return ctx

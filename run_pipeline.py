@@ -17,6 +17,7 @@ Stages (in execution order):
     Stage 4.3  statemachines  — State Machine Reconstruction (static)
     Stage 4.5  flows          — BusinessFlowExtractor (LLM)
     Stage 4.6  specrules      — Specification Mining (static + 1 LLM batch)
+    Stage 4.8  triangulate    — Evidence Triangulation (static)
     Stage 4.7  validate       — Behavioral Flow Validation (deterministic)
     Stage 5    brd/srs/ac/us  — parallel BA document agents (LLM)
     Stage 5.9  doccoverage    — Document Coverage Audit (static)
@@ -71,6 +72,7 @@ from pipeline.stage4_domain        import run as stage4
 from pipeline.stage43_statemachines import run as stage43
 from pipeline.stage45_flows        import run as stage45
 from pipeline.stage46_specrules    import run as stage46
+from pipeline.stage48_triangulate  import run as stage48
 from pipeline.stage47_validate_flows import run as stage47
 from pipeline.stage5_workers       import run as stage5
 from pipeline.stage59_doccoverage  import run as stage59
@@ -102,6 +104,7 @@ STAGES: list[tuple[str, any]] = [
     ("stage43_statemachines", stage43),  # state machine reconstruction (feeds stage45 + stage67)
     ("stage45_flows",        stage45),  # business flow extraction (feeds stage62 + stage67)
     ("stage46_specrules",    stage46),  # specification mining — formal business rules (feeds stage5 + stage9)
+    ("stage48_triangulate",  stage48),  # evidence triangulation — cross-source confidence scoring (feeds stage5 + stage6)
     ("stage47_validate",     stage47),  # behavioral validation (are flows missing / valid / real?)
     ("stage5_brd",           None),     # ← parallel group handled below
     ("stage5_srs",           None),
