@@ -1,5 +1,5 @@
 """
-pipeline/stage37_graphrag.py — Graph-Aware Context Index (Stage 3.7)
+pipeline/stage38_graphrag.py — Graph-Aware Context Index (Stage 3.8)
 
 Runs after Stage 3.5 preflight (all static extracts confirmed healthy).
 Merges every Stage 2.x structured output onto a single in-memory traversal
@@ -61,7 +61,7 @@ _STOPWORDS: frozenset[str] = frozenset({
 
 def run(ctx: PipelineContext) -> None:
     """Build the graph-aware context index, persist it, and update ctx."""
-    print("  [stage37] Building Graph-Aware Context Index…")
+    print("  [stage38] Building Graph-Aware Context Index…")
 
     index = _build_index(ctx)
 
@@ -78,16 +78,16 @@ def run(ctx: PipelineContext) -> None:
         generated_at  = datetime.utcnow().isoformat(),
     )
     ctx.graph_rag_meta = meta
-    ctx.stage("stage37_graphrag").mark_completed(out_path)
+    ctx.stage("stage38_graphrag").mark_completed(out_path)
     ctx.save()
 
     print(
-        f"  [stage37] Index built — "
+        f"  [stage38] Index built — "
         f"{meta.file_count} file nodes · "
         f"{meta.entity_count} entity nodes · "
         f"{meta.cluster_count} cluster nodes"
     )
-    print(f"  [stage37] Saved → {out_path}")
+    print(f"  [stage38] Saved → {out_path}")
 
 
 def load_index(index_path: str) -> dict:
@@ -259,7 +259,7 @@ def _build_index(ctx: PipelineContext) -> dict:
     """Merge all Stage 2.x outputs into the traversal index dict."""
     cm = ctx.code_map
     if not cm:
-        print("  [stage37] ⚠️  No code_map — index will be empty.")
+        print("  [stage38] ⚠️  No code_map — index will be empty.")
         return {}
 
     # ── Stage 2.8: cluster lookups ────────────────────────────────────────────

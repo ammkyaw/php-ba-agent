@@ -10,12 +10,12 @@ Stages (in execution order):
     Stage 2.5  behavior       — behavior graph extraction (Route→Ctrl→Service→SQL→Redirect)
     Stage 2.7  semanticroles — semantic role tagging (action type + external systems)
     Stage 3    embed          — vector index (ChromaDB)
-    Stage 3.5  preflight      — context pre-flight checks
-    Stage 3.7  graphrag       — graph-aware context index (static)
-    Stage 4.1  entities       — Entity Extraction (static)
-    Stage 4.2  relationships  — Entity Relationship Reconstruction (static)
+    Stage 3.5  entities       — Entity Extraction (static)
+    Stage 3.6  relationships  — Entity Relationship Reconstruction (static)
+    Stage 3.7  statemachines  — State Machine Reconstruction (static)
+    Stage 3.8  graphrag       — graph-aware context index (enriched by 3.5-3.7, static)
+    Stage 3.9  preflight      — pre-LLM gate: validates all static context
     Stage 4    domain         — DomainAnalystAgent (LLM)
-    Stage 4.3  statemachines  — State Machine Reconstruction (static)
     Stage 4.5  flows          — BusinessFlowExtractor (LLM)
     Stage 4.6  specrules      — Specification Mining (static + 1 LLM batch)
     Stage 4.7  validate       — Behavioral Flow Validation (deterministic)
@@ -66,13 +66,13 @@ from pipeline.stage25_behavior     import run as stage25
 from pipeline.stage27_semanticroles import run as stage27
 from pipeline.stage28_clusters     import run as stage28
 from pipeline.stage29_invariants   import run as stage29
-from pipeline.stage3_embed         import run as stage3
-from pipeline.stage35_preflight    import run as stage35
-from pipeline.stage37_graphrag     import run as stage37
-from pipeline.stage41_entities      import run as stage41
-from pipeline.stage42_relationships import run as stage42
-from pipeline.stage4_domain        import run as stage4
-from pipeline.stage43_statemachines import run as stage43
+from pipeline.stage3_embed          import run as stage3
+from pipeline.stage35_entities      import run as stage35
+from pipeline.stage36_relationships import run as stage36
+from pipeline.stage37_statemachines import run as stage37
+from pipeline.stage38_graphrag      import run as stage38
+from pipeline.stage39_preflight     import run as stage39
+from pipeline.stage4_domain         import run as stage4
 from pipeline.stage45_flows        import run as stage45
 from pipeline.stage46_specrules    import run as stage46
 from pipeline.stage47_validate_flows import run as stage47
@@ -100,13 +100,13 @@ STAGES: list[tuple[str, any]] = [
     ("stage27_semanticroles", stage27), # semantic role tagging (feeds stage28 + stage45 + stage9)
     ("stage28_clusters",     stage28),  # action clustering (feeds stage4 + stage45 bounded contexts)
     ("stage29_invariants",   stage29),  # business rule extraction (feeds stage3 chunks + stage4 grounding)
-    ("stage3_embed",         stage3),
-    ("stage35_preflight",    stage35),
-    ("stage37_graphrag",     stage37),  # graph-aware context index (feeds stage4 + stage45 + stage5 retrieval)
-    ("stage41_entities",     stage41),  # entity extraction (feeds stage42 + stage4 grounding)
-    ("stage42_relationships", stage42), # relationship reconstruction (feeds stage4 + stage67 ER diagram)
-    ("stage4_domain",        stage4),
-    ("stage43_statemachines", stage43),  # state machine reconstruction (feeds stage45 + stage67)
+    ("stage3_embed",          stage3),
+    ("stage35_entities",      stage35),  # entity extraction (feeds stage36 + stage38 enrichment + stage4 grounding)
+    ("stage36_relationships", stage36),  # relationship reconstruction (feeds stage38 enrichment + stage4 + stage67 ER)
+    ("stage37_statemachines", stage37),  # state machine reconstruction (feeds stage38 enrichment + stage4 + stage45 + stage67)
+    ("stage38_graphrag",      stage38),  # graph-aware context index — enriched by stage35/36/37 (feeds stage4 + stage45 + stage5)
+    ("stage39_preflight",     stage39),  # pre-LLM gate — validates all static context before Stage 4
+    ("stage4_domain",         stage4),
     ("stage45_flows",        stage45),  # business flow extraction (feeds stage62 + stage67)
     ("stage46_specrules",    stage46),  # specification mining — formal business rules (feeds stage5 + stage9)
     ("stage47_validate",     stage47),  # behavioral validation (are flows missing / valid / real?)

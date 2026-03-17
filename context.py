@@ -167,7 +167,7 @@ class EmbeddingMeta:
 
 @dataclass
 class PreflightResult:
-    """Results of Stage 3.5 context pre-flight checks."""
+    """Results of Stage 3.9 context pre-flight checks."""
     passed:   bool      = True
     warnings: list[str] = field(default_factory=list)
     blockers: list[str] = field(default_factory=list)
@@ -369,7 +369,7 @@ class StateTransition:
     """
     One detected state transition for a state-machine entity field.
 
-    Produced by Stage 4.3 — fully static, no LLM.
+    Produced by Stage 3.7 — fully static, no LLM.
     """
     from_state:   str            # e.g. "Draft"
     to_state:     str            # e.g. "Submitted"
@@ -382,7 +382,7 @@ class StateTransition:
 @dataclass
 class StateMachine:
     """
-    State machine for one (table, field) pair, produced by Stage 4.3.
+    State machine for one (table, field) pair, produced by Stage 3.7.
 
     Consumed by Stage 4.5 (flow validation), Stage 6.7 (diagrams),
     Stage 8 (test generation).
@@ -402,7 +402,7 @@ class StateMachine:
 
 @dataclass
 class StateMachineCollection:
-    """Container written to state_machine_catalog.json by Stage 4.3."""
+    """Container written to state_machine_catalog.json by Stage 3.7."""
     machines:     list[StateMachine] = field(default_factory=list)
     total:        int                = 0
     generated_at: str                = field(default_factory=lambda: datetime.utcnow().isoformat())
@@ -477,7 +477,7 @@ class ActionClusterCollection:
 
 @dataclass
 class EntityColumn:
-    """One column of a DB table, produced by Stage 4.1."""
+    """One column of a DB table, produced by Stage 3.5."""
     name:              str
     data_type:         str  = ""
     nullable:          bool = True
@@ -490,7 +490,7 @@ class EntityColumn:
 @dataclass
 class Entity:
     """
-    One business entity extracted by Stage 4.1.
+    One business entity extracted by Stage 3.5.
 
     Covers every table/model in the codebase.  Use is_core / is_system /
     is_pivot flags to filter for different consumers (ER diagram vs full graph).
@@ -510,7 +510,7 @@ class Entity:
 
 @dataclass
 class EntityCollection:
-    """Container written to entity_catalog.json by Stage 4.1."""
+    """Container written to entity_catalog.json by Stage 3.5."""
     entities:     list[Entity] = field(default_factory=list)
     total:        int          = 0
     core_count:   int          = 0   # entities where is_core=True
@@ -520,7 +520,7 @@ class EntityCollection:
 @dataclass
 class EntityRelationship:
     """
-    One detected relationship between two entities, produced by Stage 4.2.
+    One detected relationship between two entities, produced by Stage 3.6.
 
     Multiple signals (FK, JOIN, ORM, column pattern) are merged into a single
     entry per (from_entity, to_entity) pair.
@@ -539,7 +539,7 @@ class EntityRelationship:
 
 @dataclass
 class EntityRelationshipCollection:
-    """Container written to relationship_catalog.json by Stage 4.2."""
+    """Container written to relationship_catalog.json by Stage 3.6."""
     relationships: list[EntityRelationship] = field(default_factory=list)
     entity_names:  list[str]                = field(default_factory=list)
     total:         int                      = 0
@@ -567,7 +567,7 @@ class SpecRule:
     entities:          list[str]      # ["User"]
     bounded_context:   str            # "Users"
     source_invariants: list[str]      # rule_ids from Stage 2.9
-    source_machines:   list[str]      # machine_ids from Stage 4.3
+    source_machines:   list[str]      # machine_ids from Stage 3.7
     source_flows:      list[str]      # flow_ids from Stage 4.5
     source_files:      list[str]
     confidence:        float          # 0.0–1.0
@@ -691,7 +691,7 @@ class DocCoverageResult:
 @dataclass
 class GraphRAGMeta:
     """
-    Metadata for the Graph-Aware Context Index produced by Stage 3.7.
+    Metadata for the Graph-Aware Context Index produced by Stage 3.8.
 
     The full index lives in graph_context_index.json; this dataclass carries
     only the path and node counts.  Downstream stages call ctx.graph_query()
@@ -748,19 +748,19 @@ _STAGE_SUBDIRS: dict[str, str] = {
     # Stage 3 — Vector Embeddings
     "chromadb":                    "3_embed",
     "chunks_manifest.json":        "3_embed",
-    # Stage 3.5 — Preflight
-    "preflight_report.json":       "3.5_preflight",
-    # Stage 3.7 — Graph-Aware Context Index
-    "graph_context_index.json":    "3.7_graphrag",
+    # Stage 3.5 — Entity Extraction
+    "entity_catalog.json":         "3.5_entities",
+    # Stage 3.6 — Entity Relationship Reconstruction
+    "relationship_catalog.json":   "3.6_relationships",
+    # Stage 3.7 — State Machine Reconstruction
+    "state_machine_catalog.json":  "3.7_statemachines",
+    # Stage 3.8 — Graph-Aware Context Index (enriched by 3.5/3.6/3.7)
+    "graph_context_index.json":    "3.8_graphrag",
+    # Stage 3.9 — Pre-LLM Preflight Gate
+    "preflight_report.json":       "3.9_preflight",
     # Stage 4 — Domain Model
     "domain_model.json":           "4_domain",
     "coverage_report.json":        "4_domain",
-    # Stage 4.1 — Entity Extraction
-    "entity_catalog.json":         "4.1_entities",
-    # Stage 4.2 — Entity Relationship Reconstruction
-    "relationship_catalog.json":   "4.2_relationships",
-    # Stage 4.3 — State Machine Reconstruction
-    "state_machine_catalog.json":  "4.3_statemachines",
     # Stage 4.5 — Business Flows
     "business_flows.json":         "4.5_flows",
     "flow_coverage.json":          "4.5_flows",
@@ -841,12 +841,12 @@ class PipelineContext:
         "stage28_clusters":       StageResult(),  # action clustering (similarity)
         "stage29_invariants":     StageResult(),  # business rule / invariant detection
         "stage3_embed":           StageResult(),
-        "stage35_preflight":      StageResult(),
-        "stage37_graphrag":       StageResult(),  # graph-aware context index (static)
+        "stage35_entities":       StageResult(),  # entity extraction (static)
+        "stage36_relationships":  StageResult(),  # entity relationship reconstruction (static)
+        "stage37_statemachines":  StageResult(),  # state machine reconstruction (static)
+        "stage38_graphrag":       StageResult(),  # graph-aware context index (enriched by 3.5/3.6/3.7)
+        "stage39_preflight":      StageResult(),  # pre-LLM gate
         "stage4_domain":          StageResult(),
-        "stage41_entities":       StageResult(),  # entity extraction (static)
-        "stage42_relationships":  StageResult(),  # entity relationship reconstruction (static)
-        "stage43_statemachines":  StageResult(),  # state machine reconstruction
         "stage45_flows":          StageResult(),
         "stage46_specrules":      StageResult(),  # specification mining (business rule synthesis)
         "stage47_validate":       StageResult(),  # behavioral flow validation
@@ -873,14 +873,14 @@ class PipelineContext:
     semantic_roles:    Optional[SemanticRoleIndex]       = None  # Stage 2.7
     action_clusters:   Optional[ActionClusterCollection] = None  # Stage 2.8
     invariants:        Optional[InvariantCollection]      = None  # Stage 2.9
-    entities:          Optional[EntityCollection]          = None  # Stage 4.1
-    relationships:     Optional[EntityRelationshipCollection] = None  # Stage 4.2
-    state_machines:    Optional[StateMachineCollection]   = None  # Stage 4.3
+    entities:          Optional[EntityCollection]          = None  # Stage 3.5
+    relationships:     Optional[EntityRelationshipCollection] = None  # Stage 3.6
+    state_machines:    Optional[StateMachineCollection]   = None  # Stage 3.7
     spec_rules:        Optional[SpecRuleCollection]        = None  # Stage 4.6
     triangulation:     Optional[TriangulationReport]       = None  # Stage 4.8
     embedding_meta:    Optional[EmbeddingMeta]          = None
     preflight:         Optional[PreflightResult]        = None
-    graph_rag_meta:    Optional[GraphRAGMeta]           = None  # Stage 3.7
+    graph_rag_meta:    Optional[GraphRAGMeta]           = None  # Stage 3.8
     domain_model:      Optional[DomainModel]            = None
     business_flows:    Optional[BusinessFlowCollection] = None
     flow_validation:   Optional[dict]                   = None   # Stage 4.7
@@ -933,7 +933,7 @@ class PipelineContext:
 
     def graph_query(self, topic: str, depth: int = 2, max_chars: int = 3000) -> str:
         """
-        Graph-aware context retrieval using the Stage 3.7 index.
+        Graph-aware context retrieval using the Stage 3.8 index.
 
         Returns a structured Markdown context block suitable for LLM prompt
         injection.  Empty string if the index was not built or the topic has no
@@ -945,7 +945,7 @@ class PipelineContext:
         if not self.graph_rag_meta or not self.graph_rag_meta.index_path:
             return ""
         # Late import to avoid circular dependency (stage37 imports from context).
-        from pipeline.stage37_graphrag import load_index, query_graph  # noqa: PLC0415
+        from pipeline.stage38_graphrag import load_index, query_graph  # noqa: PLC0415
         if not hasattr(self, "_graph_rag_cache"):
             self._graph_rag_cache = load_index(self.graph_rag_meta.index_path)
         return query_graph(self._graph_rag_cache, topic, depth=depth, max_chars=max_chars)

@@ -1,5 +1,5 @@
 """
-pipeline/stage42_relationships.py — Entity Relationship Reconstruction (Stage 4.2)
+pipeline/stage36_relationships.py — Entity Relationship Reconstruction (Stage 3.6)
 
 Detects relationships between entities and their cardinality.
 Fully static — no LLM.
@@ -40,7 +40,7 @@ Output
 Consumed by
 -----------
     Stage 4    (domain model grounding — entity list + relationships)
-    Stage 4.3  (state machine entity name enrichment)
+    Stage 3.7  (state machine entity name enrichment)
     Stage 4.5  (flow validation)
     Stage 6.7  (ER diagram)
     Stage 9    (knowledge graph edges)
@@ -519,12 +519,12 @@ def _build_mermaid(
 def run(ctx: PipelineContext) -> None:
     cm = getattr(ctx, "code_map", None)
     if cm is None:
-        print("  [stage42] ⚠️  No code_map — skipping relationship reconstruction.")
+        print("  [stage36] ⚠️  No code_map — skipping relationship reconstruction.")
         ctx.relationships = EntityRelationshipCollection()
         return
 
     if ctx.entities is None:
-        print("  [stage42] ⚠️  No entity catalog (stage41 not run) — skipping.")
+        print("  [stage36] ⚠️  No entity catalog (stage35 not run) — skipping.")
         ctx.relationships = EntityRelationshipCollection()
         return
 
@@ -534,7 +534,7 @@ def run(ctx: PipelineContext) -> None:
     table_columns = cm.table_columns or []
     sql_queries   = cm.sql_queries   or []
 
-    print(f"  [stage42] Scanning {len(known_tables)} entities for relationships …")
+    print(f"  [stage36] Scanning {len(known_tables)} entities for relationships …")
 
     # ── Run all signal detectors ────────────────────────────────────────────
     raw_A = _detect_fk_explicit(table_columns, known_tables)
@@ -546,7 +546,7 @@ def run(ctx: PipelineContext) -> None:
     all_raw = raw_A + raw_B + raw_C + raw_D + raw_E
     merged  = _merge_rels(all_raw)
 
-    print(f"  [stage42] Signal counts: FK={len(raw_A)} pivot={len(raw_B)} "
+    print(f"  [stage36] Signal counts: FK={len(raw_A)} pivot={len(raw_B)} "
           f"ORM={len(raw_C)} JOIN={len(raw_D)} col_pattern={len(raw_E)} "
           f"→ {len(merged)} unique relationship(s).")
 
@@ -588,7 +588,7 @@ def run(ctx: PipelineContext) -> None:
     for rel in relationships:
         card_counts[rel.cardinality] += 1
 
-    print(f"\n  [stage42] Relationship Reconstruction complete — {total} relationship(s) "
+    print(f"\n  [stage36] Relationship Reconstruction complete — {total} relationship(s) "
           f"(1:1={card_counts['1:1']} 1:N={card_counts['1:N']} N:M={card_counts['N:M']}):")
     for rel in relationships[:25]:
         print(f"    {rel.rel_id}  {rel.from_entity:<25} {rel.cardinality:<5} "
@@ -613,9 +613,9 @@ def run(ctx: PipelineContext) -> None:
         Path(out_path).parent.mkdir(parents=True, exist_ok=True)
         with open(out_path, "w", encoding="utf-8") as fh:
             json.dump(dataclasses.asdict(collection), fh, indent=2, ensure_ascii=False)
-        print(f"  [stage42] Saved → {out_path}")
+        print(f"  [stage36] Saved → {out_path}")
     except Exception as exc:
-        print(f"  [stage42] ⚠️  Could not save relationship_catalog.json: {exc}")
+        print(f"  [stage36] ⚠️  Could not save relationship_catalog.json: {exc}")
 
     # ── Persist Mermaid ER diagram ───────────────────────────────────────────
     try:
@@ -623,9 +623,9 @@ def run(ctx: PipelineContext) -> None:
         er_path     = str(Path(ctx.output_path("relationship_catalog.json")).parent / "er_diagram.mmd")
         Path(er_path).write_text(mermaid_src, encoding="utf-8")
         ctx.relationships.mermaid_path = er_path
-        print(f"  [stage42] ER diagram  → {er_path}")
+        print(f"  [stage36] ER diagram  → {er_path}")
     except Exception as exc:
-        print(f"  [stage42] ⚠️  Could not write er_diagram.mmd: {exc}")
+        print(f"  [stage36] ⚠️  Could not write er_diagram.mmd: {exc}")
 
     # Re-save entity catalog so updated is_core flags are persisted
     if ctx.entities:
