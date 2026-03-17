@@ -762,6 +762,63 @@ def _merge_all(
     return list(seen.values())
 
 
+def _to_plain_english(rule: "BusinessRule") -> str:
+    """
+    Convert a BusinessRule into a BA-ready plain-English sentence.
+
+    The `description` field is already human-readable but entity-centric
+    (e.g. "password must be at least 8 characters").  This function produces
+    a complete sentence that a business analyst can paste directly into a BRD:
+      "User passwords must be at least 8 characters long."
+
+    Rules:
+      - Start with the entity/table name in Title Case
+      - Use imperative mood for VALIDATION / REFERENTIAL / AUTHORIZATION
+      - Use passive-present for STATE_TRANSITION ("Order status must progress
+        from X to Y")
+      - Cap at 120 characters; fall back to description if pattern fails.
+    """
+    desc  = rule.description.strip().rstrip(".")
+    ent   = rule.entity or ""
+    cat   = rule.category
+
+    # Extract a human entity name from "Table.column" or "variable_name"
+    if "." in ent:
+        table, col = ent.split(".", 1)
+        entity_label = f"{_humanize(table)} {_humanize(col)}"
+    elif ent:
+        entity_label = _humanize(ent)
+    else:
+        entity_label = ""
+
+    # If description already starts with the entity, capitalise and punctuate.
+    if desc and entity_label and desc.lower().startswith(entity_label.lower()):
+        return desc[0].upper() + desc[1:] + "."
+
+    # Prefix with entity label for VALIDATION / BUSINESS_LIMIT / REFERENTIAL
+    if entity_label and cat in ("VALIDATION", "BUSINESS_LIMIT", "REFERENTIAL"):
+        # Avoid double noun: "User Username must be unique" → skip if desc starts
+        # with a word already present in entity_label
+        first_word = desc.split()[0].lower() if desc else ""
+        label_words = {w.lower() for w in entity_label.split()}
+        if first_word not in label_words:
+            sentence = f"{entity_label}: {desc[0].lower() + desc[1:]}."
+        else:
+            sentence = desc[0].upper() + desc[1:] + "."
+        return sentence[:150]
+
+    # AUTHORIZATION: add "Only authorised users …" framing if not already there
+    if cat == "AUTHORIZATION" and "only" not in desc.lower():
+        return f"Only authorised users may: {desc[0].lower() + desc[1:]}."[:150]
+
+    # STATE_TRANSITION: "The {entity} status must …"
+    if cat == "STATE_TRANSITION" and entity_label and "status" not in desc.lower():
+        return f"The {entity_label} must satisfy: {desc[0].lower() + desc[1:]}."[:150]
+
+    # Default: capitalise + punctuate
+    return (desc[0].upper() + desc[1:] + ".") if desc else ""
+
+
 def _build_collection(rules: list[BusinessRule]) -> InvariantCollection:
     by_category: dict[str, list[str]] = defaultdict(list)
     by_context:  dict[str, list[str]] = defaultdict(list)
@@ -838,6 +895,9 @@ def run(ctx: PipelineContext) -> None:
 
     # ── Merge and build collection ────────────────────────────────────────────
     rules      = _merge_all(schema_rules, branch_rules, source_rules, sql_rules)
+    # Populate plain_english on every rule (BA-ready phrasing for BRD injection)
+    for rule in rules:
+        rule.plain_english = _to_plain_english(rule)
     collection = _build_collection(rules)
 
     # ── Print summary ─────────────────────────────────────────────────────────

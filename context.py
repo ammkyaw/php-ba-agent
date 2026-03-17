@@ -311,6 +311,7 @@ class BusinessRule:
     source_files:    list[str]      # PHP files where this rule was found
     confidence:      float = 0.8    # 1.0=schema, 0.8=guard-clause, 0.6=source-scan
     tables:          list[str] = field(default_factory=list)
+    plain_english:   str   = ""    # BA-ready phrasing, populated at end of Stage 2.9
 
 
 @dataclass
@@ -721,6 +722,7 @@ _STAGE_SUBDIRS: dict[str, str] = {
     # Stage 4.5 — Business Flows
     "business_flows.json":         "4.5_flows",
     "flow_coverage.json":          "4.5_flows",
+    "feature_stubs.feature":       "4.5_flows",
     # Stage 4.6 — Specification Mining
     "spec_rules.json":             "4.6_specrules",
     # Stage 4.7 — Behavioral Validation
