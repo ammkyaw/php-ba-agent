@@ -232,12 +232,33 @@ class BusinessFlowCollection:
 
 
 @dataclass
+class CriticPass:
+    """
+    Result of one Critic-loop pass on a Stage 5 BA document.
+
+    Produced by Stage 5.0 CriticAgent.  One entry per document per turn.
+    Stage 6 QA can inspect these to see what the critic already addressed.
+    """
+    doc_type:              str   = ""     # "brd" | "srs" | "ac" | "us"
+    turn:                  int   = 1      # 1 = after first draft, 2 = after refinement
+    score:                 float = 0.0   # 0.0–1.0 (≥ CRITIC_THRESHOLD → passed)
+    passed:                bool  = False
+    uncovered_rule_ids:    list  = field(default_factory=list)   # list[str]
+    hallucinated_entities: list  = field(default_factory=list)   # list[str]
+    structural_issues:     list  = field(default_factory=list)   # list[str]
+    rewrite_hints:         list  = field(default_factory=list)   # list[str]
+    generated_at:          str   = field(default_factory=lambda: datetime.utcnow().isoformat())
+
+
+@dataclass
 class BAArtifacts:
     """Paths to the four BA document artefacts produced by Stage 5."""
     brd_path:          Optional[str] = None
     srs_path:          Optional[str] = None
     ac_path:           Optional[str] = None
     user_stories_path: Optional[str] = None
+    # Critic-loop results: doc_key → list of CriticPass dicts (one per turn attempted)
+    critic_passes:     dict          = field(default_factory=dict)
 
 
 @dataclass
