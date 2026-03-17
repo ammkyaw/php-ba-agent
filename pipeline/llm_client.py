@@ -313,7 +313,7 @@ def _call_local(
     if num_ctx > 0:
         return _call_local_ollama_native(
             system_prompt, user_prompt, max_tokens, temperature,
-            model, num_ctx, prefill,
+            model, num_ctx, prefill, json_mode=json_mode,
         )
 
     base_url = get_local_url()
@@ -429,6 +429,7 @@ def _call_local_ollama_native(
     model:         str,
     num_ctx:       int,
     prefill:       str = "",
+    json_mode:     bool = False,
 ) -> str:
     """
     Call Ollama via its native /api/chat endpoint.
@@ -467,6 +468,10 @@ def _call_local_ollama_native(
             "temperature": temperature,
         },
     }
+    if json_mode:
+        # Ollama native /api/chat uses a top-level "format" field (not inside
+        # "options") to constrain output to valid JSON.
+        payload["format"] = "json"
 
     body    = json.dumps(payload).encode("utf-8")
     headers = {"Content-Type": "application/json"}
