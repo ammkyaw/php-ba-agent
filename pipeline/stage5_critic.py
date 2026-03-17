@@ -60,6 +60,7 @@ from __future__ import annotations
 import dataclasses
 import json
 import re
+from pathlib import Path
 from typing import Optional
 
 from context import CriticPass, PipelineContext
@@ -150,6 +151,9 @@ def run_critic_loop(
                 f"accepting draft with score {cp.score:.2f}"
             )
             break
+
+        # Enrich hints with execution paths for uncovered rules
+        _enrich_hints_with_exec_paths(cp, ctx)
 
         # Refine: targeted surgical edit
         print(f"  [stage5_critic] {label} → triggering refiner pass …")
@@ -495,3 +499,84 @@ def _refine(draft: str, cp: CriticPass) -> str:
         temperature = 0.15,
         label       = f"stage5_refiner_{cp.doc_type}",
     )
+
+
+# ── Internal: Execution-Path Hint Enrichment ───────────────────────────────────
+
+# Max execution-path hints injected per failed critic pass (keeps refiner prompt
+# within the token budget while still grounding the refiner in real code flow)
+_MAX_EXEC_PATH_HINTS = 3
+
+
+def _enrich_hints_with_exec_paths(cp: CriticPass, ctx: PipelineContext) -> None:
+    """
+    After a failed critic pass, inject relevant execution-path summaries into
+    cp.rewrite_hints so the Refiner has concrete code-flow evidence to cite.
+
+    For each uncovered rule ID, we look up which source file the rule came from
+    (via spec_rule.file_path), then find Stage 1.5 execution paths whose entry
+    point matches that file.  A concise summary of each path (up to
+    _MAX_EXEC_PATH_HINTS paths) is appended to cp.rewrite_hints in-place.
+
+    No-op when:
+      - cp has no uncovered rules (nothing to enrich)
+      - ctx.code_map.execution_paths is empty (Stage 1.5 not run)
+      - ctx.spec_rules is empty (no rule catalogue)
+    """
+    if not cp.uncovered_rule_ids:
+        return
+    if not ctx.code_map or not ctx.code_map.execution_paths:
+        return
+    if not ctx.spec_rules or not ctx.spec_rules.rules:
+        return
+
+    # Build rule_id → basename of source file
+    rule_to_file: dict[str, str] = {}
+    for rule in ctx.spec_rules.rules:
+        if rule.rule_id in cp.uncovered_rule_ids:
+            fp = getattr(rule, "file_path", "") or ""
+            if fp:
+                rule_to_file[rule.rule_id] = Path(fp).name
+
+    if not rule_to_file:
+        return
+
+    target_files: set[str] = set(rule_to_file.values())
+
+    # Walk execution paths looking for entry points in target_files
+    new_hints: list[str] = []
+    seen_entries: set[str] = set()
+
+    for ep in ctx.code_map.execution_paths:
+        entry = Path(ep.get("entry_point", "")).name
+        if entry not in target_files or entry in seen_entries:
+            continue
+        seen_entries.add(entry)
+
+        # Summarise the happy path as "step1 → step2 → step3"
+        steps = ep.get("happy_path") or []
+        labels: list[str] = []
+        for s in steps[:5]:
+            label = (
+                s.get("action")
+                or s.get("page")
+                or s.get("file", "")
+            ).strip()
+            if label:
+                labels.append(label)
+
+        path_desc = " → ".join(labels) if labels else "(no steps)"
+        new_hints.append(
+            f"Execution path for '{entry}' (covers uncovered rule "
+            f"{', '.join(r for r, f in rule_to_file.items() if f == entry)[:60]}): "
+            f"{path_desc}"
+        )
+        if len(new_hints) >= _MAX_EXEC_PATH_HINTS:
+            break
+
+    if new_hints:
+        cp.rewrite_hints.extend(new_hints)
+        print(
+            f"  [stage5_critic] Enriched rewrite_hints with "
+            f"{len(new_hints)} execution-path hint(s)."
+        )

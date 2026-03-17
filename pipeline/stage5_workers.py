@@ -265,6 +265,7 @@ Bounded Contexts: {", ".join(_to_str_list(domain.bounded_contexts))}
 Business Rules:
 {rule_lines}
 {_format_spec_rules_for_prompt(ctx)}
+{_format_plain_english_rules(ctx)}
 
 CRITICAL: Section 5 MUST use EXACTLY these {n_features} subsection headings in order.
 Do NOT rename, merge, skip, or reorder them. Fill in the Priority and Acceptance fields.
@@ -734,6 +735,48 @@ def _format_execution_paths_for_prompt(ctx: PipelineContext) -> str:
                 for e in else_acts:
                     lines.append(f"      ✗ {e}")
 
+    return "\n".join(lines)
+
+
+def _format_plain_english_rules(ctx: PipelineContext, max_rules: int = 40) -> str:
+    """
+    Return a compact block of BA-ready plain-English invariant sentences
+    (Stage 2.9 plain_english field) for injection into writer prompts.
+
+    Only includes rules that didn't make it into Stage 4.6 SpecRules — these
+    are the low-confidence invariants the LLM writer would otherwise miss.
+    """
+    inv = getattr(ctx, "invariants", None)
+    if not inv or not inv.rules:
+        return ""
+
+    # IDs already covered by SpecRules (via source_invariants)
+    covered: set[str] = set()
+    sr = getattr(ctx, "spec_rules", None)
+    if sr:
+        for rule in sr.rules:
+            covered.update(rule.source_invariants or [])
+
+    extras = [
+        r for r in inv.rules
+        if r.rule_id not in covered and r.plain_english
+    ]
+    if not extras:
+        return ""
+
+    lines = [
+        f"\n=== ADDITIONAL BUSINESS RULES — Stage 2.9 "
+        f"({len(extras)} rules not yet in SpecRules) ===",
+        "Use these to enrich the Business Rules section. Do not duplicate "
+        "rules already listed in MINED BUSINESS RULES above.",
+    ]
+    by_cat: dict[str, list] = {}
+    for r in extras[:max_rules]:
+        by_cat.setdefault(r.category, []).append(r)
+    for cat, rs in sorted(by_cat.items()):
+        lines.append(f"\n[{cat}]")
+        for r in rs:
+            lines.append(f"  • {r.plain_english}")
     return "\n".join(lines)
 
 

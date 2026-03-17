@@ -266,6 +266,22 @@ def _build_coverage_prompt(ctx: PipelineContext, artefacts: dict[str, str]) -> s
         parts.append(f"\n{name} ({len(headings)} headings):")
         parts.append("\n".join(f"  • {h}" for h in headings[:30]))
 
+    # ── Stage 5.0 Critic summary injection ───────────────────────────────────
+    # Let the LLM coverage auditor know what the inline critic already fixed so
+    # it can focus on residual gaps rather than re-flagging resolved issues.
+    try:
+        from pipeline.stage5_critic        import critic_summary_block   as _critic_blk
+        from pipeline.stage55_traceability import coverage_summary_block as _cov_blk
+        _cb = _critic_blk(ctx)
+        _tb = _cov_blk(ctx)
+        if _cb:
+            parts.append("\n" + _cb)
+        if _tb:
+            parts.append("\n=== TRACEABILITY COVERAGE (Stage 5.5) ===")
+            parts.append(_tb)
+    except ImportError:
+        pass  # Stages not yet run — skip gracefully
+
     # ── Stage 5.9 gap injection ───────────────────────────────────────────────
     dc = getattr(ctx, "doc_coverage", None)
     if dc and dc.gap_summary:
@@ -744,6 +760,23 @@ def _build_report_md(
             )
         lines.append("")
 
+    # ── Traceability Summary (Stage 5.5 + Stage 5.0 Critic) ─────────────────
+    try:
+        from pipeline.stage5_critic        import critic_summary_block   as _critic_blk
+        from pipeline.stage55_traceability import coverage_summary_block as _cov_blk
+        _cov_md    = _cov_blk(ctx)
+        _critic_md = _critic_blk(ctx)
+        if _cov_md or _critic_md:
+            lines += ["## Traceability Summary", ""]
+            if _cov_md:
+                lines.append(_cov_md)
+                lines.append("")
+            if _critic_md:
+                lines.append(_critic_md)
+                lines.append("")
+    except ImportError:
+        pass  # Stages not yet run — skip gracefully
+
     if ctx.ba_artifacts:
         lines += ["## Reviewed Artefacts", ""]
         for label, path in [
@@ -806,11 +839,46 @@ def _save_checklist_json(ctx: PipelineContext, qa_checks: list[dict]) -> None:
 
 
 def _save_confidence_json(ctx: PipelineContext, conf_report: list[dict]) -> None:
-    """Save the confidence report as confidence_scores.json in the stage6 output dir."""
+    """
+    Save the confidence report as confidence_scores.json.
+
+    Each entry is enriched with traceability data when Stage 5.5 has run:
+      tr_ids          — list of TR-XXX requirement IDs that map to this feature
+      doc_covered     — {brd, srs, ac, us} boolean flags
+      code_link_count — total code links across all matched requirements
+    """
     import json as _json
+
+    tm = ctx.traceability_meta
+    enriched: list[dict] = []
+
+    for row in conf_report:
+        entry = dict(row)
+        if tm and hasattr(tm, "requirements") and tm.requirements:
+            feature_name = (row.get("feature") or "").lower()
+            matched = [
+                req for req in tm.requirements
+                if feature_name and (
+                    feature_name in (req.title or "").lower()
+                    or feature_name in (req.source_section or "").lower()
+                )
+            ]
+            if matched:
+                entry["tr_ids"] = [r.tr_id for r in matched[:10]]
+                entry["doc_covered"] = {
+                    "brd": any(r.covered_in_brd for r in matched),
+                    "srs": any(r.covered_in_srs for r in matched),
+                    "ac":  any(r.covered_in_ac  for r in matched),
+                    "us":  any(r.covered_in_us  for r in matched),
+                }
+                entry["code_link_count"] = sum(
+                    len(getattr(r, "code_links", None) or []) for r in matched
+                )
+        enriched.append(entry)
+
     path = ctx.output_path("confidence_scores.json")
     with open(path, "w", encoding="utf-8") as fh:
-        _json.dump(conf_report, fh, indent=2, ensure_ascii=False)
+        _json.dump(enriched, fh, indent=2, ensure_ascii=False)
     print(f"  [stage6] Confidence report saved → {path}")
 
 
