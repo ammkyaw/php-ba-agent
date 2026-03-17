@@ -1029,16 +1029,27 @@ def _call_part(system_prompt: str, user_prompt: str,
                max_tokens: int, label: str) -> str:
     """Call the configured LLM and return the raw response string.
 
-    json_mode=True forces local models (Ollama etc.) to output valid JSON
-    via response_format, preventing Qwen3 / DeepSeek-R1 from writing prose.
+    json_mode=True forces local models (Ollama etc.) to output valid JSON:
+      - OpenAI-compat path:   response_format={"type":"json_object"}
+      - Ollama native path:   format="json"  (top-level payload field)
+
+    prefill="{" is a secondary safety net for thinking models (Qwen3,
+    DeepSeek-R1): the assistant turn starts with "{" so the model cannot
+    emit any preamble or markdown fence before the JSON object.
+    On Claude the prefill is sent as a partial assistant message; on local
+    models it is appended to the messages array the same way.
     """
-    from pipeline.llm_client import call_llm
+    from pipeline.llm_client import call_llm, get_provider
+    # Use prefill only for local models — Claude handles structured output
+    # differently and prefill interferes with its extended-thinking mode.
+    use_prefill = "{" if get_provider() == "local" else ""
     return call_llm(
         system_prompt = system_prompt,
         user_prompt   = user_prompt,
         max_tokens    = max_tokens,
         label         = label,
         json_mode     = True,
+        prefill       = use_prefill,
     )
 
 
