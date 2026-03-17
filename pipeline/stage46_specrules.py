@@ -127,6 +127,79 @@ If a constraint is clearly boilerplate (deleted=0, internal routing), set confid
 """
 
 
+def _extract_json_array(raw: str) -> list | None:
+    """
+    Try every reasonable strategy to pull a JSON array out of `raw`.
+
+    Strategies (in order):
+      1. Direct parse — model followed instructions exactly
+      2. Strip ``` code fences, then parse
+      3. Regex scan for the first [...] block (handles prose preamble/postamble)
+      4. Truncation recovery — if the response was cut mid-array, close it and
+         drop the last (incomplete) element before parsing
+    Returns the parsed list, or None if all strategies fail.
+    """
+    raw = raw.strip()
+
+    # 1. Direct parse
+    if raw.startswith("["):
+        try:
+            parsed = json.loads(raw)
+            if isinstance(parsed, list):
+                return parsed
+        except json.JSONDecodeError:
+            pass  # may be truncated — fall through to recovery
+
+    # 2. Strip code fences
+    clean = raw
+    if clean.startswith("```"):
+        clean = re.sub(r"^```[a-zA-Z]*\s*", "", clean)
+        clean = re.sub(r"\s*```\s*$", "", clean).strip()
+        if clean.startswith("["):
+            try:
+                parsed = json.loads(clean)
+                if isinstance(parsed, list):
+                    return parsed
+            except json.JSONDecodeError:
+                pass
+
+    # 3. Find first JSON array anywhere in the response (handles preamble text)
+    match = re.search(r"(\[[\s\S]*\])", raw)
+    if match:
+        try:
+            parsed = json.loads(match.group(1))
+            if isinstance(parsed, list):
+                return parsed
+        except json.JSONDecodeError:
+            pass
+
+    # 4. Truncation recovery — close the array after the last complete object
+    #    (handles MAX_TOKENS cut mid-element)
+    candidate = clean if clean.startswith("[") else raw
+    brace_open = candidate.rfind("{")
+    if brace_open > 0:
+        truncated = candidate[:brace_open].rstrip().rstrip(",") + "]"
+        try:
+            parsed = json.loads(truncated)
+            if isinstance(parsed, list) and parsed:
+                print(f"  [stage46]   ⚠️  Truncated response — recovered {len(parsed)} item(s).")
+                return parsed
+        except json.JSONDecodeError:
+            pass
+
+    # 5. dict wrapper {"rules": [...]}
+    try:
+        parsed = json.loads(clean or raw)
+        if isinstance(parsed, dict):
+            for key in ("rules", "items", "results", "data"):
+                if isinstance(parsed.get(key), list):
+                    return parsed[key]
+    except json.JSONDecodeError:
+        pass
+
+    return None
+
+
 def _llm_formalize_batch(candidates: list[dict], batch_num: int) -> list[dict]:
     """Send a batch of rule candidates to the LLM and return structured results.
     Falls back to static GWT if LLM fails.
@@ -140,18 +213,19 @@ def _llm_formalize_batch(candidates: list[dict], batch_num: int) -> list[dict]:
             max_tokens    = LLM_MAX_TOKENS,
             label         = f"spec_rules_batch_{batch_num}",
         )
-        # Parse response
-        raw = raw.strip()
-        # Strip optional code fence
-        if raw.startswith("```"):
-            raw = re.sub(r"^```[a-z]*\n?", "", raw)
-            raw = re.sub(r"\n?```$", "", raw)
 
-        parsed = json.loads(raw)
-        if isinstance(parsed, list):
-            return parsed
-        if isinstance(parsed, dict) and "rules" in parsed:
-            return parsed["rules"]
+        if not raw or not raw.strip():
+            print(f"  [stage46] ⚠️  LLM batch {batch_num} returned empty response; using static fallback.")
+        else:
+            parsed = _extract_json_array(raw)
+            if parsed is not None:
+                return parsed
+            # Log a snippet to help debug what the model actually returned
+            snippet = raw.strip()[:200].replace("\n", " ")
+            print(f"  [stage46] ⚠️  LLM batch {batch_num} — could not extract JSON array. "
+                  f"Response preview: {snippet!r}")
+            print(f"  [stage46]   Using static fallback.")
+
     except Exception as exc:
         print(f"  [stage46] ⚠️  LLM batch {batch_num} failed ({exc}); using static fallback.")
 
