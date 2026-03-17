@@ -192,19 +192,31 @@ def _extract_json_array(raw: str) -> list | None:
         except json.JSONDecodeError:
             continue
 
-    # 4. Truncation recovery — close the array after the last complete object
-    #    (handles MAX_TOKENS cut mid-element)
+    # 4. Truncation recovery — two sub-strategies for MAX_TOKENS cut-off:
     candidate = clean if clean.startswith("[") else raw
-    brace_open = candidate.rfind("{")
-    if brace_open > 0:
-        truncated = candidate[:brace_open].rstrip().rstrip(",") + "]"
+    if candidate.startswith("["):
+        # 4a. Last object IS complete but closing "]" is missing — just append it.
+        #     Handles single-item sub-batches: '[{...}' → '[{...}]'
         try:
-            parsed = json.loads(truncated)
+            parsed = json.loads(candidate.rstrip() + "]")
             if isinstance(parsed, list) and _is_rule_list(parsed):
                 print(f"  [stage46]   ⚠️  Truncated response — recovered {len(parsed)} item(s).")
                 return parsed
         except json.JSONDecodeError:
             pass
+
+        # 4b. Array cut mid-object — drop the last incomplete element and close.
+        #     Handles: '[{...}, {...}, {...'  →  '[{...}, {...}]'
+        brace_open = candidate.rfind("{")
+        if brace_open > 0:
+            truncated = candidate[:brace_open].rstrip().rstrip(",") + "]"
+            try:
+                parsed = json.loads(truncated)
+                if isinstance(parsed, list) and _is_rule_list(parsed):
+                    print(f"  [stage46]   ⚠️  Truncated response — recovered {len(parsed)} item(s).")
+                    return parsed
+            except json.JSONDecodeError:
+                pass
 
     # 5. dict wrapper {"rules": [...]}
     try:
