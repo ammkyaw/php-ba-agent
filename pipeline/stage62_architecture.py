@@ -291,6 +291,7 @@ def _call_llm(system_prompt: str, user_prompt: str) -> str:
         system_prompt = system_prompt,
         user_prompt   = user_prompt,
         max_tokens    = MAX_TOKENS,
+        temperature   = 0.1,   # architecture: deterministic JSON structure
         label         = STAGE_NAME,
     )
 

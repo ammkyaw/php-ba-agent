@@ -1129,6 +1129,7 @@ def _call_part(system_prompt: str, user_prompt: str,
         system_prompt = system_prompt,
         user_prompt   = user_prompt,
         max_tokens    = max_tokens,
+        temperature   = 0.1,   # extraction: deterministic JSON output
         label         = label,
         json_mode     = True,
         prefill       = use_prefill,

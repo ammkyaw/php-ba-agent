@@ -496,7 +496,7 @@ def _refine(draft: str, cp: CriticPass) -> str:
         _REFINER_SYSTEM,
         user,
         max_tokens  = REFINER_MAX_TOKENS,
-        temperature = 0.15,
+        temperature = 0.35,  # prose refinement: needs fluency, not just precision
         label       = f"stage5_refiner_{cp.doc_type}",
     )
 
