@@ -273,6 +273,7 @@ def _llm_formalize_batch(candidates: list[dict], batch_num: int) -> list[dict]:
             system_prompt = _LLM_SYSTEM,
             user_prompt   = user_payload,
             max_tokens    = LLM_MAX_TOKENS,
+            temperature   = 0.1,   # extraction: deterministic rule classification
             label         = f"spec_rules_batch_{batch_num}",
             prefill       = "[",   # force model to start JSON array immediately,
                                    # preventing any "Thinking Process:" preamble

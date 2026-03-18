@@ -2104,6 +2104,7 @@ def _enrich_with_llm(
             user = _build_llm_user_prompt(context_name, batch, domain)
             try:
                 raw = call_llm(system, user, max_tokens=MAX_TOKENS,
+                               temperature=0.1,   # flow analysis: structural JSON
                                label=batch_label)
                 batch_enr = _parse_llm_response(raw, len(batch))
             except Exception as e:

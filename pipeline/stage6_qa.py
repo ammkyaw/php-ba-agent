@@ -175,7 +175,9 @@ def run(ctx: PipelineContext) -> None:
     if pass_c_prompt:
         print(f"  [stage6] Pass C — reverse audit ({len(pass_c_prompt):,} chars) ...")
         raw_c       = call_llm(system_prompt, pass_c_prompt,
-                               max_tokens=MAX_TOKENS_AUDIT, label="stage6_passC")
+                               max_tokens=MAX_TOKENS_AUDIT,
+                               temperature=0.1,  # reverse audit: strict file-by-file check
+                               label="stage6_passC")
         pass_c_data = _parse_response(raw_c, pass_label="C")
         n_missing   = sum(
             1 for e in pass_c_data.get("audit", [])

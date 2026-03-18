@@ -323,7 +323,9 @@ Markdown table: Term | Definition"""
                 + _gc_brd.strip()
             )
 
-    return call_llm(_append_traceability_hints(system), user, max_tokens=MAX_TOKENS, label="stage5_brd")
+    return call_llm(_append_traceability_hints(system), user, max_tokens=MAX_TOKENS,
+                    temperature=0.5,  # BRD: natural professional prose
+                    label="stage5_brd")
 
 
 # ─── SRS Agent ────────────────────────────────────────────────────────────────
@@ -462,7 +464,9 @@ Technical and business constraints on the implementation."""
                 + env_lines
             )
 
-    return call_llm(_append_traceability_hints(system), user, max_tokens=MAX_TOKENS, label="stage5_srs")
+    return call_llm(_append_traceability_hints(system), user, max_tokens=MAX_TOKENS,
+                    temperature=0.4,  # SRS: technical writing with some variability
+                    label="stage5_srs")
 
 
 # ─── AC Agent ─────────────────────────────────────────────────────────────────
@@ -546,7 +550,9 @@ Brief description of how acceptance testing should be approached for this system
 ## Test Data Requirements
 What test data is needed to execute these criteria."""
 
-    return call_llm(_append_traceability_hints(system), user, max_tokens=MAX_TOKENS, label="stage5_ac")
+    return call_llm(_append_traceability_hints(system), user, max_tokens=MAX_TOKENS,
+                    temperature=0.35,  # AC: structured but prose criteria
+                    label="stage5_ac")
 
 
 # ─── User Story Agent ──────────────────────────────────────────────────────────
@@ -640,7 +646,9 @@ Status for all stories should be "To Do"
 ## Total Story Points
 Sum by priority band."""
 
-    return call_llm(_append_traceability_hints(system), user, max_tokens=MAX_TOKENS, label="stage5_userstories")
+    return call_llm(_append_traceability_hints(system), user, max_tokens=MAX_TOKENS,
+                    temperature=0.5,  # user stories: narrative writing
+                    label="stage5_userstories")
 
 
 # ─── Helpers ───────────────────────────────────────────────────────────────────
