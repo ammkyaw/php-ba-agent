@@ -55,6 +55,25 @@ Environment variables:
                        always uses explicit chain-of-thought prompting instead.
                          export LOCAL_LLM_THINKING=1  # re-enable if needed
 
+    Response cache (pipeline/llm_cache.py):
+    LLM_CACHE_ENABLED  "1"|"true"|"yes" to enable the SQLite exact-match cache
+                       (default: disabled).  When enabled, identical calls
+                       (same model + prompts + temperature) return the cached
+                       response instantly — saves significant time and tokens
+                       when re-running the pipeline on the same codebase.
+                         export LLM_CACHE_ENABLED=1
+    LLM_CACHE_PATH     Path to the SQLite cache file
+                       (default: .llm_cache.db in the current directory)
+                         export LLM_CACHE_PATH=/tmp/llm_cache.db
+
+    Claude prefix caching:
+    CLAUDE_PREFIX_CACHE
+                       "1"|"true"|"yes" to attach cache_control breakpoints to
+                       Claude system prompts (default: enabled when provider=claude).
+                       Reduces cost for large, stable system prompts (stage4/5/6).
+                       Set to "0" to disable if you hit caching-related API errors.
+                         export CLAUDE_PREFIX_CACHE=0  # disable
+
 Default models:
     Claude : claude-sonnet-4-20250514
     Gemini : gemini-2.5-flash-lite   (free tier)
@@ -230,11 +249,20 @@ def call_llm(
     Raises:
         RuntimeError: On non-retryable API error, or after all retries exhausted.
     """
+    from pipeline import llm_cache as _cache
+
     provider = get_provider()
     model    = get_model()
     tag      = f"[{label}] " if label else ""
 
     print(f"  {tag}LLM provider : {provider} ({model})")
+
+    # ── Exact-match cache lookup ───────────────────────────────────────────────
+    cache_key = _cache.make_key(model, system_prompt, user_prompt,
+                                temperature, json_mode, prefill)
+    cached = _cache.get(cache_key, label=label)
+    if cached is not None:
+        return cached
 
     if provider == "claude":
         call_fn = _call_claude
@@ -249,13 +277,17 @@ def call_llm(
     for attempt in range(MAX_RETRIES + 1):   # attempt 0 = first try
         try:
             if provider == "local":
-                return _call_local(system_prompt, user_prompt, max_tokens,
-                                   temperature, model, json_mode=json_mode,
-                                   prefill=prefill)
-            if provider == "claude":
-                return _call_claude(system_prompt, user_prompt, max_tokens,
-                                    temperature, model, prefill=prefill)
-            return call_fn(system_prompt, user_prompt, max_tokens, temperature, model)
+                result = _call_local(system_prompt, user_prompt, max_tokens,
+                                     temperature, model, json_mode=json_mode,
+                                     prefill=prefill)
+            elif provider == "claude":
+                result = _call_claude(system_prompt, user_prompt, max_tokens,
+                                      temperature, model, prefill=prefill)
+            else:
+                result = call_fn(system_prompt, user_prompt, max_tokens,
+                                 temperature, model)
+            _cache.put(cache_key, result, label=label)
+            return result
 
         except _NonRetryableError:
             raise   # bad key, safety block, empty response — don't retry
@@ -674,12 +706,31 @@ def _call_claude(
     if prefill:
         messages.append({"role": "assistant", "content": prefill})
 
+    # Prefix caching: mark the system prompt for server-side KV caching.
+    # Anthropic caches content blocks whose cumulative token count exceeds
+    # ~1024 tokens; smaller prompts are cached but the saving is minimal.
+    # Disable via CLAUDE_PREFIX_CACHE=0 if you hit unexpected API errors.
+    prefix_cache = os.environ.get("CLAUDE_PREFIX_CACHE", "1").strip().lower() not in (
+        "0", "false", "no"
+    )
+    if prefix_cache:
+        system_param: list[dict] | str = [
+            {
+                "type":          "text",
+                "text":          system_prompt,
+                "cache_control": {"type": "ephemeral"},
+            }
+        ]
+    else:
+        system_param = system_prompt
+
     client  = anthropic.Anthropic(api_key=api_key)
     message = client.messages.create(
-        model      = model,
-        max_tokens = max_tokens,
-        system     = system_prompt,
-        messages   = messages,
+        model       = model,
+        max_tokens  = max_tokens,
+        temperature = temperature,
+        system      = system_param,
+        messages    = messages,
     )
 
     if not message.content:
