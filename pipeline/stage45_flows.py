@@ -669,14 +669,15 @@ def run(ctx: PipelineContext) -> None:
     # Tier-0 highest priority, then Tier-1, then graph BFS paths
     all_raw: list = laravel_skeletons + tier1_skeletons + raw_paths
 
-    # Back-fill branches for Tier-0/Tier-1 skeletons that start with branches:[]
-    # using redirect evidence from the code map.  Prevents V-04 false positives
-    # where a flow has multiple redirect targets but no declared branches.
-    _fill_branches_from_redirects(all_raw, ctx.code_map)
-
     print("  [stage45] Pass D–E: Stitching execution_paths onto graph paths ...")
     flow_skeletons = _stitch_execution_paths(all_raw, ctx, G)
     print(f"  [stage45]   {len(flow_skeletons)} flow skeleton(s) built")
+
+    # Back-fill branches AFTER stitching — _stitch_execution_paths creates
+    # entirely new skeleton dicts so any branches filled in all_raw would be
+    # discarded.  Running here ensures the filled branches land in the dicts
+    # that _enrich_with_llm reads via sk["branches"].
+    _fill_branches_from_redirects(flow_skeletons, ctx.code_map)
 
     print("  [stage45] Pass F: Grouping by bounded context ...")
     context_groups = _group_by_context(flow_skeletons, ctx)
