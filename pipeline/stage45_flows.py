@@ -2262,7 +2262,33 @@ Rules:
   Each entry: {{"condition": "what triggers this path", "outcome": "what happens"}}
   Use [] if the flow has only one outcome.
 - replaces_workflow: name of an existing workflow this replaces, or null
-- Respond with a JSON array of objects, one per skeleton, in the same order"""
+- Respond with a JSON array of objects, one per skeleton, in the same order
+
+EXAMPLE INPUT (skeleton):
+  Route chain: POST /login → AuthController::login
+  SQL tables: users, sessions
+  Files visited: login.php → AuthController.php
+  Step 1: /login — Display login form [GET]
+  Step 2: /login — Submit credentials [POST] [DB: SELECT users, INSERT sessions] inputs=['email','password']
+  Step 3: Redirect → /dashboard
+  Alternate paths (2):
+    • if !$validated → Redirect → /login?error=1
+    • if $account->suspended → Redirect → /suspended
+
+EXAMPLE OUTPUT:
+[
+  {{
+    "name": "Customer Login",
+    "actor": "Guest",
+    "trigger": "User submits login credentials on the login form",
+    "termination": "User is authenticated and redirected to the dashboard",
+    "branches": [
+      {{"condition": "Validation fails (invalid credentials)", "outcome": "User is redirected back to login with error message"}},
+      {{"condition": "Account is suspended", "outcome": "User is redirected to suspended account notice"}}
+    ],
+    "replaces_workflow": null
+  }}
+]"""
 
 
 def _build_llm_user_prompt(

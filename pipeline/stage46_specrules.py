@@ -142,6 +142,34 @@ OUTPUT RULES (strictly enforced):
 - Do NOT write any text before or after the JSON array
 Keep technical jargon OUT of given/when/then; use plain business language.
 given/when/then must each be a single sentence — no bullet points or sub-clauses.
+
+EXAMPLE INPUT:
+[
+  {"id": "C-042", "type": "length_check", "subject": "password", "detail": "strlen($password) >= 8", "source_file": "AuthController.php"},
+  {"id": "C-101", "type": "csrf", "subject": "_token", "detail": "VerifyCsrfToken middleware", "source_file": "Kernel.php"}
+]
+
+EXAMPLE OUTPUT:
+[
+  {
+    "id": "C-042",
+    "title": "Password Minimum Length",
+    "given": "Given a user is registering or changing their password",
+    "when": "When they submit the password form",
+    "then": "Then the system must reject passwords shorter than 8 characters",
+    "confidence": 0.95,
+    "tags": ["password", "validation", "security", "registration"]
+  },
+  {
+    "id": "C-101",
+    "title": "Form Submission Token Check",
+    "given": "Given a user submits any state-changing form",
+    "when": "When the request is received by the server",
+    "then": "Then the system verifies the CSRF token matches the session token",
+    "confidence": 0.05,
+    "tags": ["csrf", "framework", "security"]
+  }
+]
 """
 
 
