@@ -154,22 +154,40 @@ def run(ctx: PipelineContext) -> None:
     # Capped to keep the prompt token budget manageable.
     known_pages: list[str] = _build_grounding_pages(cm, cap=300)
 
+    # ── Self-consistency voting ───────────────────────────────────────────────
+    # STAGE4_CONSISTENCY_RUNS=N runs Calls A and B N times independently and
+    # merges results by taking the union of entities/features/contexts.
+    # Default is 1 (off) to preserve speed; set to 3 for higher accuracy.
+    _consistency_runs = max(1, int(os.environ.get("STAGE4_CONSISTENCY_RUNS", "1") or "1"))
+
     # ── Call A: meta + entities + contexts (fast, ~4K tokens) ────────────────
-    print(f"  [stage4] Call 1/3 — domain name, entities, contexts ...")
-    raw_a = _call_part(_system_meta(quality_score), user_prompt,
-                       MAX_TOKENS_META, "stage4-A")
-    data_a = _parse_partial(raw_a, "A", debug_dir)
+    print(f"  [stage4] Call 1/3 — domain name, entities, contexts "
+          f"(x{_consistency_runs} consistency runs) ...")
+    _a_results: list[dict] = []
+    for _run in range(_consistency_runs):
+        _lbl = f"stage4-A{_run+1}" if _consistency_runs > 1 else "stage4-A"
+        _a_results.append(_parse_partial(
+            _call_part(_system_meta(quality_score), user_prompt, MAX_TOKENS_META, _lbl),
+            f"A{_run+1}", debug_dir,
+        ))
+    data_a = _merge_consistency_a(_a_results)
 
     # ── Call B: features (largest field, ~8K tokens) ──────────────────────────
-    print(f"  [stage4] Call 2/3 — features ...")
-    raw_b = _call_part(
-        _system_features(quality_score,
-                         known_tables=known_tables,
-                         known_pages=known_pages,
-                         known_fields=known_fields),
-        user_prompt, MAX_TOKENS_FEATURES, "stage4-B",
-    )
-    data_b = _parse_partial(raw_b, "B", debug_dir)
+    print(f"  [stage4] Call 2/3 — features "
+          f"(x{_consistency_runs} consistency runs) ...")
+    _b_results: list[dict] = []
+    _sys_b = _system_features(quality_score,
+                               known_tables=known_tables,
+                               known_pages=known_pages,
+                               known_fields=known_fields,
+                               table_columns=getattr(cm, "table_columns", None) or [])
+    for _run in range(_consistency_runs):
+        _lbl = f"stage4-B{_run+1}" if _consistency_runs > 1 else "stage4-B"
+        _b_results.append(_parse_partial(
+            _call_part(_sys_b, user_prompt, MAX_TOKENS_FEATURES, _lbl),
+            f"B{_run+1}", debug_dir,
+        ))
+    data_b = _merge_consistency_b(_b_results)
 
     # Filter hallucinated page/table names.
     # Use known_files_all (not just known_pages) so that controller / service
@@ -220,6 +238,78 @@ def run(ctx: PipelineContext) -> None:
     print(f"  [stage4]   Entities : {domain_model.key_entities}")
     print(f"  [stage4]   Contexts : {domain_model.bounded_contexts}")
     print(f"  [stage4] Saved → {output_path}")
+
+
+# ─── Self-Consistency Merge Helpers ───────────────────────────────────────────
+
+def _merge_consistency_a(results: list[dict]) -> dict:
+    """
+    Merge multiple Call-A results (domain_name, key_entities, bounded_contexts).
+
+    Strategy:
+      - domain_name / description: take from the run that produced the most entities
+      - key_entities: union across all runs, deduplicated case-insensitively
+      - bounded_contexts: union across all runs, deduplicated case-insensitively
+    """
+    if len(results) == 1:
+        return results[0]
+
+    # Pick the base result (most entities → likely highest quality run)
+    base = max(results, key=lambda r: len(r.get("key_entities") or []))
+    merged = dict(base)
+
+    # Union of entities
+    seen_ent: set[str] = set()
+    entities: list[str] = []
+    for r in results:
+        for e in (r.get("key_entities") or []):
+            key = str(e).strip().lower()
+            if key and key not in seen_ent:
+                seen_ent.add(key)
+                entities.append(e)
+    merged["key_entities"] = entities
+
+    # Union of bounded contexts
+    seen_ctx: set[str] = set()
+    contexts: list[str] = []
+    for r in results:
+        for c in (r.get("bounded_contexts") or []):
+            key = str(c).strip().lower()
+            if key and key not in seen_ctx:
+                seen_ctx.add(key)
+                contexts.append(c)
+    merged["bounded_contexts"] = contexts
+
+    if len(results) > 1:
+        print(f"  [stage4] Consistency merge A: "
+              f"{len(entities)} entities, {len(contexts)} contexts "
+              f"(from {len(results)} runs)")
+    return merged
+
+
+def _merge_consistency_b(results: list[dict]) -> dict:
+    """
+    Merge multiple Call-B results (features list).
+
+    Strategy: union of all features across runs, deduplicated by name
+    (case-insensitive).  Features from later runs fill gaps not covered by
+    earlier runs.
+    """
+    if len(results) == 1:
+        return results[0]
+
+    seen_names: set[str] = set()
+    merged_features: list[dict] = []
+    for r in results:
+        for f in (r.get("features") or []):
+            key = (f.get("name") or "").strip().lower()
+            if key and key not in seen_names:
+                seen_names.add(key)
+                merged_features.append(f)
+
+    print(f"  [stage4] Consistency merge B: "
+          f"{len(merged_features)} unique features (from {len(results)} runs)")
+    return {"features": merged_features}
 
 
 # ─── Retrieval ─────────────────────────────────────────────────────────────────
@@ -417,28 +507,67 @@ Rename for clarity, merge near-empty ones, but anchor to detected module names.
 Now produce the JSON for domain_name, description, key_entities, and bounded_contexts:"""
 
 
+def _format_schema_grounding(
+    known_tables: list[str],
+    table_columns: list[dict],
+) -> str:
+    """
+    Build a rich DB schema grounding block.
+
+    When table_columns is available, emit full column info (name + type +
+    nullable + FK) for each table.  Falls back to the flat table-name list
+    when column data is absent.
+    """
+    # Index column data by table name (lower-cased for case-insensitive match)
+    col_index: dict[str, list[dict]] = {}
+    for entry in (table_columns or []):
+        tname = (entry.get("table") or "").strip().lower()
+        if tname:
+            col_index.setdefault(tname, []).extend(entry.get("columns") or [])
+
+    lines: list[str] = [
+        "MANDATORY GROUNDING — DATABASE SCHEMA (actual tables and columns):"
+    ]
+    for table in known_tables[:60]:          # cap to 60 tables
+        cols = col_index.get(table.lower(), [])
+        if cols:
+            col_parts: list[str] = []
+            for c in cols[:20]:              # cap to 20 cols per table
+                cname = c.get("name", "?")
+                ctype = c.get("type", "")
+                nullable = " NULL" if c.get("nullable") else " NOT NULL"
+                default  = f" DEFAULT {c['default']}" if c.get("default") not in (None, "") else ""
+                col_parts.append(f"{cname} ({ctype}{nullable}{default})")
+            lines.append(f"  {table}: {', '.join(col_parts)}")
+        else:
+            lines.append(f"  {table}")
+
+    lines += [
+        "You MUST use ONLY table names from the schema above in 'tables' arrays.",
+        "Do NOT invent table names. Use the exact column names shown when writing business_rules.",
+    ]
+    return "\n".join(lines)
+
+
 def _system_features(
-    quality_score: int,
-    known_tables: list[str] | None = None,
-    known_pages:  list[str] | None = None,
-    known_fields: list[str] | None = None,
+    quality_score:  int,
+    known_tables:   list[str] | None = None,
+    known_pages:    list[str] | None = None,
+    known_fields:   list[str] | None = None,
+    table_columns:  list[dict] | None = None,
 ) -> str:
     """Call B — features list only.
 
-    known_tables / known_pages / known_fields: when provided, injected as
-    mandatory grounding so the model cannot hallucinate names that don't exist
-    in the actual codebase.
+    known_tables / known_pages / known_fields / table_columns: when provided,
+    injected as mandatory grounding so the model cannot hallucinate names that
+    don't exist in the actual codebase.  table_columns enriches table grounding
+    with column names and types for more accurate business_rules generation.
     """
     # ── Build grounding block ────────────────────────────────────────────────
     grounding_parts: list[str] = []
     if known_tables:
-        tables_str = ", ".join(known_tables[:100])   # cap to avoid token overflow
         grounding_parts.append(
-            "MANDATORY GROUNDING — ACTUAL DATABASE TABLES IN THIS CODEBASE:\n"
-            f"{tables_str}\n"
-            "You MUST use ONLY table names from the list above in 'tables' arrays.\n"
-            "Do NOT invent table names like 'products', 'orders', 'cart_items' "
-            "unless they actually appear in this list."
+            _format_schema_grounding(known_tables, table_columns or [])
         )
     if known_pages:
         pages_str = ", ".join(known_pages[:250])     # cap to avoid token overflow

@@ -286,6 +286,19 @@ def call_llm(
             else:
                 result = call_fn(system_prompt, user_prompt, max_tokens,
                                  temperature, model)
+            # ── JSON validation + single correction retry ──────────────────
+            if json_mode:
+                ok, err = _validate_json(result)
+                if not ok:
+                    corrected = _json_correction_call(
+                        system_prompt, result, err,
+                        max_tokens, temperature, model, provider, label,
+                    )
+                    ok2, _ = _validate_json(corrected)
+                    if ok2:
+                        result = corrected
+                    else:
+                        print(f"  {tag}JSON correction also invalid — using original")
             _cache.put(cache_key, result, label=label)
             return result
 
@@ -310,6 +323,56 @@ def call_llm(
         f"LLM call failed after {MAX_RETRIES + 1} attempt(s). "
         f"Last error: {last_exc}"
     )
+
+
+def _validate_json(text: str) -> tuple[bool, str]:
+    """
+    Try to parse *text* as JSON.  Returns (True, "") on success or
+    (False, error_message) on failure.  Strips markdown fences first.
+    """
+    import json as _json
+    t = text.strip()
+    if t.startswith("```"):
+        t = "\n".join(l for l in t.splitlines() if not l.strip().startswith("```")).strip()
+    try:
+        _json.loads(t)
+        return True, ""
+    except _json.JSONDecodeError as exc:
+        return False, str(exc)
+
+
+def _json_correction_call(
+    system_prompt: str,
+    bad_response:  str,
+    error_msg:     str,
+    max_tokens:    int,
+    temperature:   float,
+    model:         str,
+    provider:      str,
+    label:         str,
+) -> str:
+    """
+    Make a single correction call asking the model to fix its malformed JSON.
+    Returns the corrected text (may still be invalid — caller decides).
+    """
+    tag = f"[{label}] " if label else ""
+    fix_system = (
+        system_prompt
+        + "\n\nYour previous response was not valid JSON. "
+        "Return ONLY the corrected JSON — no prose, no fences, no explanation."
+    )
+    fix_user = (
+        f"Your previous response had a JSON parse error:\n{error_msg}\n\n"
+        f"Malformed response:\n{bad_response}\n\n"
+        "Please return the corrected JSON only."
+    )
+    print(f"  {tag}JSON invalid — requesting correction")
+    if provider == "local":
+        return _call_local(fix_system, fix_user, max_tokens, temperature, model, json_mode=True)
+    elif provider == "claude":
+        return _call_claude(fix_system, fix_user, max_tokens, temperature, model)
+    else:
+        return _call_gemini(fix_system, fix_user, max_tokens, temperature, model)
 
 
 # ─── Internal sentinel for errors that must not be retried ────────────────────
