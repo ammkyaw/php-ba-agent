@@ -856,7 +856,8 @@ class PipelineContext:
         "stage5_ac":              StageResult(),
         "stage5_userstories":     StageResult(),
         "stage55_traceability":   StageResult(),  # automated traceability matrix (static)
-        "stage59_doccoverage":    StageResult(),  # document coverage audit (static)
+        "stage58_doccoverage":    StageResult(),  # document coverage audit (static)
+        "stage59_accuracy_report": StageResult(), # BA document accuracy report (static)
         "stage6_qa":              StageResult(),
         "stage62_architecture":   StageResult(),  # architecture reconstruction (LLM)
         "stage65_postprocess":    StageResult(),
