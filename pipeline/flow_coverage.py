@@ -12,8 +12,10 @@ Four metrics
        appear in at least one flow step.
 
   2. Route Coverage
-       route_files_in_flows / total_route_files
-       How many files that register HTTP routes appear in flow steps.
+       route_handler_files_in_flows / total_route_handler_files
+       How many route handler/controller files (resolved from the route's
+       handler field) appear in flow steps.  Falls back to the route
+       definition file when the handler is a closure or absent.
 
   3. Database Table Coverage
        tables_touched_by_flow_pages / total_unique_tables
@@ -61,6 +63,31 @@ def _extract_module_name(filepath: str) -> str | None:
         if part.lower() == "modules" and i + 1 < len(parts):
             return parts[i + 1]
     return None
+
+
+def _handler_to_filename(handler: str | None) -> str | None:
+    """
+    Convert a route handler string to a lowercase PHP filename for matching.
+
+    Handles two common formats:
+      "App\\Controller\\UserController:index"  → "usercontroller.php"
+      "UserController@index"                   → "usercontroller.php"
+
+    Returns None for closures / anonymous handlers that have no filename.
+    """
+    if not handler:
+        return None
+    h = handler.strip()
+    # Skip anonymous/closure handlers
+    if h.lower() in ("(closure)", "closure", "(anonymous)", ""):
+        return None
+    # Normalise separator: both "Class:method" and "Class@method"
+    class_part = h.replace("@", ":").split(":")[0]
+    # Take the last segment of a namespaced class: "App\\Ctrl\\Foo" → "Foo"
+    class_name = class_part.replace("\\", "/").split("/")[-1].strip()
+    if not class_name:
+        return None
+    return class_name.lower() + ".php"
 
 
 def _module_expand(exec_paths: list[dict], flow_pages: set[str]) -> set[str]:
@@ -164,15 +191,27 @@ def _compute(ctx: Any) -> dict[str, Any]:
     ep_missing = sorted(ep_all - module_flow_pages)
 
     # ── 2. Route coverage ─────────────────────────────────────────────────────
+    # Prefer matching by the route's *handler* class file (e.g. UserController
+    # → usercontroller.php) because handler files are the ones that appear in
+    # flow steps.  Route *definition* files (routes.php, moduleroutes.php, …)
+    # are pure wiring infrastructure and never appear in flow steps, so using
+    # them as the match key always yields 0% on framework-style codebases.
+    # Fall back to the definition file only when the handler is a closure or
+    # is absent (e.g. legacy inline routes).
     route_files: set[str] = set()
     _SKIP_METHODS = {"GROUP", "MIDDLEWARE", "PREFIX", "MIDDLEWARE_GROUP"}
     if cm and cm.routes:
-        route_files = {
-            Path(r["file"]).name.lower()
-            for r in cm.routes
-            if r.get("file")
-            and (r.get("method") or "GROUP").upper() not in _SKIP_METHODS
-        }
+        for r in cm.routes:
+            if not r.get("file"):
+                continue
+            if (r.get("method") or "GROUP").upper() in _SKIP_METHODS:
+                continue
+            handler_file = _handler_to_filename(r.get("handler"))
+            if handler_file:
+                route_files.add(handler_file)
+            else:
+                # Closure / inline route — fall back to definition file basename
+                route_files.add(Path(r["file"]).name.lower())
     rt_covered = route_files & module_flow_pages
     rt_missing = sorted(route_files - module_flow_pages)
 
