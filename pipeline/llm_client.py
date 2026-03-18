@@ -225,6 +225,14 @@ def call_llm(
                                     # completely preventing any reasoning preamble.
                                     # The prefill string is prepended to the
                                     # returned text so callers see a complete value.
+    json_schema:   dict | None = None,  # optional JSON schema for constrained decoding
+                                        # (Ollama ≥0.4.6 native path only).
+                                        # When set, grammar-level enforcement replaces
+                                        # best-effort json_mode — invalid JSON is
+                                        # literally impossible.  json_mode is
+                                        # automatically set True when schema is given.
+    model_override: str | None = None,  # override the configured model for this call
+                                        # used by multi-model ensemble
 ) -> str:
     """
     Call the configured LLM provider and return the response text.
@@ -252,7 +260,9 @@ def call_llm(
     from pipeline import llm_cache as _cache
 
     provider = get_provider()
-    model    = get_model()
+    model    = model_override or get_model()
+    if json_schema is not None:
+        json_mode = True  # schema implies json_mode
     tag      = f"[{label}] " if label else ""
 
     print(f"  {tag}LLM provider : {provider} ({model})")
@@ -279,7 +289,7 @@ def call_llm(
             if provider == "local":
                 result = _call_local(system_prompt, user_prompt, max_tokens,
                                      temperature, model, json_mode=json_mode,
-                                     prefill=prefill)
+                                     prefill=prefill, json_schema=json_schema)
             elif provider == "claude":
                 result = _call_claude(system_prompt, user_prompt, max_tokens,
                                       temperature, model, prefill=prefill)
@@ -397,6 +407,7 @@ def _call_local(
     model:         str,
     json_mode:     bool = False,
     prefill:       str = "",
+    json_schema:   dict | None = None,
 ) -> str:
     """
     Call a local LLM server.
@@ -425,7 +436,7 @@ def _call_local(
     if num_ctx > 0:
         return _call_local_ollama_native(
             system_prompt, user_prompt, max_tokens, temperature,
-            model, num_ctx, prefill, json_mode=json_mode,
+            model, num_ctx, prefill, json_mode=json_mode, json_schema=json_schema,
         )
 
     base_url = get_local_url()
@@ -448,7 +459,14 @@ def _call_local(
         "temperature": temperature,
         "stream":      False,
     }
-    if json_mode:
+    if json_schema is not None:
+        # Structured output via JSON schema — Ollama ≥0.4.6, LM Studio ≥0.3.
+        # Grammar-level enforcement: invalid JSON is literally impossible.
+        payload["response_format"] = {
+            "type": "json_schema",
+            "json_schema": {"name": "response", "strict": True, "schema": json_schema},
+        }
+    elif json_mode:
         # Forces Ollama / LM Studio / llama.cpp to output valid JSON.
         # Supported by Ollama ≥ 0.1.14 and LM Studio ≥ 0.2.
         payload["response_format"] = {"type": "json_object"}
@@ -542,6 +560,7 @@ def _call_local_ollama_native(
     num_ctx:       int,
     prefill:       str = "",
     json_mode:     bool = False,
+    json_schema:   dict | None = None,
 ) -> str:
     """
     Call Ollama via its native /api/chat endpoint.
@@ -602,7 +621,11 @@ def _call_local_ollama_native(
         # Ollama ≥0.6: top-level "think" key suppresses the reasoning trace
         # and forces all output into message.content.
         payload["think"] = False
-    if json_mode:
+    if json_schema is not None:
+        # Ollama ≥0.4.6: pass JSON schema directly as "format" for grammar-level
+        # constrained decoding — the model cannot emit anything that violates the schema.
+        payload["format"] = json_schema
+    elif json_mode:
         # Ollama native /api/chat uses a top-level "format" field (not inside
         # "options") to constrain output to valid JSON.
         payload["format"] = "json"

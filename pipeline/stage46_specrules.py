@@ -173,6 +173,25 @@ EXAMPLE OUTPUT:
 """
 
 
+# ── JSON schema for constrained decoding (Ollama ≥0.4.6 structured outputs) ──
+_RULE_JSON_SCHEMA: dict = {
+    "type": "array",
+    "items": {
+        "type": "object",
+        "properties": {
+            "id":         {"type": "string"},
+            "title":      {"type": "string"},
+            "given":      {"type": "string"},
+            "when":       {"type": "string"},
+            "then":       {"type": "string"},
+            "confidence": {"type": "number"},
+            "tags":       {"type": "array", "items": {"type": "string"}},
+        },
+        "required": ["id", "title", "given", "when", "then", "confidence", "tags"],
+    },
+}
+
+
 def _extract_json_array(raw: str) -> list | None:
     """
     Try every reasonable strategy to pull a JSON array out of `raw`.
@@ -316,6 +335,7 @@ def _llm_formalize_batch(candidates: list[dict], batch_num: int) -> list[dict]:
             label         = f"spec_rules_batch_{batch_num}",
             prefill       = "[",   # force model to start JSON array immediately,
                                    # preventing any "Thinking Process:" preamble
+            json_schema   = _RULE_JSON_SCHEMA,  # grammar-level JSON enforcement
         )
 
         if not raw or not raw.strip():

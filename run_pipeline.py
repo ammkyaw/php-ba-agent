@@ -200,6 +200,13 @@ async def run_pipeline(ctx: PipelineContext, until: Optional[str] = None, force:
             print(f"Stopping at requested stage: {until}")
             break
 
+    # Generate confidence-based human review report after all stages complete
+    try:
+        from pipeline.review_report import generate as _gen_review
+        _gen_review(ctx)
+    except Exception as _rev_exc:
+        print(f"  [review_report] Warning: could not generate review report: {_rev_exc}")
+
     print("\nPipeline complete! Outputs:", ctx.output_dir)
 
 
