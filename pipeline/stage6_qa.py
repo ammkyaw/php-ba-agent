@@ -822,8 +822,18 @@ def _load_doc_coverage(ctx: PipelineContext) -> dict:
     import os
     dc = getattr(ctx, "doc_coverage", None)
     if dc is not None:
-        # already hydrated — convert DimCoverage dicts to checklist-friendly shape
-        return {d["dimension"]: d for d in (dc.dimensions or [])}
+        # dc.dimensions may contain DimCoverage dataclass objects (stage58 stores
+        # them as dataclasses, not dicts).  Normalise to dicts before building
+        # the keyed lookup so downstream code can use d["dimension"] safely.
+        from dataclasses import asdict as _asdict, fields as _fields
+        def _to_dict(d: object) -> dict:
+            if isinstance(d, dict):
+                return d
+            try:
+                return _asdict(d)
+            except TypeError:
+                return {f.name: getattr(d, f.name) for f in _fields(d)}
+        return {d["dimension"]: d for d in (_to_dict(x) for x in (dc.dimensions or []))}
     path = ctx.output_path("doc_coverage.json")
     if os.path.exists(path):
         with open(path, encoding="utf-8") as fh:

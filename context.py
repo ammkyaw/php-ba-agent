@@ -681,7 +681,7 @@ class DocCoverageResult:
     state machines, relationships) made it into the generated BA documents.
     Consumed by Stage 6 to inject gap context into the QA review prompt.
     """
-    dimensions:     list[dict]  = field(default_factory=list)   # DimCoverage as dicts
+    dimensions:     list        = field(default_factory=list)   # DimCoverage objects or dicts
     overall_pct:    float       = 0.0
     overall_status: str         = "fail"                        # "pass" | "warn" | "fail"
     gap_summary:    list[str]   = field(default_factory=list)   # human-readable gaps
