@@ -106,6 +106,18 @@ def run(ctx: PipelineContext) -> None:
         e.table.lower() for e in (ctx.entities.entities if ctx.entities else [])
     )
 
+    # Word-level tokens from the entity catalog (≥4 chars), used for fuzzy
+    # matching when rule.entities use descriptive names rather than table names.
+    # e.g. "email_addresses" → {"email", "addresses"}
+    # e.g. "acl_roles_actions" → {"roles", "actions"}
+    _MIN_WORD_LEN = 4
+    known_words: frozenset[str] = frozenset(
+        word
+        for table in known_tables
+        for word in table.replace("_", " ").split()
+        if len(word) >= _MIN_WORD_LEN
+    )
+
     # Tables that have state machines
     machine_tables: frozenset[str] = frozenset(
         m.table.lower() for m in (ctx.state_machines.machines if ctx.state_machines else [])
@@ -152,7 +164,9 @@ def run(ctx: PipelineContext) -> None:
         contradicting: list[str] = []
         contradiction_notes: list[str] = []
 
-        applicable = _MAX_APPLICABLE.get(rule.category, _MAX_APPLICABLE_DEFAULT)
+        # Mutable per-rule set so we can remove inapplicable checks (e.g.
+        # entity_model when entity names are generic/unresolvable).
+        applicable = set(_MAX_APPLICABLE.get(rule.category, _MAX_APPLICABLE_DEFAULT))
 
         # ── 1. code_static ─────────────────────────────────────────────────────
         if _T_CODE_STATIC in applicable:
@@ -201,17 +215,36 @@ def run(ctx: PipelineContext) -> None:
         # ── 4. entity_model ────────────────────────────────────────────────────
         if _T_ENTITY_MODEL in applicable:
             if rule.entities and ctx.entities:
-                rule_tables_lower = {e.lower() for e in rule.entities}
+                rule_tables_lower = {e.lower() for e in rule.entities
+                                     if e and len(e.strip()) >= 3}
+                # Pass 1: exact table-name match
                 matched = rule_tables_lower & known_tables
+                if not matched:
+                    # Pass 2: word-overlap match — rule entity names often come
+                    # from stage2.9 variable/comment text (e.g. "Email Address
+                    # String") rather than DB table names ("email_addresses").
+                    # Split each rule entity into words (≥4 chars) and check
+                    # against the word-token set from the catalog.
+                    rule_words = {
+                        word
+                        for ent in rule_tables_lower
+                        for word in ent.replace("_", " ").split()
+                        if len(word) >= _MIN_WORD_LEN
+                    }
+                    matched = rule_words & known_words
                 if matched:
                     corroborating.append(_T_ENTITY_MODEL)
                 else:
-                    # Entities mentioned in the rule don't appear in the catalog.
-                    # Could be pre-4.1 name mismatch — flag but don't hard-contradict.
-                    contradicting.append(_T_ENTITY_MODEL)
+                    # No exact or word-level match.  Stage 2.9 entity names are
+                    # free-form strings extracted from code comments / variable
+                    # names; they frequently don't align with catalog table names.
+                    # Treat as neutral (remove from applicable) rather than
+                    # hard-contradicting, to avoid penalising valid rules whose
+                    # entity names happen to be generic/descriptive.
+                    applicable.discard(_T_ENTITY_MODEL)
                     contradiction_notes.append(
                         f"entities {sorted(rule_tables_lower)} not found in entity "
-                        f"catalog — possible hallucination or name mismatch"
+                        f"catalog (name mismatch likely — excluded from score)"
                     )
             elif rule.category == "REFERENTIAL" and ctx.relationships and rule.entities:
                 # Referential rules may be corroborated by relationship catalog alone
