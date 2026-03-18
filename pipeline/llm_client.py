@@ -37,6 +37,16 @@ Environment variables:
                        small (2048–4096); set this to 16384 or 32768 when you
                        see truncated output with large batches:
                          export LOCAL_LLM_NUM_CTX=16384
+    LOCAL_LLM_NUM_PREDICT
+                       Ollama-only (native /api/chat path): maximum tokens the
+                       model may generate per response (num_predict).  Defaults
+                       to the per-call max_tokens value (8192 for stage45).
+                       Thinking models (qwen3, deepseek-r1) consume most of
+                       that budget on reasoning before writing the final answer,
+                       so they hit the limit and return empty content.
+                       Set to -1 for unlimited, or a large value like 32768:
+                         export LOCAL_LLM_NUM_PREDICT=-1   # unlimited
+                         export LOCAL_LLM_NUM_PREDICT=32768
     LOCAL_LLM_THINKING "1" | "true" to enable Ollama extended-thinking mode
                        for models that support it (e.g. qwen3, deepseek-r1).
                        Disabled by default because thinking-only models set
@@ -99,7 +109,7 @@ DEFAULT_LOCAL_LLM_URL = "http://localhost:11434" # Ollama default
 GEMINI_INTER_CALL_DELAY = 4   # seconds
 
 # Local LLM request timeout — local inference can be slow for large prompts
-LOCAL_LLM_TIMEOUT = 300   # seconds (5 minutes)
+LOCAL_LLM_TIMEOUT = 1800  # seconds (30 minutes)
 
 # ── Retry configuration ───────────────────────────────────────────────────────
 MAX_RETRIES        = 3          # maximum number of retry attempts after first failure
@@ -475,12 +485,20 @@ def _call_local_ollama_native(
         "1", "true", "yes"
     )
 
+    # LOCAL_LLM_NUM_PREDICT lets users override the per-response token budget
+    # independently of max_tokens.  Thinking models burn most of max_tokens on
+    # the reasoning trace before writing the final answer, hitting the limit and
+    # returning empty content.  Set to -1 (unlimited) or a large value like
+    # 32768 when using qwen3, deepseek-r1, or any other thinking model.
+    _num_predict_env = os.environ.get("LOCAL_LLM_NUM_PREDICT", "").strip()
+    num_predict = int(_num_predict_env) if _num_predict_env else max_tokens
+
     payload = {
         "model":    model,
         "messages": messages_payload,
         "stream":   False,
         "options": {
-            "num_predict": max_tokens,
+            "num_predict": num_predict,
             "num_ctx":     num_ctx,
             "temperature": temperature,
         },
@@ -542,7 +560,10 @@ def _call_local_ollama_native(
             print(
                 "  [llm_client] ⚠ Ollama returned empty content but non-empty "
                 "thinking field — using thinking output as response fallback.\n"
-                "  Set LOCAL_LLM_THINKING=1 or upgrade Ollama to suppress this."
+                "  Most likely cause: num_predict budget exhausted during thinking "
+                "before the model wrote its final answer.\n"
+                "  Fix: export LOCAL_LLM_NUM_PREDICT=-1  (unlimited) or a large "
+                "value like 32768."
             )
             content = thinking_fallback
         else:
@@ -554,8 +575,9 @@ def _call_local_ollama_native(
     done_reason = data.get("done_reason", "")
     if done_reason == "length":
         print(
-            f"  Warning: Ollama hit num_predict limit ({max_tokens}) "
-            f"with num_ctx={num_ctx}. Response: {len(content)} chars."
+            f"  Warning: Ollama hit num_predict limit ({num_predict}) "
+            f"with num_ctx={num_ctx}. Response: {len(content)} chars.\n"
+            f"  Fix: export LOCAL_LLM_NUM_PREDICT=-1  (unlimited) or a larger value."
         )
 
     return (prefill + content) if prefill else content
