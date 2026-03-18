@@ -224,6 +224,12 @@ Write in professional business language using actual system names from the evide
 Use proper Markdown with headers, bullet points, and tables.
 When an Evidence block is provided under a feature, use those routes/SQL/fields to write
 specific, grounded acceptance criteria and descriptions — not generic placeholders.
+
+Quality rules:
+- Number every business rule BR-01, BR-02, … so the critic can cross-reference them
+- Use exact entity/table names from the domain model — do NOT paraphrase or abbreviate
+- Never leave placeholder text like "TBD", "[Enter here]", or "as needed"
+- Each feature section must state at least one measurable acceptance criterion
 Output ONLY the document — no preamble, no commentary after.
 
 Framework context: {hints.brd_note}{_preflight_system_note(ctx)}"""
@@ -345,6 +351,14 @@ following IEEE 830 conventions. Be precise and technical.
 When an Evidence block is provided under a feature, derive concrete Input/Processing/Output/Tables
 values from it rather than using placeholders — reference actual route paths, table names, and
 form field names. Output clean Markdown only.
+
+Quality rules:
+- Number every functional requirement FR-3.X.Y so the critic can cross-reference them
+- Use exact table/column names from the domain model — no paraphrasing
+- Each FR must include: Input, Processing, Output, Tables (use "none" if truly empty)
+- List ALL validation rules per FR (required fields, format checks, length limits)
+- Include at least one negative/error scenario per feature (invalid input, unauthorised access)
+- Never leave placeholder text like "TBD", "[to be determined]", or "as required"
 
 {hints.srs_note}{_preflight_system_note(ctx)}"""
 
@@ -482,13 +496,20 @@ def _run_ac_agent(domain: DomainModel, ctx: PipelineContext) -> str:
     ev_idx = build_evidence_index(ctx, domain)
 
     system = f"""You are a QA lead writing Acceptance Criteria for a software system.
-Write criteria in Given/When/Then (Gherkin) format where appropriate, and as clear
-pass/fail statements otherwise.
+Use Given/When/Then (Gherkin) format for all interactive scenarios (form submissions,
+logins, data mutations). Use plain pass/fail statements only for static display rules.
 When an Evidence block is provided, derive Given/When/Then values directly from it:
   - Given: reference the auth guard / session precondition from ExecPath
   - When: reference the actual route, form field names, and HTTP method
   - Then: reference the SQL operation and table, or the redirect target
 Output clean Markdown only.
+
+Quality rules:
+- Every feature MUST include at least one negative scenario (invalid input, missing auth,
+  duplicate submission, boundary value) in addition to the happy path
+- Use specific, testable values — not "valid data" but "email format user@example.com"
+- Reference actual spec rule IDs (BR-XX) where the rule backs an AC item
+- Do NOT write vague criteria like "system works correctly" or "page loads"
 
 {hints.ac_template}"""
 
@@ -574,6 +595,14 @@ and detailed acceptance criteria for each story.
 When an Evidence block is provided under an Epic, write the "I want to" and acceptance
 criteria using the actual route paths, form field names, and table names from the evidence
 rather than generic placeholders. Output clean Markdown only.
+
+Quality rules:
+- Prioritise by business value: authentication/core data flows = Must; reporting/export = Should
+- Story points guide: 1=trivial display, 2=simple form, 3=form+validation, 5=multi-step flow,
+  8=complex workflow with branching, 13=cross-cutting concern or integration
+- Each story's acceptance criteria must include at least one failure/edge case scenario
+- "So that" must state a concrete business benefit — not "the system works"
+- Use exact field names, table names, and route paths from the Evidence block
 
 {hints.story_note}"""
 
