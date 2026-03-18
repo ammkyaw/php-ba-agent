@@ -368,7 +368,12 @@ Respond with ONLY a valid JSON object, no prose, no markdown fences:
   ]
 }
 
-Keep rewrite_hints concise (≤ 10 items, each ≤ 20 words).
+rewrite_hints rules:
+  - Maximum 10 items; each hint ≤ 40 words
+  - Every hint MUST name the specific section to edit
+  - Format: "In section '<Section Name>': <what to add/fix/remove>"
+  - Example: "In section 'Security Requirements': add BR-007 (session timeout after 30 min inactivity)"
+  - Example: "In section '3.2 User Registration': rename table 'users_tbl' to 'users' (catalog name)"
 If nothing is wrong, return score=1.0 and empty arrays.\
 """
 

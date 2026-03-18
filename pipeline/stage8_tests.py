@@ -555,6 +555,7 @@ _SYSTEM_PROMPT = textwrap.dedent("""    You are a senior QA automation engineer 
     PLAYWRIGHT (JavaScript):
     - One test() block per Gherkin scenario
     - Use page.goto(), page.fill(), page.click(), expect(page)
+    - Use await page.waitForURL() or await expect(page).toHaveURL() after navigation
     - Use the same realistic test data as Gherkin
     - Group tests in a describe() block named after the bounded context
     - Do NOT emit import/require lines — they will be added by the pipeline
@@ -562,7 +563,9 @@ _SYSTEM_PROMPT = textwrap.dedent("""    You are a senior QA automation engineer 
     PYTEST (Python):
     - One test function per criterion, prefixed with test_
     - Use the requests library for HTTP calls
-    - Add a @pytest.mark.skip(reason="stub") decorator — these are stubs to complete
+    - Write REAL assertions using assert response.status_code, assert "keyword" in response.text
+    - Only add @pytest.mark.skip(reason="needs live server") if the test requires a running
+      server to execute — do NOT skip tests that can be written as pure unit or HTTP assertions
     - Do NOT emit import lines — they will be added by the pipeline
 
     OUTPUT FORMAT — respond using EXACTLY these delimiter lines, no JSON:

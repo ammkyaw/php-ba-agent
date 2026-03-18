@@ -2203,6 +2203,23 @@ def _enrich_with_llm(
             # rewarded by LLM success via _final_confidence)
             pattern_bonus = 0.05 if (pattern and not enr) else 0.0
 
+            # Merge skeleton branches (from redirect/execution-path evidence)
+            # with any branches the LLM generated from its understanding of the flow.
+            # Normalise LLM branches to the standard dict schema first.
+            llm_branches: list[dict] = []
+            for b in (enr.get("branches") or []):
+                if isinstance(b, dict) and b.get("condition"):
+                    llm_branches.append({
+                        "at_page":   "inferred",
+                        "condition": str(b.get("condition", ""))[:100],
+                        "alternate": [str(b.get("outcome", ""))[:80]],
+                    })
+            existing_conds = {x.get("condition", "") for x in sk["branches"]}
+            merged_branches = sk["branches"] + [
+                b for b in llm_branches
+                if b["condition"] not in existing_conds
+            ]
+
             flows.append(BusinessFlow(
                 flow_id          = flow_id,
                 name             = enr.get("name") or _fallback_name(sk),
@@ -2210,7 +2227,7 @@ def _enrich_with_llm(
                 bounded_context  = context_name,
                 trigger          = enr.get("trigger") or _infer_trigger(sk),
                 steps            = sk["steps"],
-                branches         = sk["branches"],
+                branches         = merged_branches,
                 termination      = termination,
                 evidence_files   = sk["evidence_files"],
                 confidence       = _final_confidence(
@@ -2226,7 +2243,8 @@ def _enrich_with_llm(
 def _build_llm_system_prompt(domain) -> str:
     return f"""You are a senior Business Analyst extracting business flows from PHP codebase evidence.
 You will receive skeletons of user journeys (sequences of PHP pages with actions).
-Your job is to assign each skeleton a meaningful business name, actor, trigger, and termination.
+Your job is to assign each skeleton a meaningful business name, actor, trigger, termination,
+and any alternate/error branches evident from the redirect targets shown.
 
 Domain: {domain.domain_name}
 Known actors: {", ".join(r["role"] for r in domain.user_roles) or "Unknown"}
@@ -2238,7 +2256,11 @@ Rules:
 - name: short verb-noun phrase e.g. "Customer Login", "Booking Submission"
 - actor: the user role performing the flow
 - trigger: one sentence — what causes the flow to begin
-- termination: one sentence — the successful end state
+- termination: one sentence — the SUCCESSFUL end state only
+- branches: alternate or error paths — one entry per distinct redirect target that
+  represents a failure, validation error, or alternate outcome (not the happy path).
+  Each entry: {{"condition": "what triggers this path", "outcome": "what happens"}}
+  Use [] if the flow has only one outcome.
 - replaces_workflow: name of an existing workflow this replaces, or null
 - Respond with a JSON array of objects, one per skeleton, in the same order"""
 
@@ -2284,7 +2306,11 @@ def _build_llm_user_prompt(
                 f"{auth_tag}{db_tag}{inputs_tag}"
             )
         if sk["branches"]:
-            parts.append(f"  Branches: {len(sk['branches'])} alternate path(s)")
+            parts.append(f"  Alternate paths ({len(sk['branches'])}):")
+            for b in sk["branches"][:5]:
+                cond = b.get("condition", "alternate path")[:80]
+                alt  = ", ".join(b.get("alternate", []))[:60]
+                parts.append(f"    • if {cond} → {alt}")
 
     parts.append(f"""
 Return a JSON array with exactly {len(skeletons)} objects:
@@ -2293,10 +2319,15 @@ Return a JSON array with exactly {len(skeletons)} objects:
     "name": "Business Flow Name",
     "actor": "Role Name",
     "trigger": "What initiates this flow",
-    "termination": "Successful end state",
+    "termination": "Successful end state (happy path only)",
+    "branches": [
+      {{"condition": "Validation fails / user not authenticated / etc.", "outcome": "Error shown or redirect to login"}}
+    ],
     "replaces_workflow": "existing workflow name or null"
   }}
-]""")
+]
+If a skeleton shows alternate paths above, generate a branch entry for each one.
+If there are no alternate paths, set branches to [].""")
 
     return "\n".join(parts)
 

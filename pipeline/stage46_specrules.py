@@ -122,15 +122,26 @@ For EACH constraint in the input array produce a JSON object with these exact ke
   "given"       : precondition phrase starting with "Given "
   "when"        : trigger phrase starting with "When "
   "then"        : expected behaviour phrase starting with "Then "
-  "confidence"  : float 0.0–1.0 (your assessment of this being a real business rule; lower if it looks like framework boilerplate)
+  "confidence"  : float 0.0–1.0 — how likely this is a genuine business rule vs framework noise
   "tags"        : array of 1–4 lowercase keyword strings
+
+CONFIDENCE GUIDE:
+  0.9–1.0  Real domain rule: password length, booking time window, max quantity, payment validation
+  0.6–0.8  Likely real: email format check, required field, unique constraint, auth redirect
+  0.3–0.5  Ambiguous: generic status flags, soft-delete (deleted=0/1), ordering/pagination defaults
+  0.0–0.2  Boilerplate — set ≤ 0.2 for these patterns:
+             • CSRF / _token validation
+             • Internal Laravel routing (middleware group, prefix, namespace)
+             • Framework lifecycle hooks (boot(), register(), handle())
+             • Auto-increment primary keys, created_at/updated_at timestamps
+             • Debug/logging guards (APP_DEBUG, log level)
 
 OUTPUT RULES (strictly enforced):
 - Respond with a JSON ARRAY only — your response must begin with [ and end with ]
-- No prose, no markdown fences, no explanation, no "Thinking Process", no reasoning
+- No prose, no markdown fences, no explanation, no reasoning trace
 - Do NOT write any text before or after the JSON array
-Keep technical jargon OUT of given/when/then; use business language.
-If a constraint is clearly boilerplate (deleted=0, internal routing), set confidence ≤ 0.3.
+Keep technical jargon OUT of given/when/then; use plain business language.
+given/when/then must each be a single sentence — no bullet points or sub-clauses.
 """
 
 
