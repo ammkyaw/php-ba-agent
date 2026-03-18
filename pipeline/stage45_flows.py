@@ -543,6 +543,65 @@ def _build_gap_fill_skeletons(
     return skeletons
 
 
+# ─── Branch Enrichment ─────────────────────────────────────────────────────────
+
+def _fill_branches_from_redirects(skeletons: list[dict], cm: Any) -> None:
+    """
+    Back-fill the ``branches`` list for skeletons that have none.
+
+    Tier-0 (Laravel) and Tier-1 (Structured-route) skeletons always start
+    with ``branches: []`` because the per-route builders only capture one
+    redirect target.  When the evidence files contain ≥2 distinct redirect
+    targets the flow likely has error / alternate paths that were missed.
+
+    This pass scans cm.redirects for each skeleton's evidence files and
+    creates a basic branch entry per additional redirect target so that
+    stage47 V-04 (Missing Branches) stops flagging them as uncovered.
+
+    Branch dicts follow the same schema used by the BFS graph builder:
+        {"at_page": str, "condition": str, "alternate": list[str]}
+    """
+    if not (cm and getattr(cm, "redirects", None)):
+        return
+
+    # Build file → [redirect-dict, …] index once
+    from collections import defaultdict as _dd
+    f2r: dict[str, list[dict]] = _dd(list)
+    for r in cm.redirects:
+        if r.get("file"):
+            f2r[r["file"]].append(r)
+
+    for sk in skeletons:
+        if sk.get("branches"):
+            continue  # already populated by graph BFS builder
+
+        ev_files = sk.get("evidence_files") or sk.get("files") or []
+
+        # Collect distinct redirect targets across evidence files
+        seen_targets: dict[str, str] = {}   # target → condition
+        for fpath in ev_files:
+            for r in f2r.get(fpath, []):
+                tgt  = (r.get("target")    or "").strip()
+                cond = (r.get("condition") or "").strip()
+                if tgt and tgt not in seen_targets:
+                    seen_targets[tgt] = cond
+
+        if len(seen_targets) < 2:
+            continue  # single redirect — no alternate path evidence
+
+        anchor_page = (ev_files[0] if ev_files else "unknown")
+        targets     = list(seen_targets.items())   # [(target, condition), …]
+
+        # First target is assumed to be the happy-path redirect already
+        # represented in the step list.  Add the rest as branches.
+        for tgt, cond in targets[1:6]:            # cap at 5 extra branches
+            sk["branches"].append({
+                "at_page":   anchor_page,
+                "condition": cond or "alternate path",
+                "alternate": [f"Redirect → {tgt[:80]}"],
+            })
+
+
 # ─── Public Entry Point ────────────────────────────────────────────────────────
 
 def run(ctx: PipelineContext) -> None:
@@ -609,6 +668,11 @@ def run(ctx: PipelineContext) -> None:
 
     # Tier-0 highest priority, then Tier-1, then graph BFS paths
     all_raw: list = laravel_skeletons + tier1_skeletons + raw_paths
+
+    # Back-fill branches for Tier-0/Tier-1 skeletons that start with branches:[]
+    # using redirect evidence from the code map.  Prevents V-04 false positives
+    # where a flow has multiple redirect targets but no declared branches.
+    _fill_branches_from_redirects(all_raw, ctx.code_map)
 
     print("  [stage45] Pass D–E: Stitching execution_paths onto graph paths ...")
     flow_skeletons = _stitch_execution_paths(all_raw, ctx, G)

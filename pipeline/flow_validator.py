@@ -487,8 +487,21 @@ def _check_hallucinated_steps(
 
     for flow in flow_list:
         for step in (flow.steps or []):
-            page = (step.page or "").strip()
+            page   = (step.page   or "").strip()
+            action = (step.action or "").strip()
             issues_for_step: list[str] = []
+
+            # ── Skip steps that are known-generated (not LLM-invented) ─────────
+            # Redirect steps are synthesised from cm.redirects data by the
+            # skeleton builder — their page value is a redirect target segment,
+            # not a PHP file or registered route, so checking them against
+            # known_files / known_routes always produces false positives.
+            if action.startswith("Redirect →"):
+                continue
+            # Branch steps reference alternate-path pages that may legitimately
+            # sit outside the main route registry (e.g. error pages, external URLs).
+            if getattr(step, "is_branch", False):
+                continue
 
             # ── File check: step.page looks like a PHP file ────────────────────
             if page.endswith(".php"):
@@ -500,14 +513,19 @@ def _check_hallucinated_steps(
 
             # ── Route path check: step.page starts with '/' ───────────────────
             elif page.startswith("/") and not page.endswith(".php"):
-                path_clean = page.split("?")[0].lower()
+                # Strip query string and normalise trailing slash before comparing
+                path_clean = page.split("?")[0].lower().rstrip("/") or "/"
                 if path_clean not in known_routes:
                     # Normalise both sides and retry (handles {param} / numeric segs)
                     path_norm = _normalize_route(path_clean)
                     if path_norm not in known_routes_norm:
                         # Partial prefix match as last resort
-                        if not any(r.startswith(path_clean) or path_clean.startswith(r)
-                                   for r in known_routes if r):
+                        if not any(
+                            r.rstrip("/") == path_clean
+                            or r.startswith(path_clean + "/")
+                            or path_clean.startswith(r.rstrip("/") + "/")
+                            for r in known_routes if r
+                        ):
                             issues_for_step.append(
                                 f"Route path '{page}' not found in registered routes"
                             )
