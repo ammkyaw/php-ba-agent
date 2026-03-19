@@ -477,7 +477,7 @@ def _run_sanity_query(ctx: PipelineContext) -> tuple[bool, str, float]:
     sensible results. Returns (ok, message, best_distance).
     """
     try:
-        from pipeline.stage3_embed import query_collection
+        from pipeline.stage30_embed import query_collection
         results = query_collection(ctx, "PHP file database query", n_results=1)
         if not results:
             return False, "Query returned zero results", 1.0
@@ -526,7 +526,7 @@ def _get_chunk_types(ctx: PipelineContext) -> list[str]:
 
     # ── Tier 2: ChromaDB metadata (fallback) ─────────────────────────────────
     try:
-        from pipeline.stage3_embed import _try_load_collection, COLLECTION_NAME
+        from pipeline.stage30_embed import _try_load_collection, COLLECTION_NAME
         collection = _try_load_collection(
             ctx.embedding_meta.chroma_path,
             COLLECTION_NAME,
