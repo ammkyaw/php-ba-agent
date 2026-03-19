@@ -1,5 +1,5 @@
 """
-pipeline/stage5_workers.py — Stage 5.0 Critic-Augmented BA Document Generation
+pipeline/stage50_workers.py — Stage 5.0 Critic-Augmented BA Document Generation
 
 Runs four LLM agents concurrently using asyncio, each producing one
 BA artefact from the shared DomainModel built in Stage 4.
@@ -13,7 +13,7 @@ Agents
 
 Critic loop (Stage 5.0 enhancement)
 ------------------------------------
-After each writer produces a draft, stage5_critic.run_critic_loop() is called:
+After each writer produces a draft, stage50_critic.run_critic_loop() is called:
     Turn 1  → writer draft
     Critic  → structured JSON: score + uncovered rules + hallucinated entities
     Turn 2  → refiner makes targeted edits (only if score < CRITIC_THRESHOLD)
@@ -65,10 +65,10 @@ _CRITIC_ENABLED = os.environ.get("STAGE5_SKIP_CRITIC", "0").strip() != "1"
 
 # Doc-type key mapping: stage_name → critic doc_type string
 _STAGE_TO_DOC_TYPE = {
-    "stage5_brd":         "brd",
-    "stage5_srs":         "srs",
-    "stage5_ac":          "ac",
-    "stage5_userstories": "us",
+    "stage50_brd":         "brd",
+    "stage50_srs":         "srs",
+    "stage50_ac":          "ac",
+    "stage50_userstories": "us",
 }
 
 
@@ -94,10 +94,10 @@ async def run(ctx: PipelineContext) -> None:
 
     # Define all four agents: (stage_name, output_filename, agent_fn)
     agents: list[tuple[str, str, Callable]] = [
-        ("stage5_brd",         "brd.md",          _run_brd_agent),
-        ("stage5_srs",         "srs.md",          _run_srs_agent),
-        ("stage5_ac",          "ac.md",           _run_ac_agent),
-        ("stage5_userstories", "user_stories.md", _run_userstories_agent),
+        ("stage50_brd",         "brd.md",          _run_brd_agent),
+        ("stage50_srs",         "srs.md",          _run_srs_agent),
+        ("stage50_ac",          "ac.md",           _run_ac_agent),
+        ("stage50_userstories", "user_stories.md", _run_userstories_agent),
     ]
 
     # Filter to only agents that need running
@@ -172,7 +172,7 @@ async def _run_agent(
     if _CRITIC_ENABLED:
         doc_type = _STAGE_TO_DOC_TYPE.get(stage_name)
         if doc_type:
-            from pipeline.stage5_critic import run_critic_loop
+            from pipeline.stage50_critic import run_critic_loop
             content, passes = await loop.run_in_executor(
                 None,
                 lambda: run_critic_loop(doc_type, content, ctx)
@@ -331,7 +331,7 @@ Markdown table: Term | Definition"""
 
     return call_llm(_append_traceability_hints(system), user, max_tokens=MAX_TOKENS,
                     temperature=0.5,  # BRD: natural professional prose
-                    label="stage5_brd")
+                    label="stage50_brd")
 
 
 # ─── SRS Agent ────────────────────────────────────────────────────────────────
@@ -480,7 +480,7 @@ Technical and business constraints on the implementation."""
 
     return call_llm(_append_traceability_hints(system), user, max_tokens=MAX_TOKENS,
                     temperature=0.4,  # SRS: technical writing with some variability
-                    label="stage5_srs")
+                    label="stage50_srs")
 
 
 # ─── AC Agent ─────────────────────────────────────────────────────────────────
@@ -573,7 +573,7 @@ What test data is needed to execute these criteria."""
 
     return call_llm(_append_traceability_hints(system), user, max_tokens=MAX_TOKENS,
                     temperature=0.35,  # AC: structured but prose criteria
-                    label="stage5_ac")
+                    label="stage50_ac")
 
 
 # ─── User Story Agent ──────────────────────────────────────────────────────────
@@ -677,7 +677,7 @@ Sum by priority band."""
 
     return call_llm(_append_traceability_hints(system), user, max_tokens=MAX_TOKENS,
                     temperature=0.5,  # user stories: narrative writing
-                    label="stage5_userstories")
+                    label="stage50_userstories")
 
 
 # ─── Helpers ───────────────────────────────────────────────────────────────────
@@ -1143,10 +1143,10 @@ def _set_artifact_path(ctx: PipelineContext, stage_name: str, path: str) -> None
     if ctx.ba_artifacts is None:
         ctx.ba_artifacts = BAArtifacts()
     mapping = {
-        "stage5_brd":         "brd_path",
-        "stage5_srs":         "srs_path",
-        "stage5_ac":          "ac_path",
-        "stage5_userstories": "user_stories_path",
+        "stage50_brd":         "brd_path",
+        "stage50_srs":         "srs_path",
+        "stage50_ac":          "ac_path",
+        "stage50_userstories": "user_stories_path",
     }
     field = mapping.get(stage_name)
     if field:

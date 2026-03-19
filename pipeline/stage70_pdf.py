@@ -1,5 +1,5 @@
 """
-pipeline/stage7_pdf.py — DOCX → PDF Conversion for Final Delivery
+pipeline/stage70_pdf.py — DOCX → PDF Conversion for Final Delivery
 
 Converts all five DOCX artefacts from Stage 6.5 into PDF files using
 LibreOffice (headless mode). Falls back to a pure-Python approach via
@@ -32,7 +32,7 @@ Conversion strategy
 
 Resume behaviour
 ----------------
-If stage7_pdf is COMPLETED and all PDF files exist, stage is skipped.
+If stage70_pdf is COMPLETED and all PDF files exist, stage is skipped.
 """
 
 from __future__ import annotations
@@ -74,7 +74,7 @@ def run(ctx: PipelineContext) -> None:
     delivery_dir = Path(ctx.output_path(DELIVERY_DIR))
 
     # ── Resume check ─────────────────────────────────────────────────────────
-    if ctx.is_stage_done("stage7_pdf"):
+    if ctx.is_stage_done("stage70_pdf"):
         pdf_files = [ctx.output_path(d[1]) for d in DOCUMENTS]
         if all(Path(p).exists() for p in pdf_files):
             print(f"  [stage7] Already completed — "
@@ -116,14 +116,14 @@ def run(ctx: PipelineContext) -> None:
 
     # ── Mark stage ────────────────────────────────────────────────────────────
     if len(converted) == len(DOCUMENTS):
-        ctx.stage("stage7_pdf").mark_completed(str(delivery_dir))
+        ctx.stage("stage70_pdf").mark_completed(str(delivery_dir))
     elif converted:
         # Partial success — mark completed with a warning note
-        ctx.stage("stage7_pdf").mark_completed(str(delivery_dir))
+        ctx.stage("stage70_pdf").mark_completed(str(delivery_dir))
         print(f"  [stage7] Warning: {len(failed)} conversion(s) failed, "
               f"{len(converted)} succeeded.")
     else:
-        ctx.stage("stage7_pdf").mark_failed(
+        ctx.stage("stage70_pdf").mark_failed(
             f"All {len(DOCUMENTS)} conversions failed. "
             f"Check that LibreOffice or docx2pdf is installed."
         )

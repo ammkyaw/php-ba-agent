@@ -300,7 +300,7 @@ def _check_feature_heading_presence(
     Verify every domain feature name appears as a heading in each BA artefact.
     Catches LLM scaffold non-compliance (renamed / dropped sections).
 
-    Expected heading patterns (from the scaffolds in stage5_workers.py):
+    Expected heading patterns (from the scaffolds in stage50_workers.py):
       AC  → ## AC-XX: {feature_name}
       US  → ## Epic: {feature_name}
       SRS → ### 3.X {feature_name}   (or any ### or ## containing the name)

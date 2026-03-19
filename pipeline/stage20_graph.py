@@ -1,5 +1,5 @@
 """
-pipeline/stage2_graph.py — Knowledge Graph Builder
+pipeline/stage20_graph.py — Knowledge Graph Builder
 
 Converts the CodeMap produced by Stage 1 into a directed NetworkX graph,
 then saves three artefacts to the run output directory:
@@ -48,7 +48,7 @@ Edge types
 
 Resume behaviour
 ----------------
-If stage2_graph is already COMPLETED and all three output files exist, the
+If stage20_graph is already COMPLETED and all three output files exist, the
 stage is skipped and graph_meta is reloaded from code_graph.json.
 """
 
@@ -162,7 +162,7 @@ def run(ctx: PipelineContext) -> None:
     png_path     = ctx.output_path("code_graph.png")
 
     # ── Resume check ─────────────────────────────────────────────────────────
-    if ctx.is_stage_done("stage2_graph") and Path(json_path).exists():
+    if ctx.is_stage_done("stage20_graph") and Path(json_path).exists():
         print("  [stage2] Resuming — loading existing code_graph.json")
         ctx.graph_meta = _load_graph_meta(json_path)
         return
@@ -207,7 +207,7 @@ def run(ctx: PipelineContext) -> None:
         edge_types  = sorted(edge_types),
     )
 
-    ctx.stage("stage2_graph").mark_completed(json_path)
+    ctx.stage("stage20_graph").mark_completed(json_path)
     ctx.save()
 
     print(

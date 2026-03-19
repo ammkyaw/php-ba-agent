@@ -315,7 +315,7 @@ def main() -> None:
         _die(
             "ctx.domain_model is None in this run.\n"
             "       Stage 4 (domain analysis) must be completed before running stage67.\n"
-            f"       Run: python run_pipeline.py --resume {args.resume} --until stage4_domain"
+            f"       Run: python run_pipeline.py --resume {args.resume} --until stage40_domain"
         )
 
     # 6. Patch module for --only / --no-inject

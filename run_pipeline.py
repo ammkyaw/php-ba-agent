@@ -40,10 +40,10 @@ Usage:
     python run_pipeline.py --resume outputs/run_20240101_120000/context.json
 
     # Run only up to a specific stage (useful for testing)
-    python run_pipeline.py --project /path/to/php-project --until stage4_domain
+    python run_pipeline.py --project /path/to/php-project --until stage40_domain
 
     # Force re-run a specific stage even if already completed
-    python run_pipeline.py --resume outputs/run_.../context.json --force stage5_brd
+    python run_pipeline.py --resume outputs/run_.../context.json --force stage50_brd
 """
 
 from __future__ import annotations
@@ -58,78 +58,78 @@ from typing import Optional
 from context import PipelineContext, StageStatus
 
 # Stage imports (each is a self-contained module)
-from pipeline.stage0_validate      import run as stage0
-from pipeline.stage1_parse         import run as stage1
+from pipeline.stage00_validate     import run as stage0
+from pipeline.stage10_parse        import run as stage1
 from pipeline.stage13_entrypoints  import run as stage13
 from pipeline.stage15_paths        import run as stage15
-from pipeline.stage2_graph         import run as stage2
+from pipeline.stage20_graph        import run as stage2
 from pipeline.stage25_behavior     import run as stage25
 from pipeline.stage27_semanticroles import run as stage27
 from pipeline.stage28_clusters     import run as stage28
 from pipeline.stage29_invariants   import run as stage29
-from pipeline.stage3_embed          import run as stage3
+from pipeline.stage30_embed        import run as stage3
 from pipeline.stage35_entities      import run as stage35
 from pipeline.stage36_relationships import run as stage36
 from pipeline.stage37_statemachines import run as stage37
 from pipeline.stage38_graphrag      import run as stage38
 from pipeline.stage39_preflight     import run as stage39
-from pipeline.stage4_domain         import run as stage4
+from pipeline.stage40_domain       import run as stage4
 from pipeline.stage45_flows        import run as stage45
 from pipeline.stage46_specrules    import run as stage46
 from pipeline.stage47_validate_flows import run as stage47
 from pipeline.stage48_triangulate  import run as stage48
-from pipeline.stage5_workers       import run as stage5
+from pipeline.stage50_workers      import run as stage5
 from pipeline.stage55_traceability import run as stage55
 from pipeline.stage58_doccoverage  import run as stage58
 from pipeline.stage59_accuracy_report import run as stage59
-from pipeline.stage6_qa            import run as stage6
+from pipeline.stage60_qa          import run as stage6
 from pipeline.stage62_architecture import run as stage62
 from pipeline.stage65_postprocess  import run as stage65
 from pipeline.stage67_diagrams     import run as stage67
-from pipeline.stage7_pdf           import run as stage7
-from pipeline.stage8_tests         import run as stage8
-from pipeline.stage9_knowledge_graph import run as stage9
+from pipeline.stage70_pdf         import run as stage7
+from pipeline.stage80_tests        import run as stage8
+from pipeline.stage90_knowledge_graph import run as stage9
 
 
 # Stage registry — defines execution order
 STAGES: list[tuple[str, any]] = [
-    ("stage0_validate",      stage0),
-    ("stage1_parse",         stage1),
+    ("stage00_validate",     stage0),
+    ("stage10_parse",        stage1),
     ("stage13_entrypoints",  stage13),  # entry-point catalog: cron/cli/webhook/queue (feeds stage15 + stage45 + stage5)
     ("stage15_paths",        stage15),  # execution-path extraction (feeds stage45 + stage5)
-    ("stage2_graph",         stage2),
+    ("stage20_graph",        stage2),
     ("stage25_behavior",     stage25),  # behavior graph extraction (feeds stage45 + stage6)
     ("stage27_semanticroles", stage27), # semantic role tagging (feeds stage28 + stage45 + stage9)
     ("stage28_clusters",     stage28),  # action clustering (feeds stage4 + stage45 bounded contexts)
     ("stage29_invariants",   stage29),  # business rule extraction (feeds stage3 chunks + stage4 grounding)
-    ("stage3_embed",          stage3),
+    ("stage30_embed",        stage3),
     ("stage35_entities",      stage35),  # entity extraction (feeds stage36 + stage38 enrichment + stage4 grounding)
     ("stage36_relationships", stage36),  # relationship reconstruction (feeds stage38 enrichment + stage4 + stage67 ER)
     ("stage37_statemachines", stage37),  # state machine reconstruction (feeds stage38 enrichment + stage4 + stage45 + stage67)
     ("stage38_graphrag",      stage38),  # graph-aware context index — enriched by stage35/36/37 (feeds stage4 + stage45 + stage5)
     ("stage39_preflight",     stage39),  # pre-LLM gate — validates all static context before Stage 4
-    ("stage4_domain",         stage4),
+    ("stage40_domain",       stage4),
     ("stage45_flows",        stage45),  # business flow extraction (feeds stage62 + stage67)
     ("stage46_specrules",    stage46),  # specification mining — formal business rules (feeds stage5 + stage9)
     ("stage47_validate",     stage47),  # behavioral validation (are flows missing / valid / real?)
     ("stage48_triangulate",  stage48),  # evidence triangulation — cross-source confidence scoring (feeds stage5 + stage6)
-    ("stage5_brd",           None),     # ← parallel group handled below
-    ("stage5_srs",           None),
-    ("stage5_ac",            None),
-    ("stage5_userstories",   None),
+    ("stage50_brd",          None),     # ← parallel group handled below
+    ("stage50_srs",          None),
+    ("stage50_ac",           None),
+    ("stage50_userstories",  None),
     ("stage55_traceability", stage55),  # automated traceability matrix (static)
     ("stage58_doccoverage",     stage58),  # document coverage audit — signals vs documents (static)
     ("stage59_accuracy_report", stage59), # single-file HTML accuracy report (static)
-    ("stage6_qa",            stage6),
+    ("stage60_qa",           stage6),
     ("stage62_architecture", stage62),  # architecture reconstruction (feeds stage65 + stage67)
     ("stage65_postprocess",  stage65),
     ("stage67_diagrams",     stage67),  # diagram generation (needs stage45 flows + stage62 arch)
-    ("stage7_pdf",           stage7),   # DOCX → PDF delivery bundle
-    ("stage8_tests",         stage8),   # test case generator (Gherkin + Playwright + pytest)
-    ("stage9_knowledge_graph", stage9), # system knowledge graph (cross-domain JSON)
+    ("stage70_pdf",          stage7),   # DOCX → PDF delivery bundle
+    ("stage80_tests",        stage8),   # test case generator (Gherkin + Playwright + pytest)
+    ("stage90_knowledge_graph", stage9), # system knowledge graph (cross-domain JSON)
 ]
 
-STAGE5_NAMES = {"stage5_brd", "stage5_srs", "stage5_ac", "stage5_userstories"}
+STAGE5_NAMES = {"stage50_brd", "stage50_srs", "stage50_ac", "stage50_userstories"}
 
 
 class PipelineBlocker(Exception):
@@ -151,7 +151,7 @@ async def run_pipeline(ctx: PipelineContext, until: Optional[str] = None, force:
             if stage5_triggered:
                 continue
             stage5_triggered = True
-            group_name = "stage5_[brd|srs|ac|userstories]"
+            group_name = "stage50_[brd|srs|ac|userstories]"
             all_done = all(ctx.is_stage_done(n) for n in STAGE5_NAMES)
             if all_done and force not in STAGE5_NAMES:
                 print(f"Skipping {group_name} (all completed)")

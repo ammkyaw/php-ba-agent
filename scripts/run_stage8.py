@@ -38,7 +38,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent.parent))  # locate project root
 
 from context import PipelineContext, StageStatus
-from pipeline.stage8_tests import (
+from pipeline.stage80_tests import (
     _chunk_ac,
     _build_context_block,
     OUTPUT_FILES,
@@ -65,7 +65,7 @@ def _parse_args() -> argparse.Namespace:
         "--force",
         action  = "store_true",
         default = False,
-        help    = "Re-run even if stage8_tests is already marked COMPLETED.",
+        help    = "Re-run even if stage80_tests is already marked COMPLETED.",
     )
     parser.add_argument(
         "--inspect",
@@ -100,9 +100,9 @@ def _load_context(args: argparse.Namespace) -> PipelineContext:
     print(f"Output dir  : {ctx.output_dir}")
 
     if args.force:
-        ctx.stages["stage8_tests"].status = StageStatus.PENDING
-        ctx.stages["stage8_tests"].error  = None
-        print("--force     : stage8_tests reset to PENDING")
+        ctx.stages["stage80_tests"].status = StageStatus.PENDING
+        ctx.stages["stage80_tests"].error  = None
+        print("--force     : stage80_tests reset to PENDING")
 
     return ctx
 
@@ -112,7 +112,7 @@ def _check_dependencies(ctx: PipelineContext, resume_path: str) -> None:
     if ctx.ba_artifacts is None:
         errors.append(
             "ctx.ba_artifacts is None — run Stage 5 first:\n"
-            f"       python run_pipeline.py --resume {resume_path} --until stage5_ac"
+            f"       python run_pipeline.py --resume {resume_path} --until stage50_ac"
         )
     elif not ctx.ba_artifacts.ac_path:
         errors.append("ctx.ba_artifacts.ac_path is empty — Stage 5 AC agent may have failed.")
@@ -163,9 +163,9 @@ def _print_inspect(ctx: PipelineContext) -> None:
         exists = Path(path).exists()
         print(f"  {'✅' if exists else '—'} {fname}")
 
-    stage_result = ctx.stages.get("stage8_tests")
+    stage_result = ctx.stages.get("stage80_tests")
     if stage_result:
-        print(f"\n[stage8_tests status]  {stage_result.status.value}")
+        print(f"\n[stage80_tests status]  {stage_result.status.value}")
 
     print("\n────────────────────────────────────────────────────────────────")
 
@@ -215,7 +215,7 @@ def main() -> None:
     print(f"AC file     : {ctx.ba_artifacts.ac_path} ({ac_size:,} bytes)")
     print(f"Flows       : {flows}")
     print(f"domain_model: {'present' if ctx.domain_model else 'absent'}")
-    print(f"Stage status: {ctx.stages['stage8_tests'].status.value}")
+    print(f"Stage status: {ctx.stages['stage80_tests'].status.value}")
     print()
 
     if args.inspect:
@@ -244,7 +244,7 @@ def main() -> None:
         print(f"pytest      → {ctx.test_suite.pytest_path}")
         print(f"Scenarios   : {ctx.test_suite.scenario_count}")
 
-    if ctx.stages["stage8_tests"].status.value == "failed":
+    if ctx.stages["stage80_tests"].status.value == "failed":
         sys.exit(1)
 
 

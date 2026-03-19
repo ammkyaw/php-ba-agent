@@ -1,5 +1,5 @@
 """
-pipeline/stage1_parse.py — PHP Code Parsing Stage
+pipeline/stage10_parse.py — PHP Code Parsing Stage
 
 Invokes the nikic/php-parser PHP CLI bridge (parse_project.php), captures its
 JSON output, and hydrates ctx.code_map with structured CodeMap data.
@@ -18,7 +18,7 @@ Dependencies:
       in the same directory as parse_project.php
 
 Resume behaviour:
-    If ctx.stage("stage1_parse").status == COMPLETED and code_map.json already
+    If ctx.stage("stage10_parse").status == COMPLETED and code_map.json already
     exists, the stage is skipped immediately.
 """
 
@@ -79,7 +79,7 @@ def run(ctx: PipelineContext) -> None:
     output_path = ctx.output_path("code_map.json")
 
     # ── Resume check ────────────────────────────────────────────────────────
-    if ctx.is_stage_done("stage1_parse") and Path(output_path).exists():
+    if ctx.is_stage_done("stage10_parse") and Path(output_path).exists():
         print("  [stage1] Resuming — loading existing code_map.json")
         ctx.code_map = _load_code_map(output_path)
         return
@@ -161,7 +161,7 @@ def run(ctx: PipelineContext) -> None:
         f"migrations={len(code_map.db_schema)}"
     )
 
-    ctx.stage("stage1_parse").mark_completed(output_path)
+    ctx.stage("stage10_parse").mark_completed(output_path)
     ctx.save()
 
 

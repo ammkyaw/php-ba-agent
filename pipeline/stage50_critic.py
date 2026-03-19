@@ -1,14 +1,14 @@
 """
-pipeline/stage5_critic.py — Stage 5.0 Critic-Augmented Document Refinement
+pipeline/stage50_critic.py — Stage 5.0 Critic-Augmented Document Refinement
 
 Provides the Critic loop that runs inline within Stage 5 document generation.
-No new pipeline stage entry — this module is imported and called by stage5_workers.
+No new pipeline stage entry — this module is imported and called by stage50_workers.
 
 Architecture
 ------------
 For each generated BA document (BRD / SRS / AC / User Stories):
 
-    Turn 1  ─── writer produces initial draft (existing stage5_workers logic)
+    Turn 1  ─── writer produces initial draft (existing stage50_workers logic)
                         │
                         ▼
     Critic call ─── CriticAgent.critique(doc_type, draft, ctx)
@@ -130,7 +130,7 @@ def run_critic_loop(
         passes.append(cp)
 
         print(
-            f"  [stage5_critic] {label} turn {turn}: "
+            f"  [stage50_critic] {label} turn {turn}: "
             f"score={cp.score:.2f} "
             f"({'PASS' if cp.passed else 'FAIL'})"
         )
@@ -147,7 +147,7 @@ def run_critic_loop(
         if turn == max_turns:
             # Exhausted turns — keep current draft as-is; log the residual issues
             print(
-                f"  [stage5_critic] {label} max turns reached — "
+                f"  [stage50_critic] {label} max turns reached — "
                 f"accepting draft with score {cp.score:.2f}"
             )
             break
@@ -156,7 +156,7 @@ def run_critic_loop(
         _enrich_hints_with_exec_paths(cp, ctx)
 
         # Refine: targeted surgical edit
-        print(f"  [stage5_critic] {label} → triggering refiner pass …")
+        print(f"  [stage50_critic] {label} → triggering refiner pass …")
         current = _refine(current, cp)
 
     return current, passes
@@ -409,7 +409,7 @@ def _critique(
         user,
         max_tokens   = CRITIC_MAX_TOKENS,
         temperature  = 0.1,
-        label        = f"stage5_critic_{doc_type}",
+        label        = f"stage50_critic_{doc_type}",
         json_mode    = True,
     )
 
@@ -502,7 +502,7 @@ def _refine(draft: str, cp: CriticPass) -> str:
         user,
         max_tokens  = REFINER_MAX_TOKENS,
         temperature = 0.35,  # prose refinement: needs fluency, not just precision
-        label       = f"stage5_refiner_{cp.doc_type}",
+        label       = f"stage50_refiner_{cp.doc_type}",
     )
 
 
@@ -582,6 +582,6 @@ def _enrich_hints_with_exec_paths(cp: CriticPass, ctx: PipelineContext) -> None:
     if new_hints:
         cp.rewrite_hints.extend(new_hints)
         print(
-            f"  [stage5_critic] Enriched rewrite_hints with "
+            f"  [stage50_critic] Enriched rewrite_hints with "
             f"{len(new_hints)} execution-path hint(s)."
         )
