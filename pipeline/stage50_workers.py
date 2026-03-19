@@ -57,7 +57,14 @@ from typing import Callable
 from context import BAArtifacts, DomainModel, PipelineContext
 
 # ── Token budget ───────────────────────────────────────────────────────────────
-MAX_TOKENS = 8192
+MAX_TOKENS = 8192  # kept for critic loop compatibility
+
+# ── Section-by-section generation ──────────────────────────────────────────────
+# Each doc is split into: front matter | requirement batches | tail sections.
+# STAGE5_SECTION_BATCH  : features per LLM call (default 10)
+# STAGE5_SECTION_TOKENS : max output tokens per section call (default 2500)
+_SECTION_BATCH  = max(1,  int(os.environ.get("STAGE5_SECTION_BATCH",  "10") or "10"))
+_SECTION_TOKENS = max(500, int(os.environ.get("STAGE5_SECTION_TOKENS", "2500") or "2500"))
 
 # ── Critic loop feature flag ───────────────────────────────────────────────────
 # Set STAGE5_SKIP_CRITIC=1 to disable the critic loop (e.g. for fast local runs)
@@ -192,20 +199,17 @@ async def _run_agent(
 # ─── BRD Agent ────────────────────────────────────────────────────────────────
 
 def _run_brd_agent(domain: DomainModel, ctx: PipelineContext) -> str:
-    """Generate the Business Requirements Document."""
-    from pipeline.llm_client import call_llm
+    """Generate the BRD section-by-section to avoid timeouts on large projects."""
     from pipeline.evidence_index import build_evidence_index, format_evidence_block
+    from pipeline.framework_hints import get_hints
 
-    # Compact domain summary — avoids sending the full JSON blob
-    feature_lines = "\n".join(
-        f"  - {f.get('name','?')}: {f.get('description','')} | pages={f.get('pages',[])} tables={f.get('tables',[])}"
-        for f in domain.features
-        if isinstance(f, dict)
-    )
+    hints  = get_hints(ctx.code_map.framework if ctx.code_map else "unknown")
+    ev_idx = build_evidence_index(ctx, domain)
+
+    all_feature_names = ", ".join(f["name"] for f in domain.features)
     role_lines = "\n".join(
         f"  - {r.get('role','?')}: {r.get('description','')}"
-        for r in domain.user_roles
-        if isinstance(r, dict)
+        for r in domain.user_roles if isinstance(r, dict)
     )
     rule_lines = "\n".join(
         f"  - {rule}"
@@ -213,33 +217,67 @@ def _run_brd_agent(domain: DomainModel, ctx: PipelineContext) -> str:
         for rule in _to_str_list(f.get("business_rules", []))
     ) or "  - None explicitly defined"
 
-    from pipeline.framework_hints import get_hints
-    hints = get_hints(ctx.code_map.framework if ctx.code_map else "unknown")
-
-    # Build evidence index once — maps feature_name → {routes, sql, ...}
-    ev_idx = build_evidence_index(ctx, domain)
-
-    system = f"""You are a senior Business Analyst writing a formal Business Requirements Document (BRD).
+    system = _append_traceability_hints(f"""You are a senior Business Analyst writing a formal Business Requirements Document (BRD).
 Write in professional business language using actual system names from the evidence.
 Use proper Markdown with headers, bullet points, and tables.
-When an Evidence block is provided under a feature, use those routes/SQL/fields to write
-specific, grounded acceptance criteria and descriptions — not generic placeholders.
+When an Evidence block is provided, use routes/SQL/fields to write specific grounded criteria.
 
 Quality rules:
-- Number every business rule BR-01, BR-02, … so the critic can cross-reference them
-- Use exact entity/table names from the domain model — do NOT paraphrase or abbreviate
+- Number every business rule BR-01, BR-02, … for critic cross-reference
+- Use exact entity/table names — do NOT paraphrase or abbreviate
 - Never leave placeholder text like "TBD", "[Enter here]", or "as needed"
 - Each feature section must state at least one measurable acceptance criterion
-Output ONLY the document — no preamble, no commentary after.
+- Output ONLY the requested section(s) — no preamble, no extra commentary
 
-Framework context: {hints.brd_note}{_preflight_system_note(ctx)}"""
+Framework context: {hints.brd_note}{_preflight_system_note(ctx)}""")
 
-    # Build explicit feature list for the BRD prompt so none get skipped
-    all_feature_names = ", ".join(f['name'] for f in domain.features)
-    n_features = len(domain.features)
+    domain_hdr = _compact_domain_header(domain)
+    spec_block  = _format_spec_rules_for_prompt(ctx)
+    plain_rules = _format_plain_english_rules(ctx)
+    bg_flows    = _format_background_flows(ctx)
 
-    # Pre-build the BR scaffold — numbered ### headings + evidence block per feature.
-    # Using ### (not bold) ensures _extract_headings() in stage6 finds them.
+    gc_ctx = ""
+    if hasattr(ctx, "graph_query"):
+        try:
+            _gc = ctx.graph_query("user roles business requirements workflows features")
+            if _gc and _gc.strip():
+                gc_ctx = "\n\nGRAPH-AWARE CONTEXT (for stakeholder/feature validation):\n" + _gc.strip()
+        except Exception:
+            pass
+
+    parts: list[str] = []
+
+    # ── Section A: front matter (1–4) ────────────────────────────────────────
+    front_user = f"""Write ONLY sections 1–4 of the BRD. Do NOT write section 5 or beyond.
+
+{domain_hdr}
+User Roles:
+{role_lines}
+Features (for scope list only): {all_feature_names}
+{spec_block}{plain_rules}{gc_ctx}
+
+Output EXACTLY:
+
+# Business Requirements Document — {domain.domain_name}
+
+## 1. Executive Summary
+2–3 sentences describing what the system does and its business value.
+
+## 2. Business Objectives
+Numbered list (max 6 measurable objectives).
+
+## 3. Scope
+### In Scope
+List every feature: {all_feature_names}
+{bg_flows}
+### Out of Scope
+
+## 4. Stakeholders
+Markdown table: Role | Description | Key Interests"""
+
+    parts.append(_call_section(system, front_user, "stage50_brd_front", 0.5, 1500))
+
+    # ── Section B: business requirements batched by feature ───────────────────
     def _br_entry(i: int, f: dict) -> str:
         ev_block = format_evidence_block(ev_idx.get(f["name"], {}))
         ev_str   = f"\n{ev_block}" if ev_block else ""
@@ -251,121 +289,135 @@ Framework context: {hints.brd_note}{_preflight_system_note(ctx)}"""
             f"{ev_str}"
         )
 
-    br_scaffold = "\n\n".join(
-        _br_entry(i, f) for i, f in enumerate(domain.features, 1)
-    )
+    req_header_written = False
+    for batch_start, batch in _feature_batches(domain.features, _SECTION_BATCH):
+        br_from = batch_start + 1
+        br_to   = batch_start + len(batch)
+        scaffold = "\n\n".join(_br_entry(i, f) for i, f in enumerate(batch, br_from))
+        section_hdr = "## 5. Business Requirements\n\n" if not req_header_written else ""
+        req_header_written = True
 
-    user = f"""Write a BRD for: {domain.domain_name}
+        req_user = f"""Write ONLY Business Requirements BR-{br_from:02d} through BR-{br_to:02d}.
+Do NOT write any other section. Do NOT repeat the document title or previous BRs.
 
-System description: {domain.description}
+{domain_hdr}
+{spec_block}
 
-User Roles:
-{role_lines}
+{section_hdr}Fill in Priority and Acceptance for EACH entry below.
+For trivial features write Priority: Low and a brief 1-line criterion.
 
-Features:
-{feature_lines}
+{scaffold}"""
+        parts.append(_call_section(system, req_user,
+                                   f"stage50_brd_req_{batch_start // _SECTION_BATCH + 1}",
+                                   0.4, _SECTION_TOKENS))
 
-Entities: {", ".join(_to_str_list(domain.key_entities))}
-Bounded Contexts: {", ".join(_to_str_list(domain.bounded_contexts))}
+    # ── Section C: tail (6–9) ─────────────────────────────────────────────────
+    entities_str = ", ".join(_to_str_list(domain.key_entities)) or "none"
+    tail_user = f"""Write ONLY sections 6–9 of the BRD. Do NOT repeat earlier sections.
 
+{domain_hdr}
+Entities: {entities_str}
 Business Rules:
 {rule_lines}
-{_format_spec_rules_for_prompt(ctx)}
-{_format_plain_english_rules(ctx)}
-{_format_background_flows(ctx)}
+{spec_block}
 
-CRITICAL: Section 5 MUST use EXACTLY these {n_features} subsection headings in order.
-Do NOT rename, merge, skip, or reorder them. Fill in the Priority and Acceptance fields.
-For trivial features write Priority: Low and a brief 1-line acceptance criterion.
-
-Write these sections (keep each section concise — 3-8 bullet points or rows):
-
-# Business Requirements Document — {domain.domain_name}
-
-## 1. Executive Summary
-2-3 sentences.
-
-## 2. Business Objectives
-Numbered list (max 6).
-
-## 3. Scope
-### In Scope
-List every feature by name: {all_feature_names}
-### Out of Scope
-
-## 4. Stakeholders
-Markdown table: Role | Description | Key Interests
-
-## 5. Business Requirements
-
-{br_scaffold}
+Output EXACTLY:
 
 ## 6. Data Requirements
-One paragraph per DB table describing purpose and key fields.
+One paragraph per key DB table describing its purpose and key fields.
 
 ## 7. Business Rules
-Numbered list of all rules from the features above.
+Numbered list of all rules extracted from features and spec rules above.
 
 ## 8. Assumptions and Constraints
 
 ## 9. Glossary
 Markdown table: Term | Definition"""
 
-    # ── GraphRAG semantic context ─────────────────────────────────────────────
-    # Inject graph-community-aware retrieval so the BRD is grounded in
-    # cross-module entity relationships not visible from the domain model alone.
-    if hasattr(ctx, "graph_query"):
-        try:
-            _gc_brd = ctx.graph_query(
-                "user roles business requirements workflows features"
-            )
-        except Exception:
-            _gc_brd = None
-        if _gc_brd and _gc_brd.strip():
-            user = (
-                user
-                + "\n\nGRAPH-AWARE SEMANTIC CONTEXT "
-                + "(use to validate stakeholder roles and feature descriptions):\n"
-                + _gc_brd.strip()
-            )
-
-    return call_llm(_append_traceability_hints(system), user, max_tokens=MAX_TOKENS,
-                    temperature=0.5,  # BRD: natural professional prose
-                    label="stage50_brd")
+    parts.append(_call_section(system, tail_user, "stage50_brd_tail", 0.5, 1200))
+    return "\n\n".join(parts)
 
 
 # ─── SRS Agent ────────────────────────────────────────────────────────────────
 
 def _run_srs_agent(domain: DomainModel, ctx: PipelineContext) -> str:
-    """Generate the Software Requirements Specification."""
-    from pipeline.llm_client import call_llm
+    """Generate the SRS section-by-section to avoid timeouts on large projects."""
     from pipeline.evidence_index import build_evidence_index, format_evidence_block
-
     from pipeline.framework_hints import get_hints
-    hints = get_hints(ctx.code_map.framework if ctx.code_map else "unknown")
 
+    hints  = get_hints(ctx.code_map.framework if ctx.code_map else "unknown")
     ev_idx = build_evidence_index(ctx, domain)
 
-    system = f"""You are a senior software engineer writing a formal Software Requirements Specification (SRS)
-following IEEE 830 conventions. Be precise and technical.
-When an Evidence block is provided under a feature, derive concrete Input/Processing/Output/Tables
-values from it rather than using placeholders — reference actual route paths, table names, and
-form field names. Output clean Markdown only.
+    system = _append_traceability_hints(f"""You are a senior software engineer writing a formal SRS (IEEE 830).
+Be precise and technical. Use Evidence blocks to derive concrete Input/Processing/Output/Tables values.
 
 Quality rules:
-- Number every functional requirement FR-3.X.Y so the critic can cross-reference them
-- Use exact table/column names from the domain model — no paraphrasing
-- Each FR must include: Input, Processing, Output, Tables (use "none" if truly empty)
-- List ALL validation rules per FR (required fields, format checks, length limits)
-- Include at least one negative/error scenario per feature (invalid input, unauthorised access)
-- Never leave placeholder text like "TBD", "[to be determined]", or "as required"
+- Number every FR as FR-3.X.Y for critic cross-reference
+- Use exact table/column names — no paraphrasing
+- Each FR must have: Input, Processing, Output, Tables (write "none" if truly absent)
+- List ALL validation rules per FR
+- Include at least one negative/error scenario per feature
+- Never leave placeholder text like "TBD" or "as required"
+- Output ONLY the requested section(s)
 
-{hints.srs_note}{_preflight_system_note(ctx)}"""
+{hints.srs_note}{_preflight_system_note(ctx)}""")
 
-    all_feature_names = ", ".join(f['name'] for f in domain.features)
-    n_features = len(domain.features)
+    domain_hdr   = _compact_domain_header(domain)
+    spec_block   = _format_spec_rules_for_prompt(
+        ctx, categories=["VALIDATION", "REFERENTIAL", "STATE", "BUSINESS_LIMIT"])
 
-    # Pre-build the FR scaffold for Section 3 with evidence per feature.
+    # Collect env vars for sections 2.3 / 6
+    env_block = ""
+    if ctx.code_map:
+        _env_vars = getattr(ctx.code_map, "env_vars", None) or []
+        if _env_vars:
+            from collections import defaultdict as _dd
+            _by_prefix: dict = _dd(list)
+            for ev in _env_vars:
+                key    = ev.get("key", "?")
+                prefix = key.split("_")[0] if "_" in key else "OTHER"
+                default = ev.get("default")
+                _by_prefix[prefix].append(key if default is None else f"{key}={default!r}")
+            env_block = "\nENVIRONMENT VARIABLES:\n" + "\n".join(
+                f"  {p}_*: {', '.join(sorted(set(vs)))}"
+                for p, vs in sorted(_by_prefix.items())
+            )
+
+    gc_ctx = ""
+    if hasattr(ctx, "graph_query"):
+        try:
+            _gc = ctx.graph_query("functional requirements system interface deployment")
+            if _gc and _gc.strip():
+                gc_ctx = "\n\nGRAPH-AWARE CONTEXT (sections 3+5):\n" + _gc.strip()
+        except Exception:
+            pass
+
+    parts: list[str] = []
+
+    # ── Section A: front matter (1–2) ────────────────────────────────────────
+    front_user = f"""Write ONLY sections 1 and 2 of the SRS. Do NOT write section 3 or beyond.
+
+{domain_hdr}{env_block}{gc_ctx}
+
+Output EXACTLY:
+
+# Software Requirements Specification — {domain.domain_name}
+
+## 1. Introduction
+### 1.1 Purpose
+### 1.2 System Overview
+### 1.3 Definitions and Abbreviations
+
+## 2. Overall Description
+### 2.1 System Context
+### 2.2 User Classes and Characteristics
+For each user role: name, technical level, frequency of use, key tasks.
+### 2.3 Operating Environment
+### 2.4 Assumptions and Dependencies"""
+
+    parts.append(_call_section(system, front_user, "stage50_srs_front", 0.4, 1500))
+
+    # ── Section B: FR batches (Section 3) ────────────────────────────────────
     def _fr_entry(i: int, f: dict) -> str:
         ev_block = format_evidence_block(ev_idx.get(f["name"], {}))
         ev_str   = f"\n{ev_block}" if ev_block else ""
@@ -380,44 +432,34 @@ Quality rules:
             f"{ev_str}"
         )
 
-    fr_scaffold = "\n\n".join(
-        _fr_entry(i, f) for i, f in enumerate(domain.features, 1)
-    )
+    fr_header_written = False
+    for batch_start, batch in _feature_batches(domain.features, _SECTION_BATCH):
+        fr_from = batch_start + 1
+        fr_to   = batch_start + len(batch)
+        scaffold = "\n\n".join(_fr_entry(i, f) for i, f in enumerate(batch, fr_from))
+        section_hdr = "## 3. Functional Requirements\n\n" if not fr_header_written else ""
+        fr_header_written = True
 
-    spec_rules_section = _format_spec_rules_for_prompt(
-        ctx, categories=["VALIDATION", "REFERENTIAL", "STATE", "BUSINESS_LIMIT"]
-    )
+        fr_user = f"""Write ONLY functional requirements 3.{fr_from} through 3.{fr_to}.
+Do NOT write any other section. Do NOT repeat the document title or previous FRs.
+For trivial features write: Input=none, Processing=minimal, Output=redirect or display, Tables=none.
 
-    user = f"""Using the domain model below, write a complete SRS for the '{domain.domain_name}'.
+{domain_hdr}
+{spec_block}
 
-DOMAIN MODEL:
-{_format_domain_for_prompt(domain)}
-{spec_rules_section}
+{section_hdr}Fill in all bracketed placeholders using the Evidence blocks provided.
 
-CRITICAL: Section 3 MUST contain exactly {n_features} subsections — one per feature.
-Do not skip ANY feature. For trivial features (e.g. logout, static pages) write a brief
-FR with: Input=none, Processing=minimal, Output=redirect or display, Tables=none.
-Fill in the bracketed placeholders using the Evidence blocks provided.
+{scaffold}"""
+        parts.append(_call_section(system, fr_user,
+                                   f"stage50_srs_fr_{batch_start // _SECTION_BATCH + 1}",
+                                   0.4, _SECTION_TOKENS))
 
-Write the SRS with these exact sections:
+    # ── Section C: tail (4–6) ─────────────────────────────────────────────────
+    tail_user = f"""Write ONLY sections 4, 5, and 6 of the SRS. Do NOT repeat earlier sections.
 
-# Software Requirements Specification — {domain.domain_name}
+{domain_hdr}{env_block}
 
-## 1. Introduction
-### 1.1 Purpose
-### 1.2 System Overview
-### 1.3 Definitions and Abbreviations
-
-## 2. Overall Description
-### 2.1 System Context
-### 2.2 User Classes and Characteristics
-For each user role: name, technical level, frequency of use, key tasks.
-### 2.3 Operating Environment
-### 2.4 Assumptions and Dependencies
-
-## 3. Functional Requirements
-
-{fr_scaffold}
+Output EXACTLY:
 
 ## 4. Non-Functional Requirements
 ### 4.1 Security Requirements
@@ -429,95 +471,63 @@ For each user role: name, technical level, frequency of use, key tasks.
 ### 5.1 User Interface
 Describe the page flow and key UI interactions.
 ### 5.2 Database Interface
-Describe each table, its purpose, and key fields inferred from the codebase.
+Describe each table, its purpose, and key fields.
 
 ## 6. System Constraints
 Technical and business constraints on the implementation."""
 
-    # ── GraphRAG semantic context ─────────────────────────────────────────────
-    # Cross-module functional/interface facts from the stage38 graph index.
-    if hasattr(ctx, "graph_query"):
-        try:
-            _gc_srs = ctx.graph_query(
-                "functional requirements system interface deployment"
-            )
-        except Exception:
-            _gc_srs = None
-        if _gc_srs and _gc_srs.strip():
-            user = (
-                user
-                + "\n\nGRAPH-AWARE SEMANTIC CONTEXT "
-                + "(use for sections 3 and 5 — functional and interface requirements):\n"
-                + _gc_srs.strip()
-            )
-
-    # ── Environment variables → Section 2.3 / Section 6 ─────────────────────
-    # env_vars carry deployment/config facts (DB host, mail server, API keys,
-    # feature flags) that belong in SRS Section 2.3 (Operating Environment)
-    # and Section 6 (System Constraints).  Previously ignored by stage5.
-    if ctx.code_map:
-        _env_vars = getattr(ctx.code_map, "env_vars", None) or []
-        if _env_vars:
-            from collections import defaultdict as _dd
-            _by_prefix: dict = _dd(list)
-            for ev in _env_vars:
-                key    = ev.get("key", "?")
-                prefix = key.split("_")[0] if "_" in key else "OTHER"
-                default = ev.get("default")
-                entry  = key if default is None else f"{key}={default!r}"
-                _by_prefix[prefix].append(entry)
-            env_lines = "\n".join(
-                f"  {pfx}_*: {', '.join(sorted(set(vs)))}"
-                for pfx, vs in sorted(_by_prefix.items())
-            )
-            user = (
-                user
-                + "\n\nENVIRONMENT VARIABLES "
-                + "(use for Section 2.3 Operating Environment and Section 6 System "
-                + "Constraints — describe each group's purpose and deployment impact):\n"
-                + env_lines
-            )
-
-    return call_llm(_append_traceability_hints(system), user, max_tokens=MAX_TOKENS,
-                    temperature=0.4,  # SRS: technical writing with some variability
-                    label="stage50_srs")
+    parts.append(_call_section(system, tail_user, "stage50_srs_tail", 0.4, 1200))
+    return "\n\n".join(parts)
 
 
 # ─── AC Agent ─────────────────────────────────────────────────────────────────
 
 def _run_ac_agent(domain: DomainModel, ctx: PipelineContext) -> str:
-    """Generate Acceptance Criteria for all features."""
-    from pipeline.llm_client import call_llm
+    """Generate Acceptance Criteria section-by-section."""
     from pipeline.evidence_index import build_evidence_index, format_evidence_block
-
     from pipeline.framework_hints import get_hints
-    hints = get_hints(ctx.code_map.framework if ctx.code_map else "unknown")
 
+    hints  = get_hints(ctx.code_map.framework if ctx.code_map else "unknown")
     ev_idx = build_evidence_index(ctx, domain)
 
-    system = f"""You are a QA lead writing Acceptance Criteria for a software system.
-Use Given/When/Then (Gherkin) format for all interactive scenarios (form submissions,
-logins, data mutations). Use plain pass/fail statements only for static display rules.
-When an Evidence block is provided, derive Given/When/Then values directly from it:
-  - Given: reference the auth guard / session precondition from ExecPath
-  - When: reference the actual route, form field names, and HTTP method
-  - Then: reference the SQL operation and table, or the redirect target
-Output clean Markdown only.
+    system = _append_traceability_hints(f"""You are a QA lead writing Acceptance Criteria.
+Use Given/When/Then (Gherkin) for interactive scenarios; plain pass/fail for display rules.
+Derive Given/When/Then from Evidence blocks:
+  - Given: auth guard / session precondition
+  - When: actual route, form field names, HTTP method
+  - Then: SQL operation + table, or redirect target
 
 Quality rules:
-- Every feature MUST include at least one negative scenario (invalid input, missing auth,
-  duplicate submission, boundary value) in addition to the happy path
-- Use specific, testable values — not "valid data" but "email format user@example.com"
-- Reference actual spec rule IDs (BR-XX) where the rule backs an AC item
-- Do NOT write vague criteria like "system works correctly" or "page loads"
+- Every feature MUST include at least one negative scenario
+- Use specific testable values (not "valid data" but "email format user@example.com")
+- Reference spec rule IDs (BR-XX) where applicable
+- Do NOT write vague criteria like "system works correctly"
+- Output ONLY the requested section(s)
 
-{hints.ac_template}"""
+{hints.ac_template}""")
 
-    ep_section     = _format_execution_paths_for_prompt(ctx)
-    flows_section  = _format_business_flows_for_prompt(ctx)
+    ep_section    = _format_execution_paths_for_prompt(ctx)
+    flows_section = _format_business_flows_for_prompt(ctx)
+    spec_block    = _format_spec_rules_for_prompt(ctx)
+    domain_hdr    = _compact_domain_header(domain)
 
-    # Pre-build the AC scaffold — exact feature-name ## headings + evidence blocks.
-    # Headings are FIXED; model fills in Given/When/Then using the evidence.
+    parts: list[str] = []
+
+    # ── Section A: header + overview ─────────────────────────────────────────
+    hdr_user = f"""Write ONLY the title and Overview section. Do NOT write any AC-XX sections yet.
+
+{domain_hdr}
+
+Output EXACTLY:
+
+# Acceptance Criteria — {domain.domain_name}
+
+## Overview
+Brief description of how acceptance testing should be approached for this system."""
+
+    parts.append(_call_section(system, hdr_user, "stage50_ac_header", 0.35, 400))
+
+    # ── Section B: AC entries batched ────────────────────────────────────────
     def _ac_entry(i: int, f: dict) -> str:
         ev_block = format_evidence_block(ev_idx.get(f["name"], {}))
         ev_str   = f"\n{ev_block}\n" if ev_block else ""
@@ -538,89 +548,106 @@ Quality rules:
             f"- Then: [expected error/rejection]"
         )
 
-    ac_scaffold = "\n\n---\n\n".join(
-        _ac_entry(i, f) for i, f in enumerate(domain.features, 1)
-    )
+    for batch_start, batch in _feature_batches(domain.features, _SECTION_BATCH):
+        ac_from = batch_start + 1
+        ac_to   = batch_start + len(batch)
+        scaffold = "\n\n---\n\n".join(_ac_entry(i, f) for i, f in enumerate(batch, ac_from))
 
-    spec_rules_ac = _format_spec_rules_for_prompt(ctx)
+        ac_user = f"""Write ONLY AC-{ac_from:02d} through AC-{ac_to:02d}.
+CRITICAL: Use the EXACT headings "## AC-XX: [Feature Name]" as written — do NOT rename them.
+Do NOT write any other section or repeat previous ACs.
 
-    user = f"""Using the domain model below, write complete Acceptance Criteria for '{domain.domain_name}'.
-
-DOMAIN MODEL:
-{_format_domain_for_prompt(domain)}
+{domain_hdr}
 {flows_section}
 {ep_section}
-{spec_rules_ac}
-
-CRITICAL HEADING RULE: The section headings below are FIXED. You MUST use them verbatim —
-do NOT rename, merge, reorder, or replace them. Each "## AC-XX: [Feature Name]" line
-must appear EXACTLY as written. Only fill in the criteria content under each heading.
-Omitting or renaming any heading causes QA coverage failures.
-
-# Acceptance Criteria — {domain.domain_name}
-
-## Overview
-Brief description of how acceptance testing should be approached for this system.
+{spec_block}
 
 ---
 
-{ac_scaffold}
+{scaffold}"""
+        parts.append(_call_section(system, ac_user,
+                                   f"stage50_ac_batch_{batch_start // _SECTION_BATCH + 1}",
+                                   0.35, _SECTION_TOKENS))
+
+    # ── Section C: test data requirements ────────────────────────────────────
+    tail_user = f"""Write ONLY the Test Data Requirements section. Do NOT repeat any AC sections.
+
+{domain_hdr}
+
+Output EXACTLY:
 
 ---
 
 ## Test Data Requirements
-What test data is needed to execute these criteria."""
+What test data is needed to execute these criteria (users, records, files, etc.)."""
 
-    return call_llm(_append_traceability_hints(system), user, max_tokens=MAX_TOKENS,
-                    temperature=0.35,  # AC: structured but prose criteria
-                    label="stage50_ac")
+    parts.append(_call_section(system, tail_user, "stage50_ac_tail", 0.35, 500))
+    return "\n\n".join(parts)
 
 
 # ─── User Story Agent ──────────────────────────────────────────────────────────
 
 def _run_userstories_agent(domain: DomainModel, ctx: PipelineContext) -> str:
-    """Generate User Stories with story points and priorities."""
-    from pipeline.llm_client import call_llm
-
-    from pipeline.framework_hints import get_hints
+    """Generate User Stories section-by-section (one epic batch per call)."""
     from pipeline.evidence_index import build_evidence_index, format_evidence_block
-    hints = get_hints(ctx.code_map.framework if ctx.code_map else "unknown")
+    from pipeline.framework_hints import get_hints
 
+    hints  = get_hints(ctx.code_map.framework if ctx.code_map else "unknown")
     ev_idx = build_evidence_index(ctx, domain)
 
-    system = f"""You are an Agile product owner writing User Stories for a development team.
-Write stories in standard format: 'As a [role], I want to [action], so that [benefit]'.
-Include story points (Fibonacci: 1,2,3,5,8,13), priority (Must/Should/Could/Won't),
-and detailed acceptance criteria for each story.
-When an Evidence block is provided under an Epic, write the "I want to" and acceptance
-criteria using the actual route paths, form field names, and table names from the evidence
-rather than generic placeholders. Output clean Markdown only.
+    system = _append_traceability_hints(f"""You are an Agile product owner writing User Stories.
+Format: 'As a [role], I want to [action], so that [benefit]'.
+Include story points (Fibonacci: 1,2,3,5,8,13) and priority (Must/Should/Could/Won't).
+Derive "I want to" and AC from Evidence blocks — use actual routes, fields, and tables.
 
 Quality rules:
-- Prioritise by business value: authentication/core data flows = Must; reporting/export = Should
-- Story points guide: 1=trivial display, 2=simple form, 3=form+validation, 5=multi-step flow,
-  8=complex workflow with branching, 13=cross-cutting concern or integration
-- Each story's acceptance criteria must include at least one failure/edge case scenario
-- "So that" must state a concrete business benefit — not "the system works"
-- Use exact field names, table names, and route paths from the Evidence block
+- Auth/core data flows = Must Have; reporting/export = Should Have
+- Points guide: 1=display, 2=simple form, 3=form+validation, 5=multi-step,
+  8=complex branching, 13=cross-cutting/integration
+- Each story AC must include at least one failure/edge case
+- "So that" = concrete business benefit, not "the system works"
+- Output ONLY the requested section(s)
 
-{hints.story_note}"""
+{hints.story_note}""")
 
-    ep_section     = _format_execution_paths_for_prompt(ctx)
-    flows_section  = _format_business_flows_for_prompt(ctx)
+    ep_section    = _format_execution_paths_for_prompt(ctx)
+    flows_section = _format_business_flows_for_prompt(ctx)
+    spec_block    = _format_spec_rules_for_prompt(ctx, categories=["WORKFLOW", "AUTHORIZATION"])
+    domain_hdr    = _compact_domain_header(domain)
 
-    # Pre-build one Epic scaffold per feature — exact feature-name ## headings + evidence.
-    # Model fills in the story content — must NOT rename the ## Epic: lines.
-    us_counter = [1]  # mutable counter for story IDs
+    parts: list[str] = []
+
+    # ── Section A: title + epic summary ──────────────────────────────────────
+    all_epics = "\n".join(
+        f"  - {f['name']}: {f.get('description', '')[:80]}"
+        for f in domain.features
+    )
+    hdr_user = f"""Write ONLY the title and Epic Summary section. Do NOT write any epic detail yet.
+
+{domain_hdr}
+
+Output EXACTLY:
+
+# User Story Backlog — {domain.domain_name}
+
+## Epic Summary
+{all_epics}"""
+
+    parts.append(_call_section(system, hdr_user, "stage50_us_header", 0.5, 600))
+
+    # ── Section B: epic batches ───────────────────────────────────────────────
+    # story counter must be consistent across batches
+    us_global_idx = [1]
+
     def _epic_block(f: dict) -> str:
-        feat_name = f['name']
-        desc   = f.get('description', '')
-        pages  = ', '.join(_to_str_list(f.get('pages', []))) or 'see domain model'
-        tables = ', '.join(_to_str_list(f.get('tables', []))) or 'see domain model'
-        idx    = us_counter[0]
-        us_counter[0] += 1
-        ev_block = format_evidence_block(ev_idx.get(feat_name, {}))
-        ev_str   = f"\n{ev_block}\n" if ev_block else ""
+        feat_name = f["name"]
+        desc      = f.get("description", "")
+        pages     = ", ".join(_to_str_list(f.get("pages", []))) or "see domain model"
+        tables    = ", ".join(_to_str_list(f.get("tables", []))) or "see domain model"
+        idx       = us_global_idx[0]
+        us_global_idx[0] += 1
+        ev_block  = format_evidence_block(ev_idx.get(feat_name, {}))
+        ev_str    = f"\n{ev_block}\n" if ev_block else ""
         return (
             f"## Epic: {feat_name}\n\n"
             f"{ev_str}"
@@ -638,46 +665,102 @@ Quality rules:
             f"**Notes:** {desc}"
         )
 
-    epic_scaffold = "\n\n---\n\n".join(_epic_block(f) for f in domain.features)
+    for batch_start, batch in _feature_batches(domain.features, _SECTION_BATCH):
+        scaffold = "\n\n---\n\n".join(_epic_block(f) for f in batch)
+        epic_names = ", ".join(f["name"] for f in batch)
 
-    spec_rules_us = _format_spec_rules_for_prompt(
-        ctx, categories=["WORKFLOW", "AUTHORIZATION"]
-    )
+        epic_user = f"""Write ONLY the epic detail for: {epic_names}.
+CRITICAL: Use EXACT headings "## Epic: [Feature Name]" as written — do NOT rename them.
+Do NOT write any other section or repeat previous epics.
 
-    user = f"""Using the domain model below, write a complete User Story backlog for '{domain.domain_name}'.
-
-DOMAIN MODEL:
-{_format_domain_for_prompt(domain)}
+{domain_hdr}
 {flows_section}
 {ep_section}
-{spec_rules_us}
-
-CRITICAL HEADING RULE: The "## Epic: [Feature Name]" headings below are FIXED.
-You MUST use them verbatim — do NOT rename, merge, reorder, or replace them.
-Only fill in the story content (title, As a / I want / So that, criteria, notes).
-Omitting or renaming any Epic heading causes QA coverage failures.
-
-# User Story Backlog — {domain.domain_name}
-
-## Epic Summary
-One-line description per epic listed below.
+{spec_block}
 
 ---
 
-{epic_scaffold}
+{scaffold}"""
+        parts.append(_call_section(system, epic_user,
+                                   f"stage50_us_epics_{batch_start // _SECTION_BATCH + 1}",
+                                   0.5, _SECTION_TOKENS))
+
+    # ── Section C: summary table + totals ─────────────────────────────────────
+    # Collect US IDs for the table hint
+    us_ids_hint = ", ".join(
+        f"US-{i:03d}" for i in range(1, len(domain.features) + 1)
+    )
+    tail_user = f"""Write ONLY the Backlog Summary Table and Total Story Points sections.
+Do NOT repeat any epic detail.
+
+Story IDs to include: {us_ids_hint}
+
+Output EXACTLY:
 
 ---
 
 ## Backlog Summary Table
-A Markdown table: Story ID | Title | Epic | Priority | Points | Status
-Status for all stories should be "To Do"
+Markdown table: Story ID | Title | Epic | Priority | Points | Status
+(Status = "To Do" for all)
 
 ## Total Story Points
-Sum by priority band."""
+Sum by priority band (Must Have / Should Have / Could Have / Won't Have)."""
 
-    return call_llm(_append_traceability_hints(system), user, max_tokens=MAX_TOKENS,
-                    temperature=0.5,  # user stories: narrative writing
-                    label="stage50_userstories")
+    parts.append(_call_section(system, tail_user, "stage50_us_tail", 0.5, 800))
+    return "\n\n".join(parts)
+
+
+# ─── Section-by-section helpers ────────────────────────────────────────────────
+
+def _call_section(
+    system:      str,
+    user:        str,
+    label:       str,
+    temperature: float,
+    max_tokens:  int = 2500,
+) -> str:
+    """
+    Make one focused LLM call for a single document section.
+
+    Smaller max_tokens per call (vs 8192 for the whole doc) means:
+    - No timeout risk — each call generates at most ~2500 tokens
+    - Better model focus — full attention on just this section
+    - Easy per-section retry on failure
+    """
+    from pipeline.llm_client import call_llm
+    return call_llm(system, user, max_tokens=max_tokens,
+                    temperature=temperature, label=label)
+
+
+def _feature_batches(features: list, batch_size: int):
+    """
+    Yield (start_index, batch) pairs for a feature list.
+    start_index is the 0-based offset into the full feature list,
+    used to compute consistent BR-XX / FR-3.X / AC-XX numbering.
+    """
+    for i in range(0, len(features), batch_size):
+        yield i, features[i : i + batch_size]
+
+
+def _compact_domain_header(domain: DomainModel) -> str:
+    """
+    Minimal domain context block for section-level calls.
+    Omits the full feature list (sent per-batch instead) to keep
+    each call's input prompt small and focused.
+    """
+    role_lines = "\n".join(
+        f"  • {r.get('role','?')}: {r.get('description','')}"
+        for r in domain.user_roles if isinstance(r, dict)
+    ) or "  • none defined"
+    entities = ", ".join(_to_str_list(domain.key_entities)) or "none"
+    contexts = ", ".join(_to_str_list(domain.bounded_contexts)) or "none"
+    return (
+        f"DOMAIN: {domain.domain_name}\n"
+        f"DESCRIPTION: {domain.description or 'n/a'}\n"
+        f"USER ROLES:\n{role_lines}\n"
+        f"KEY ENTITIES: {entities}\n"
+        f"BOUNDED CONTEXTS: {contexts}"
+    )
 
 
 # ─── Helpers ───────────────────────────────────────────────────────────────────
