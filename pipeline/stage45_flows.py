@@ -45,6 +45,7 @@ Pass I  Replace domain_model.workflows with flow summaries
 from __future__ import annotations
 
 import json
+import os
 import pickle
 import re
 from collections import defaultdict, deque
@@ -62,6 +63,33 @@ from context import (
 CLAUDE_MODEL   = "claude-sonnet-4-20250514"
 MAX_TOKENS     = 8192
 FLOWS_FILE     = "business_flows.json"
+
+# JSON schema for constrained decoding (Ollama ≥0.4.6 structured outputs)
+_FLOW_JSON_SCHEMA: dict = {
+    "type": "array",
+    "items": {
+        "type": "object",
+        "properties": {
+            "name":             {"type": "string"},
+            "actor":            {"type": "string"},
+            "trigger":          {"type": "string"},
+            "termination":      {"type": "string"},
+            "branches": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "condition": {"type": "string"},
+                        "outcome":   {"type": "string"},
+                    },
+                    "required": ["condition", "outcome"],
+                },
+            },
+            "replaces_workflow": {"type": ["string", "null"]},
+        },
+        "required": ["name", "actor", "trigger", "termination", "branches"],
+    },
+}
 
 # Graph traversal limits
 MAX_DEPTH      = 8    # max hops from an entry-point node
@@ -543,6 +571,97 @@ def _build_gap_fill_skeletons(
     return skeletons
 
 
+# ─── Route Gap Stub Generator (Lite Dynamic Analysis) ─────────────────────────
+
+def _generate_missing_route_stubs(
+    skeletons: list[dict],
+    ctx: Any,
+) -> list[dict]:
+    """
+    Generate minimal skeleton flows for Laravel routes that have no matching
+    flow skeleton yet.  This is the 'lite dynamic analysis' layer: instead of
+    running PHP with Xdebug, we statically derive the execution context from
+    the route→controller→action mapping.
+
+    Only non-GET routes and non-trivial GET routes (with controller methods that
+    are not just 'index' or 'show') generate stubs, to avoid flooding the output
+    with trivial page-display flows.
+
+    The stubs are flagged ``source="route_stub"`` and ``is_draft=True`` so the
+    review report can highlight them.  They go through LLM enrichment just like
+    regular skeletons, so the final output is a properly named BusinessFlow.
+    """
+    routes = getattr(ctx, "routes", None) or []
+    if not routes:
+        return []
+
+    # Build a set of URIs already covered by existing skeletons
+    covered: set[str] = set()
+    for sk in skeletons:
+        for step in sk.get("steps", []):
+            page = getattr(step, "page", "") or (step.get("page", "") if isinstance(step, dict) else "")
+            if page:
+                covered.add(page.split("?")[0].lower().rstrip("/") or "/")
+        # Also check files
+        for f in sk.get("files", []):
+            covered.add(Path(f).name.lower().replace(".php", ""))
+
+    stubs: list[dict] = []
+    for route in routes:
+        if not isinstance(route, dict):
+            continue
+        uri        = route.get("uri") or route.get("path", "")
+        verb       = (route.get("method") or route.get("verb", "GET")).upper()
+        controller = route.get("controller", "")
+        action     = route.get("action") or route.get("method_name", "")
+
+        if not uri:
+            continue
+        uri_clean = uri.lower().rstrip("/") or "/"
+
+        # Skip already-covered routes
+        if uri_clean in covered:
+            continue
+
+        # Skip trivial read-only routes — index/show are usually simple list/detail pages
+        if verb == "GET" and action.lower() in ("index", "show", ""):
+            continue
+
+        # Build a minimal one-step skeleton
+        step = FlowStep(
+            step_num     = 1,
+            page         = uri,
+            action       = f"{verb} request handled by {controller}::{action}" if controller else f"{verb} {uri}",
+            auth_required= False,
+            db_ops       = [],
+            inputs       = [],
+            outputs      = [],
+            is_branch    = False,
+        )
+        stub: dict[str, Any] = {
+            "files":        [controller.replace("::", "/").replace("\\", "/") + ".php"] if controller else [],
+            "steps":        [step],
+            "branches":     [],
+            "source":       "route_stub",
+            "is_draft":     True,
+            "evidence_files": [],
+            "_structured_meta": {
+                "http_verb":  verb,
+                "uri":        uri,
+                "controller": controller,
+                "method":     action,
+                "sql_tables": [],
+                "redirect":   "",
+            },
+        }
+        stubs.append(stub)
+        covered.add(uri_clean)  # avoid duplicate stubs for same URI
+
+    if stubs:
+        print(f"  [stage45]   Generated {len(stubs)} route stub(s) for uncovered routes")
+    return stubs
+
+
 # ─── Branch Enrichment ─────────────────────────────────────────────────────────
 
 def _fill_branches_from_redirects(skeletons: list[dict], cm: Any) -> None:
@@ -678,6 +797,11 @@ def run(ctx: PipelineContext) -> None:
     # discarded.  Running here ensures the filled branches land in the dicts
     # that _enrich_with_llm reads via sk["branches"].
     _fill_branches_from_redirects(flow_skeletons, ctx.code_map)
+
+    # Lite dynamic analysis: generate stub skeletons for routes with no flow
+    route_stubs = _generate_missing_route_stubs(flow_skeletons, ctx)
+    if route_stubs:
+        flow_skeletons.extend(route_stubs)
 
     print("  [stage45] Pass F: Grouping by bounded context ...")
     context_groups = _group_by_context(flow_skeletons, ctx)
@@ -2157,6 +2281,14 @@ def _enrich_with_llm(
     # max_tokens truncation on large context groups (e.g. Routes with 80+).
     MAX_LLM_BATCH = 20
 
+    # Multi-model ensemble: LLM_ENSEMBLE_MODELS=model1,model2 runs each batch
+    # with multiple models and merges by taking the most-populated result.
+    _raw_ens = os.environ.get("LLM_ENSEMBLE_MODELS", "").strip()
+    _ens_models: list[str | None] = (
+        [m.strip() for m in _raw_ens.split(",") if m.strip()]
+        if _raw_ens else [None]
+    )
+
     for context_name, indices in context_groups.items():
         group_skeletons = [skeletons[i] for i in indices]
 
@@ -2167,15 +2299,30 @@ def _enrich_with_llm(
             batch = group_skeletons[batch_start:batch_start + MAX_LLM_BATCH]
             batch_label = f"stage45_{context_name[:15]}_{batch_start//MAX_LLM_BATCH+1}"
             user = _build_llm_user_prompt(context_name, batch, domain)
-            try:
-                raw = call_llm(system, user, max_tokens=MAX_TOKENS,
-                               temperature=0.1,   # flow analysis: structural JSON
-                               label=batch_label)
-                batch_enr = _parse_llm_response(raw, len(batch))
-            except Exception as e:
-                print(f"  [stage45] Warning: LLM call failed for '{context_name}' "
-                      f"batch {batch_start//MAX_LLM_BATCH+1}: {e}")
-                batch_enr = [{}] * len(batch)
+            # Collect per-model results; merge by picking the most-complete entry
+            all_model_enrs: list[list[dict]] = []
+            for _mdl in _ens_models:
+                _lbl = batch_label + (f"_{_ens_models.index(_mdl)+1}" if len(_ens_models) > 1 else "")
+                try:
+                    raw = call_llm(system, user, max_tokens=MAX_TOKENS,
+                                   temperature=0.1,   # flow analysis: structural JSON
+                                   label=_lbl,
+                                   json_schema=_FLOW_JSON_SCHEMA,
+                                   model_override=_mdl)
+                    all_model_enrs.append(_parse_llm_response(raw, len(batch)))
+                except Exception as e:
+                    print(f"  [stage45] Warning: LLM call failed for '{context_name}' "
+                          f"batch {batch_start//MAX_LLM_BATCH+1}: {e}")
+                    all_model_enrs.append([{}] * len(batch))
+            # Merge: for each position, pick the enrichment with most non-empty fields
+            if len(all_model_enrs) == 1:
+                batch_enr = all_model_enrs[0]
+            else:
+                batch_enr = []
+                for i in range(len(batch)):
+                    candidates = [m[i] for m in all_model_enrs if i < len(m)]
+                    best = max(candidates, key=lambda e: sum(1 for v in e.values() if v))
+                    batch_enr.append(best)
             enrichments.extend(batch_enr)
 
         # Merge enrichments onto skeletons

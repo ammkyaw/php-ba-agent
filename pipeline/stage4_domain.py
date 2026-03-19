@@ -123,6 +123,32 @@ def run(ctx: PipelineContext) -> None:
     quality_score = _get_quality_score(ctx)
     user_prompt   = _build_user_prompt(ctx, chunks)
 
+    # ── RAG augmentation ──────────────────────────────────────────────────────
+    # When RAG_ENABLED=1, build an FTS5 code chunk index and append the most
+    # relevant snippets to the user prompt.  Particularly useful for large
+    # codebases where the main prompt is already near the context window limit.
+    from pipeline.rag import CodeChunkIndex, is_enabled as _rag_enabled, get_top_k as _rag_top_k
+    if _rag_enabled():
+        _rag_idx = CodeChunkIndex(str(Path(output_path).parent))
+        _rag_idx.build(ctx)
+        _rag_ctx_a = _rag_idx.format_context(
+            "domain entities data models user roles business objects database tables",
+            top_k=_rag_top_k(),
+            header="## RAG: Top relevant code chunks (entities / tables)",
+        )
+        _rag_ctx_b = _rag_idx.format_context(
+            "business features use cases workflows user actions forms authentication",
+            top_k=_rag_top_k(),
+            header="## RAG: Top relevant code chunks (features / workflows)",
+        )
+        _rag_idx.close()
+        if _rag_ctx_a:
+            user_prompt = user_prompt + "\n\n" + _rag_ctx_a
+        print(f"  [stage4] RAG augmentation: +{len(_rag_ctx_a)} chars (entities), "
+              f"+{len(_rag_ctx_b)} chars (features)")
+    else:
+        _rag_ctx_b = ""
+
     from pipeline.llm_client import get_provider, get_model
     print(f"  [stage4] LLM: {get_provider()} / {get_model()} | "
           f"context={len(user_prompt)} chars | quality={quality_score}")
@@ -160,33 +186,54 @@ def run(ctx: PipelineContext) -> None:
     # Default is 1 (off) to preserve speed; set to 3 for higher accuracy.
     _consistency_runs = max(1, int(os.environ.get("STAGE4_CONSISTENCY_RUNS", "1") or "1"))
 
+    # ── Multi-model ensemble ──────────────────────────────────────────────────
+    # LLM_ENSEMBLE_MODELS=model1,model2 runs each call once per model and
+    # merges by union.  Combines orthogonal model strengths: one model may
+    # catch entities the other misses.  Works with local (Ollama) models only.
+    _raw_ensemble = os.environ.get("LLM_ENSEMBLE_MODELS", "").strip()
+    _ensemble_models: list[str | None] = (
+        [m.strip() for m in _raw_ensemble.split(",") if m.strip()]
+        if _raw_ensemble else [None]
+    )
+    if len(_ensemble_models) > 1:
+        print(f"  [stage4] Ensemble mode: {len(_ensemble_models)} models")
+
     # ── Call A: meta + entities + contexts (fast, ~4K tokens) ────────────────
+    _total_a = _consistency_runs * len(_ensemble_models)
     print(f"  [stage4] Call 1/3 — domain name, entities, contexts "
-          f"(x{_consistency_runs} consistency runs) ...")
+          f"(x{_total_a} runs) ...")
     _a_results: list[dict] = []
-    for _run in range(_consistency_runs):
-        _lbl = f"stage4-A{_run+1}" if _consistency_runs > 1 else "stage4-A"
-        _a_results.append(_parse_partial(
-            _call_part(_system_meta(quality_score), user_prompt, MAX_TOKENS_META, _lbl),
-            f"A{_run+1}", debug_dir,
-        ))
+    for _mdl in _ensemble_models:
+        for _run in range(_consistency_runs):
+            _suffix = f"{_ensemble_models.index(_mdl)+1}.{_run+1}" if len(_ensemble_models) > 1 else str(_run+1)
+            _lbl = f"stage4-A{_suffix}" if _total_a > 1 else "stage4-A"
+            _a_results.append(_parse_partial(
+                _call_part(_system_meta(quality_score), user_prompt, MAX_TOKENS_META, _lbl,
+                           model_override=_mdl),
+                f"A{_suffix}", debug_dir,
+            ))
     data_a = _merge_consistency_a(_a_results)
 
     # ── Call B: features (largest field, ~8K tokens) ──────────────────────────
+    _total_b = _consistency_runs * len(_ensemble_models)
     print(f"  [stage4] Call 2/3 — features "
-          f"(x{_consistency_runs} consistency runs) ...")
+          f"(x{_total_b} runs) ...")
     _b_results: list[dict] = []
     _sys_b = _system_features(quality_score,
                                known_tables=known_tables,
                                known_pages=known_pages,
                                known_fields=known_fields,
                                table_columns=getattr(cm, "table_columns", None) or [])
-    for _run in range(_consistency_runs):
-        _lbl = f"stage4-B{_run+1}" if _consistency_runs > 1 else "stage4-B"
-        _b_results.append(_parse_partial(
-            _call_part(_sys_b, user_prompt, MAX_TOKENS_FEATURES, _lbl),
-            f"B{_run+1}", debug_dir,
-        ))
+    _user_prompt_b = (user_prompt + "\n\n" + _rag_ctx_b) if _rag_ctx_b else user_prompt
+    for _mdl in _ensemble_models:
+        for _run in range(_consistency_runs):
+            _suffix = f"{_ensemble_models.index(_mdl)+1}.{_run+1}" if len(_ensemble_models) > 1 else str(_run+1)
+            _lbl = f"stage4-B{_suffix}" if _total_b > 1 else "stage4-B"
+            _b_results.append(_parse_partial(
+                _call_part(_sys_b, _user_prompt_b, MAX_TOKENS_FEATURES, _lbl,
+                           model_override=_mdl),
+                f"B{_suffix}", debug_dir,
+            ))
     data_b = _merge_consistency_b(_b_results)
 
     # Filter hallucinated page/table names.
@@ -1237,7 +1284,8 @@ def _build_user_prompt(ctx: PipelineContext, chunks: list[dict]) -> str:
 # ─── LLM Call Helper ───────────────────────────────────────────────────────────
 
 def _call_part(system_prompt: str, user_prompt: str,
-               max_tokens: int, label: str) -> str:
+               max_tokens: int, label: str,
+               model_override: str | None = None) -> str:
     """Call the configured LLM and return the raw response string.
 
     json_mode=True forces local models (Ollama etc.) to output valid JSON:
@@ -1255,13 +1303,14 @@ def _call_part(system_prompt: str, user_prompt: str,
     # differently and prefill interferes with its extended-thinking mode.
     use_prefill = "{" if get_provider() == "local" else ""
     return call_llm(
-        system_prompt = system_prompt,
-        user_prompt   = user_prompt,
-        max_tokens    = max_tokens,
-        temperature   = 0.2,   # extraction: recall > precision, keep generous default
-        label         = label,
-        json_mode     = True,
-        prefill       = use_prefill,
+        system_prompt  = system_prompt,
+        user_prompt    = user_prompt,
+        max_tokens     = max_tokens,
+        temperature    = 0.2,   # extraction: recall > precision, keep generous default
+        label          = label,
+        json_mode      = True,
+        prefill        = use_prefill,
+        model_override = model_override,
     )
 
 
