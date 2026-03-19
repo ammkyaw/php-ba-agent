@@ -150,48 +150,69 @@ class CodeChunkIndex:
         yield from self._chunks_from_invariants(ctx, seen)
 
     def _chunks_from_code_map(self, ctx: Any, seen: set):
-        code_map = getattr(ctx, "code_map", None) or {}
-        for path, info in code_map.items():
-            if not isinstance(info, dict):
-                continue
-            # Classes
-            for cls_name, cls_info in (info.get("classes") or {}).items():
+        # CodeMap is a dataclass with flat list fields, not a path-keyed dict.
+        # Each list item is a dict with fields like 'name', 'file', 'methods', etc.
+        cm = getattr(ctx, "code_map", None)
+        if cm is None:
+            return
+
+        # Classes, controllers, models, services all share the same dict shape
+        all_class_lists = [
+            getattr(cm, "classes",     None) or [],
+            getattr(cm, "controllers", None) or [],
+            getattr(cm, "models",      None) or [],
+            getattr(cm, "services",    None) or [],
+        ]
+        for cls_list in all_class_lists:
+            for cls_info in cls_list:
                 if not isinstance(cls_info, dict):
+                    continue
+                cls_name = cls_info.get("name") or cls_info.get("class_name", "")
+                path     = cls_info.get("file") or cls_info.get("path", "")
+                if not cls_name:
                     continue
                 cid = f"class:{path}:{cls_name}"
                 if cid in seen:
                     continue
                 seen.add(cid)
-                methods   = list((cls_info.get("methods") or {}).keys())[:15]
-                sql_ops   = [str(q) for q in (cls_info.get("sql_queries") or [])[:5]]
-                extends   = cls_info.get("extends", "")
+                # methods may be a list of strings or a dict keyed by method name
+                raw_methods = cls_info.get("methods") or []
+                if isinstance(raw_methods, dict):
+                    methods = list(raw_methods.keys())[:15]
+                else:
+                    methods = [m if isinstance(m, str) else m.get("name", "") for m in raw_methods[:15]]
+                extends    = cls_info.get("extends", "") or cls_info.get("parent", "")
                 implements = ", ".join(cls_info.get("implements") or [])
                 content = (
                     f"class {cls_name}"
                     + (f" extends {extends}" if extends else "")
                     + (f" implements {implements}" if implements else "")
-                    + f". Methods: {', '.join(methods)}."
-                    + (f" SQL: {'; '.join(sql_ops)}." if sql_ops else "")
+                    + (f". Methods: {', '.join(str(m) for m in methods if m)}." if methods else ".")
                 )
                 yield (cid, "class", cls_name, path, content)
 
-            # Top-level functions
-            for fn_name, fn_info in (info.get("functions") or {}).items():
-                if not isinstance(fn_info, dict):
-                    continue
-                cid = f"fn:{path}:{fn_name}"
-                if cid in seen:
-                    continue
-                seen.add(cid)
-                calls   = [str(c) for c in (fn_info.get("calls") or [])[:6]]
-                content = (
-                    f"function {fn_name} in {path}."
-                    + (f" Calls: {', '.join(calls)}." if calls else "")
-                )
-                yield (cid, "function", fn_name, path, content)
+        # Standalone / global functions
+        for fn_info in (getattr(cm, "functions", None) or []):
+            if not isinstance(fn_info, dict):
+                continue
+            fn_name = fn_info.get("name") or fn_info.get("function_name", "")
+            path    = fn_info.get("file") or fn_info.get("path", "")
+            if not fn_name:
+                continue
+            cid = f"fn:{path}:{fn_name}"
+            if cid in seen:
+                continue
+            seen.add(cid)
+            calls = [str(c) for c in (fn_info.get("calls") or [])[:6]]
+            content = (
+                f"function {fn_name}" + (f" in {path}" if path else "")
+                + (f". Calls: {', '.join(calls)}." if calls else ".")
+            )
+            yield (cid, "function", fn_name, path, content)
 
     def _chunks_from_routes(self, ctx: Any, seen: set):
-        for route in (getattr(ctx, "routes", None) or []):
+        cm = getattr(ctx, "code_map", ctx)  # ctx may be CodeMap or PipelineContext
+        for route in (getattr(cm, "routes", None) or []):
             if not isinstance(route, dict):
                 continue
             uri  = route.get("uri") or route.get("path", "")
@@ -229,7 +250,8 @@ class CodeChunkIndex:
             yield (cid, "entity", name, "", content)
 
     def _chunks_from_tables(self, ctx: Any, seen: set):
-        cols = getattr(ctx, "table_columns", None) or []
+        cm   = getattr(ctx, "code_map", ctx)
+        cols = getattr(cm, "table_columns", None) or []
         for tbl in cols:
             if not isinstance(tbl, dict):
                 continue
@@ -245,7 +267,8 @@ class CodeChunkIndex:
             yield (cid, "table", tname, "", content)
 
     def _chunks_from_invariants(self, ctx: Any, seen: set):
-        for inv in (getattr(ctx, "invariants", None) or []):
+        cm = getattr(ctx, "code_map", ctx)
+        for inv in (getattr(cm, "invariants", None) or getattr(ctx, "invariants", None) or []):
             if not isinstance(inv, dict):
                 continue
             iid  = inv.get("id", "")
