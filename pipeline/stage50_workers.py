@@ -217,20 +217,6 @@ def _run_brd_agent(domain: DomainModel, ctx: PipelineContext) -> str:
         for rule in _to_str_list(f.get("business_rules", []))
     ) or "  - None explicitly defined"
 
-    system = _append_traceability_hints(f"""You are a senior Business Analyst writing a formal Business Requirements Document (BRD).
-Write in professional business language using actual system names from the evidence.
-Use proper Markdown with headers, bullet points, and tables.
-When an Evidence block is provided, use routes/SQL/fields to write specific grounded criteria.
-
-Quality rules:
-- Number every business rule BR-01, BR-02, … for critic cross-reference
-- Use exact entity/table names — do NOT paraphrase or abbreviate
-- Never leave placeholder text like "TBD", "[Enter here]", or "as needed"
-- Each feature section must state at least one measurable acceptance criterion
-- Output ONLY the requested section(s) — no preamble, no extra commentary
-
-Framework context: {hints.brd_note}{_preflight_system_note(ctx)}""")
-
     domain_hdr = _compact_domain_header(domain)
     spec_block  = _format_spec_rules_for_prompt(ctx)
     plain_rules = _format_plain_english_rules(ctx)
@@ -245,16 +231,35 @@ Framework context: {hints.brd_note}{_preflight_system_note(ctx)}""")
         except Exception:
             pass
 
-    parts: list[str] = []
+    # ── System prompt includes all stable shared context (prefix-cached) ──────
+    # Placing domain_hdr / spec_block / plain_rules in the system prompt means
+    # these tokens are processed ONCE and cached (Claude prefix cache + Ollama
+    # KV cache). Each section's user prompt then contains only the section-
+    # specific instructions — a fraction of the total token cost.
+    system = _append_traceability_hints(f"""You are a senior Business Analyst writing a formal Business Requirements Document (BRD).
+Write in professional business language using actual system names from the evidence.
+Use proper Markdown with headers, bullet points, and tables.
+When an Evidence block is provided, use routes/SQL/fields to write specific grounded criteria.
 
-    # ── Section A: front matter (1–4) ────────────────────────────────────────
-    front_user = f"""Write ONLY sections 1–4 of the BRD. Do NOT write section 5 or beyond.
+Quality rules:
+- Number every business rule BR-01, BR-02, … for critic cross-reference
+- Use exact entity/table names — do NOT paraphrase or abbreviate
+- Never leave placeholder text like "TBD", "[Enter here]", or "as needed"
+- Each feature section must state at least one measurable acceptance criterion
+- Output ONLY the requested section(s) — no preamble, no extra commentary
+
+Framework context: {hints.brd_note}{_preflight_system_note(ctx)}
 
 {domain_hdr}
 User Roles:
 {role_lines}
-Features (for scope list only): {all_feature_names}
-{spec_block}{plain_rules}{gc_ctx}
+Features: {all_feature_names}
+{spec_block}{plain_rules}{gc_ctx}""")
+
+    parts: list[str] = []
+
+    # ── Section A: front matter (1–4) ────────────────────────────────────────
+    front_user = f"""Write ONLY sections 1–4 of the BRD. Do NOT write section 5 or beyond.
 
 Output EXACTLY:
 
@@ -300,9 +305,6 @@ Markdown table: Role | Description | Key Interests"""
         req_user = f"""Write ONLY Business Requirements BR-{br_from:02d} through BR-{br_to:02d}.
 Do NOT write any other section. Do NOT repeat the document title or previous BRs.
 
-{domain_hdr}
-{spec_block}
-
 {section_hdr}Fill in Priority and Acceptance for EACH entry below.
 For trivial features write Priority: Low and a brief 1-line criterion.
 
@@ -315,11 +317,9 @@ For trivial features write Priority: Low and a brief 1-line criterion.
     entities_str = ", ".join(_to_str_list(domain.key_entities)) or "none"
     tail_user = f"""Write ONLY sections 6–9 of the BRD. Do NOT repeat earlier sections.
 
-{domain_hdr}
 Entities: {entities_str}
 Business Rules:
 {rule_lines}
-{spec_block}
 
 Output EXACTLY:
 
@@ -347,20 +347,6 @@ def _run_srs_agent(domain: DomainModel, ctx: PipelineContext) -> str:
 
     hints  = get_hints(ctx.code_map.framework if ctx.code_map else "unknown")
     ev_idx = build_evidence_index(ctx, domain)
-
-    system = _append_traceability_hints(f"""You are a senior software engineer writing a formal SRS (IEEE 830).
-Be precise and technical. Use Evidence blocks to derive concrete Input/Processing/Output/Tables values.
-
-Quality rules:
-- Number every FR as FR-3.X.Y for critic cross-reference
-- Use exact table/column names — no paraphrasing
-- Each FR must have: Input, Processing, Output, Tables (write "none" if truly absent)
-- List ALL validation rules per FR
-- Include at least one negative/error scenario per feature
-- Never leave placeholder text like "TBD" or "as required"
-- Output ONLY the requested section(s)
-
-{hints.srs_note}{_preflight_system_note(ctx)}""")
 
     domain_hdr   = _compact_domain_header(domain)
     spec_block   = _format_spec_rules_for_prompt(
@@ -392,12 +378,27 @@ Quality rules:
         except Exception:
             pass
 
+    system = _append_traceability_hints(f"""You are a senior software engineer writing a formal SRS (IEEE 830).
+Be precise and technical. Use Evidence blocks to derive concrete Input/Processing/Output/Tables values.
+
+Quality rules:
+- Number every FR as FR-3.X.Y for critic cross-reference
+- Use exact table/column names — no paraphrasing
+- Each FR must have: Input, Processing, Output, Tables (write "none" if truly absent)
+- List ALL validation rules per FR
+- Include at least one negative/error scenario per feature
+- Never leave placeholder text like "TBD" or "as required"
+- Output ONLY the requested section(s)
+
+{hints.srs_note}{_preflight_system_note(ctx)}
+
+{domain_hdr}{env_block}{gc_ctx}
+{spec_block}""")
+
     parts: list[str] = []
 
     # ── Section A: front matter (1–2) ────────────────────────────────────────
     front_user = f"""Write ONLY sections 1 and 2 of the SRS. Do NOT write section 3 or beyond.
-
-{domain_hdr}{env_block}{gc_ctx}
 
 Output EXACTLY:
 
@@ -444,9 +445,6 @@ For each user role: name, technical level, frequency of use, key tasks.
 Do NOT write any other section. Do NOT repeat the document title or previous FRs.
 For trivial features write: Input=none, Processing=minimal, Output=redirect or display, Tables=none.
 
-{domain_hdr}
-{spec_block}
-
 {section_hdr}Fill in all bracketed placeholders using the Evidence blocks provided.
 
 {scaffold}"""
@@ -456,8 +454,6 @@ For trivial features write: Input=none, Processing=minimal, Output=redirect or d
 
     # ── Section C: tail (4–6) ─────────────────────────────────────────────────
     tail_user = f"""Write ONLY sections 4, 5, and 6 of the SRS. Do NOT repeat earlier sections.
-
-{domain_hdr}{env_block}
 
 Output EXACTLY:
 
@@ -490,6 +486,11 @@ def _run_ac_agent(domain: DomainModel, ctx: PipelineContext) -> str:
     hints  = get_hints(ctx.code_map.framework if ctx.code_map else "unknown")
     ev_idx = build_evidence_index(ctx, domain)
 
+    ep_section    = _format_execution_paths_for_prompt(ctx)
+    flows_section = _format_business_flows_for_prompt(ctx)
+    spec_block    = _format_spec_rules_for_prompt(ctx)
+    domain_hdr    = _compact_domain_header(domain)
+
     system = _append_traceability_hints(f"""You are a QA lead writing Acceptance Criteria.
 Use Given/When/Then (Gherkin) for interactive scenarios; plain pass/fail for display rules.
 Derive Given/When/Then from Evidence blocks:
@@ -504,19 +505,17 @@ Quality rules:
 - Do NOT write vague criteria like "system works correctly"
 - Output ONLY the requested section(s)
 
-{hints.ac_template}""")
+{hints.ac_template}
 
-    ep_section    = _format_execution_paths_for_prompt(ctx)
-    flows_section = _format_business_flows_for_prompt(ctx)
-    spec_block    = _format_spec_rules_for_prompt(ctx)
-    domain_hdr    = _compact_domain_header(domain)
+{domain_hdr}
+{flows_section}
+{ep_section}
+{spec_block}""")
 
     parts: list[str] = []
 
     # ── Section A: header + overview ─────────────────────────────────────────
     hdr_user = f"""Write ONLY the title and Overview section. Do NOT write any AC-XX sections yet.
-
-{domain_hdr}
 
 Output EXACTLY:
 
@@ -557,11 +556,6 @@ Brief description of how acceptance testing should be approached for this system
 CRITICAL: Use the EXACT headings "## AC-XX: [Feature Name]" as written — do NOT rename them.
 Do NOT write any other section or repeat previous ACs.
 
-{domain_hdr}
-{flows_section}
-{ep_section}
-{spec_block}
-
 ---
 
 {scaffold}"""
@@ -571,8 +565,6 @@ Do NOT write any other section or repeat previous ACs.
 
     # ── Section C: test data requirements ────────────────────────────────────
     tail_user = f"""Write ONLY the Test Data Requirements section. Do NOT repeat any AC sections.
-
-{domain_hdr}
 
 Output EXACTLY:
 
@@ -595,6 +587,11 @@ def _run_userstories_agent(domain: DomainModel, ctx: PipelineContext) -> str:
     hints  = get_hints(ctx.code_map.framework if ctx.code_map else "unknown")
     ev_idx = build_evidence_index(ctx, domain)
 
+    ep_section    = _format_execution_paths_for_prompt(ctx)
+    flows_section = _format_business_flows_for_prompt(ctx)
+    spec_block    = _format_spec_rules_for_prompt(ctx, categories=["WORKFLOW", "AUTHORIZATION"])
+    domain_hdr    = _compact_domain_header(domain)
+
     system = _append_traceability_hints(f"""You are an Agile product owner writing User Stories.
 Format: 'As a [role], I want to [action], so that [benefit]'.
 Include story points (Fibonacci: 1,2,3,5,8,13) and priority (Must/Should/Could/Won't).
@@ -608,12 +605,12 @@ Quality rules:
 - "So that" = concrete business benefit, not "the system works"
 - Output ONLY the requested section(s)
 
-{hints.story_note}""")
+{hints.story_note}
 
-    ep_section    = _format_execution_paths_for_prompt(ctx)
-    flows_section = _format_business_flows_for_prompt(ctx)
-    spec_block    = _format_spec_rules_for_prompt(ctx, categories=["WORKFLOW", "AUTHORIZATION"])
-    domain_hdr    = _compact_domain_header(domain)
+{domain_hdr}
+{flows_section}
+{ep_section}
+{spec_block}""")
 
     parts: list[str] = []
 
@@ -624,14 +621,13 @@ Quality rules:
     )
     hdr_user = f"""Write ONLY the title and Epic Summary section. Do NOT write any epic detail yet.
 
-{domain_hdr}
-
 Output EXACTLY:
 
 # User Story Backlog — {domain.domain_name}
 
 ## Epic Summary
-{all_epics}"""
+{all_epics}
+"""
 
     parts.append(_call_section(system, hdr_user, "stage50_us_header", 0.5, 600))
 
@@ -672,11 +668,6 @@ Output EXACTLY:
         epic_user = f"""Write ONLY the epic detail for: {epic_names}.
 CRITICAL: Use EXACT headings "## Epic: [Feature Name]" as written — do NOT rename them.
 Do NOT write any other section or repeat previous epics.
-
-{domain_hdr}
-{flows_section}
-{ep_section}
-{spec_block}
 
 ---
 
