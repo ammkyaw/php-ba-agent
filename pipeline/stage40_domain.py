@@ -1,5 +1,5 @@
 """
-pipeline/stage4_domain.py — Domain Analyst Agent
+pipeline/stage40_domain.py — Domain Analyst Agent
 
 Uses the Claude API (claude-sonnet-4-20250514) to analyse the embedded
 codebase and produce a structured DomainModel that all Stage 5 agents
@@ -42,7 +42,7 @@ Uses ctx.preflight.quality_score to adjust Claude's instruction tone:
 
 Resume behaviour
 ----------------
-If stage4_domain is COMPLETED and domain_model.json exists, the stage
+If stage40_domain is COMPLETED and domain_model.json exists, the stage
 is skipped and ctx.domain_model is restored from the saved file.
 """
 
@@ -102,7 +102,7 @@ def run(ctx: PipelineContext) -> None:
     output_path = ctx.output_path(DOMAIN_FILE)
 
     # ── Resume check ─────────────────────────────────────────────────────────
-    if ctx.is_stage_done("stage4_domain") and Path(output_path).exists():
+    if ctx.is_stage_done("stage40_domain") and Path(output_path).exists():
         ctx.domain_model = _load_domain_model(output_path)
         print(f"  [stage4] Already completed — "
               f"domain='{ctx.domain_model.domain_name}', "
@@ -276,7 +276,7 @@ def run(ctx: PipelineContext) -> None:
     # ── Save ──────────────────────────────────────────────────────────────────
     _save_domain_model(domain_model, output_path)
     ctx.domain_model = domain_model
-    ctx.stage("stage4_domain").mark_completed(output_path)
+    ctx.stage("stage40_domain").mark_completed(output_path)
     ctx.save()
 
     print(f"  [stage4] Done — domain='{domain_model.domain_name}'")
@@ -366,7 +366,7 @@ def _retrieve_context(ctx: PipelineContext) -> list[dict[str, Any]]:
     Fire all retrieval queries against ChromaDB and return a deduplicated,
     ranked list of the most relevant chunks.
     """
-    from pipeline.stage3_embed import query_collection
+    from pipeline.stage30_embed import query_collection
 
     seen_ids: set[str]      = set()
     scored:   list[tuple]   = []   # (score, chunk_dict)

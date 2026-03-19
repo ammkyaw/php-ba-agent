@@ -1,5 +1,5 @@
 """
-pipeline/stage6_qa.py — QA Review Agent
+pipeline/stage60_qa.py — QA Review Agent
 
 Reviews all four BA artefacts (BRD, SRS, AC, User Stories) for quality,
 consistency, and coverage against the domain model and codebase evidence.
@@ -40,7 +40,7 @@ Output
 
 Resume behaviour
 ----------------
-If stage6_qa is COMPLETED and qa_report.md exists, stage is skipped.
+If stage60_qa is COMPLETED and qa_report.md exists, stage is skipped.
 """
 
 from __future__ import annotations
@@ -83,7 +83,7 @@ def run(ctx: PipelineContext) -> None:
     report_path = ctx.output_path(QA_REPORT_FILE)
 
     # ── Resume check ─────────────────────────────────────────────────────────
-    if ctx.is_stage_done("stage6_qa") and Path(report_path).exists():
+    if ctx.is_stage_done("stage60_qa") and Path(report_path).exists():
         ctx.qa_result = _load_qa_result(ctx.output_path(QA_JSON_FILE))
         print(f"  [stage6] Already completed — "
               f"coverage={ctx.qa_result.coverage_score:.0%}, "
@@ -158,7 +158,7 @@ def run(ctx: PipelineContext) -> None:
     pass_a_prompt = _build_coverage_prompt(ctx, artefacts)
     print(f"  [stage6] Pass A — coverage ({len(pass_a_prompt):,} chars) ...")
     raw_a     = call_llm(system_prompt, pass_a_prompt,
-                         max_tokens=MAX_TOKENS, label="stage6_passA")
+                         max_tokens=MAX_TOKENS, label="stage60_passA")
     pass_a_data = _parse_response(raw_a, pass_label="A")
 
     # ── Pass B: Consistency & Issues ─────────────────────────────────────────
@@ -166,7 +166,7 @@ def run(ctx: PipelineContext) -> None:
     pass_b_prompt = _build_consistency_prompt(ctx, artefacts, pass_d_issues)
     print(f"  [stage6] Pass B — consistency + issues ({len(pass_b_prompt):,} chars) ...")
     raw_b     = call_llm(system_prompt, pass_b_prompt,
-                         max_tokens=MAX_TOKENS, label="stage6_passB")
+                         max_tokens=MAX_TOKENS, label="stage60_passB")
     pass_b_data = _parse_response(raw_b, pass_label="B")
 
     # ── Pass C: Reverse Audit ─────────────────────────────────────────────────
@@ -177,7 +177,7 @@ def run(ctx: PipelineContext) -> None:
         raw_c       = call_llm(system_prompt, pass_c_prompt,
                                max_tokens=MAX_TOKENS_AUDIT,
                                temperature=0.1,  # reverse audit: strict file-by-file check
-                               label="stage6_passC")
+                               label="stage60_passC")
         pass_c_data = _parse_response(raw_c, pass_label="C")
         n_missing   = sum(
             1 for e in pass_c_data.get("audit", [])
@@ -215,7 +215,7 @@ def run(ctx: PipelineContext) -> None:
     with open(ctx.output_path(QA_JSON_FILE), "w", encoding="utf-8") as fh:
         json.dump(qa_data, fh, indent=2, ensure_ascii=False)
 
-    ctx.stage("stage6_qa").mark_completed(report_path)
+    ctx.stage("stage60_qa").mark_completed(report_path)
     ctx.save()
 
     _print_summary(ctx.qa_result)
@@ -272,7 +272,7 @@ def _build_coverage_prompt(ctx: PipelineContext, artefacts: dict[str, str]) -> s
     # Let the LLM coverage auditor know what the inline critic already fixed so
     # it can focus on residual gaps rather than re-flagging resolved issues.
     try:
-        from pipeline.stage5_critic        import critic_summary_block   as _critic_blk
+        from pipeline.stage50_critic       import critic_summary_block   as _critic_blk
         from pipeline.stage55_traceability import coverage_summary_block as _cov_blk
         _cb = _critic_blk(ctx)
         _tb = _cov_blk(ctx)
@@ -484,7 +484,7 @@ def _parse_response(raw: str, pass_label: str = "") -> dict[str, Any]:
     try:
         return json.loads(text)
     except json.JSONDecodeError:
-        from pipeline.stage4_domain import _attempt_json_recovery
+        from pipeline.stage40_domain import _attempt_json_recovery
         recovered = _attempt_json_recovery(text)
         if recovered:
             print(f"  [stage6] Pass {pass_label}: truncated JSON — partial recovery OK.")
@@ -764,7 +764,7 @@ def _build_report_md(
 
     # ── Traceability Summary (Stage 5.5 + Stage 5.0 Critic) ─────────────────
     try:
-        from pipeline.stage5_critic        import critic_summary_block   as _critic_blk
+        from pipeline.stage50_critic       import critic_summary_block   as _critic_blk
         from pipeline.stage55_traceability import coverage_summary_block as _cov_blk
         _cov_md    = _cov_blk(ctx)
         _critic_md = _critic_blk(ctx)

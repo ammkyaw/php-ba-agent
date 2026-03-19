@@ -23,7 +23,7 @@ def main() -> None:
         sys.exit(1)
 
     from context import PipelineContext
-    from pipeline.stage7_pdf import run as stage7_run
+    from pipeline.stage70_pdf import run as stage7_run
 
     ctx = _load(sys.argv[1])
     print(f"Run ID : {ctx.run_id}")

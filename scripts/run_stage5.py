@@ -33,18 +33,18 @@ def main() -> None:
     args = parser.parse_args()
 
     from context import PipelineContext, StageStatus
-    from pipeline.stage5_workers import run as stage5_run
+    from pipeline.stage50_workers import run as stage5_run
 
     ctx = _load_or_create(args.context)
 
     # Apply force flag — reset the relevant stage(s) to PENDING
     if args.force:
         force_map = {
-            "brd":         ["stage5_brd"],
-            "srs":         ["stage5_srs"],
-            "ac":          ["stage5_ac"],
-            "userstories": ["stage5_userstories"],
-            "all":         ["stage5_brd", "stage5_srs", "stage5_ac", "stage5_userstories"],
+            "brd":         ["stage50_brd"],
+            "srs":         ["stage50_srs"],
+            "ac":          ["stage50_ac"],
+            "userstories": ["stage50_userstories"],
+            "all":         ["stage50_brd", "stage50_srs", "stage50_ac", "stage50_userstories"],
         }
         for stage_name in force_map[args.force]:
             ctx.stage(stage_name).status = StageStatus.PENDING

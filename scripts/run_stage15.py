@@ -45,17 +45,17 @@ def main() -> None:
         ctx = PipelineContext.create(php_project_path=str(project_path))
         print(f"New run: {ctx.run_id}")
 
-        from pipeline.stage0_validate import run as stage0
-        from pipeline.stage1_parse    import run as stage1
+        from pipeline.stage00_validate import run as stage0
+        from pipeline.stage10_parse    import run as stage1
 
-        print("Running stage0_validate ...")
+        print("Running stage00_validate ...")
         stage0(ctx)
-        ctx.stage("stage0_validate").mark_completed()
+        ctx.stage("stage00_validate").mark_completed()
         ctx.save()
 
-        print("Running stage1_parse ...")
+        print("Running stage10_parse ...")
         stage1(ctx)
-        ctx.stage("stage1_parse").mark_completed()
+        ctx.stage("stage10_parse").mark_completed()
         ctx.save()
 
     else:

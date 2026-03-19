@@ -1,5 +1,5 @@
 """
-pipeline/stage8_tests.py — Test Case Generator (Stage 8)
+pipeline/stage80_tests.py — Test Case Generator (Stage 8)
 
 Converts BA artefacts into executable test assets:
 
@@ -14,7 +14,7 @@ Sources (in priority order, all combined into a single LLM context):
 
 Placement in the pipeline
 --------------------------
-  … stage7_pdf → stage8_tests
+  … stage70_pdf → stage80_tests
 
 Stage 8 is a standalone QA deliverable that sits after the BA document bundle
 is finalised.  It does not modify any earlier artefact.
@@ -27,7 +27,7 @@ and test file at the end.
 
 Resume behaviour
 ----------------
-If stage8_tests is COMPLETED and all three output files exist the stage is
+If stage80_tests is COMPLETED and all three output files exist the stage is
 skipped.  Pass --force to regenerate.
 
 Output layout
@@ -56,7 +56,7 @@ from pipeline.llm_client import call_llm
 
 # ── Constants ──────────────────────────────────────────────────────────────────
 
-STAGE_NAME = "stage8_tests"
+STAGE_NAME = "stage80_tests"
 MAX_TOKENS = 32000  # code output is dense; raised to prevent mid-block truncation
 
 # AC text budget per LLM call — keeps prompt + response within model limits
@@ -211,7 +211,7 @@ def _assert_prerequisites(ctx: PipelineContext) -> None:
     if ctx.ba_artifacts is None:
         raise RuntimeError(
             f"[{STAGE_NAME}] ctx.ba_artifacts is None — run Stage 5 first.\n"
-            f"  python run_pipeline.py --resume <context.json> --until stage5_ac"
+            f"  python run_pipeline.py --resume <context.json> --until stage50_ac"
         )
     if not ctx.ba_artifacts.ac_path:
         raise RuntimeError(
@@ -223,7 +223,7 @@ def _assert_prerequisites(ctx: PipelineContext) -> None:
         raise RuntimeError(
             f"[{STAGE_NAME}] AC file not found: {ac_path}\n"
             f"  Re-run Stage 5: python run_pipeline.py --resume <context.json> "
-            f"--until stage5_ac --force stage5_ac"
+            f"--until stage50_ac --force stage50_ac"
         )
 
 

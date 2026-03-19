@@ -76,7 +76,7 @@ def main() -> None:
     # ── Dry run: just build and print chunks ─────────────────────────────────
     if args.dry_run:
         import pickle
-        from pipeline.stage3_embed import _build_chunks, _build_context_tables
+        from pipeline.stage30_embed import _build_chunks, _build_context_tables
 
         graph = None
         if ctx.graph_meta and ctx.graph_meta.graph_path:
@@ -133,7 +133,7 @@ def main() -> None:
         return
 
     # ── Normal run ────────────────────────────────────────────────────────────
-    from pipeline.stage3_embed import run as stage3_run
+    from pipeline.stage30_embed import run as stage3_run
     stage3_run(ctx)
 
     print(f"\nEmbedding complete!")
@@ -154,7 +154,7 @@ def main() -> None:
             print(f"  Filter: chunk_type = {args.filter_type}")
         print(f"{'='*60}")
 
-        from pipeline.stage3_embed import query_collection
+        from pipeline.stage30_embed import query_collection
         where = {"chunk_type": args.filter_type} if args.filter_type else None
 
         results = query_collection(ctx, args.query, n_results=args.n_results, where=where)

@@ -43,7 +43,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent.parent))  # locate project root
 
 from context import PipelineContext, StageStatus
-from pipeline.stage9_knowledge_graph import run as stage9_run, OUTPUT_FILE
+from pipeline.stage90_knowledge_graph import run as stage9_run, OUTPUT_FILE
 
 
 # ─── Argument Parsing ─────────────────────────────────────────────────────────
@@ -65,7 +65,7 @@ def _parse_args() -> argparse.Namespace:
         "--force",
         action  = "store_true",
         default = False,
-        help    = "Re-run even if stage9_knowledge_graph is already COMPLETED.",
+        help    = "Re-run even if stage90_knowledge_graph is already COMPLETED.",
     )
     parser.add_argument(
         "--inspect",
@@ -93,9 +93,9 @@ def _load_context(args: argparse.Namespace) -> PipelineContext:
     print(f"Output dir  : {ctx.output_dir}")
 
     if args.force:
-        ctx.stages["stage9_knowledge_graph"].status = StageStatus.PENDING
-        ctx.stages["stage9_knowledge_graph"].error  = None
-        print("--force     : stage9_knowledge_graph reset to PENDING")
+        ctx.stages["stage90_knowledge_graph"].status = StageStatus.PENDING
+        ctx.stages["stage90_knowledge_graph"].error  = None
+        print("--force     : stage90_knowledge_graph reset to PENDING")
 
     return ctx
 
@@ -105,7 +105,7 @@ def _check_dependencies(ctx: PipelineContext, resume_path: str) -> None:
     if ctx.domain_model is None:
         errors.append(
             "ctx.domain_model is None — run Stage 4 first:\n"
-            f"       python run_pipeline.py --resume {resume_path} --until stage4_domain"
+            f"       python run_pipeline.py --resume {resume_path} --until stage40_domain"
         )
     if ctx.business_flows is None or not ctx.business_flows.flows:
         errors.append(
@@ -150,7 +150,7 @@ def _print_inspect(ctx: PipelineContext) -> None:
     out = ctx.output_path(OUTPUT_FILE)
     exists = Path(out).exists()
     print(f"\n[output]  {'✅ exists' if exists else '— not yet built'}: {out}")
-    stage_result = ctx.stages.get("stage9_knowledge_graph")
+    stage_result = ctx.stages.get("stage90_knowledge_graph")
     if stage_result:
         print(f"[stage status]  {stage_result.status.value}")
 
@@ -173,7 +173,7 @@ def main() -> None:
     print(f"business_flows: {bfc.total if bfc else 0} flow(s)")
     print(f"code_map      : {'present' if cm else 'absent'}"
           + (f"  ({len(cm.html_pages)} pages, {len(cm.db_schema)} tables)" if cm else ""))
-    print(f"stage status  : {ctx.stages['stage9_knowledge_graph'].status.value}")
+    print(f"stage status  : {ctx.stages['stage90_knowledge_graph'].status.value}")
     print()
 
     if args.inspect:
@@ -200,7 +200,7 @@ def main() -> None:
         for etype, count in sorted(kg.edge_type_counts.items()):
             print(f"  {etype:<25s} {count}")
 
-    if ctx.stages["stage9_knowledge_graph"].status.value == "failed":
+    if ctx.stages["stage90_knowledge_graph"].status.value == "failed":
         sys.exit(1)
 
 

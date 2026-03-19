@@ -23,7 +23,7 @@ def main() -> None:
         sys.exit(1)
 
     from context import PipelineContext
-    from pipeline.stage2_graph import run, load_graph, summarise_graph
+    from pipeline.stage20_graph import run, load_graph, summarise_graph
 
     ctx = _load_or_create(sys.argv[1])
 
@@ -51,7 +51,7 @@ def _load_or_create(arg: str):
         sys.exit(1)
 
     # New run — need to run Stage 1 first
-    from pipeline.stage1_parse import run as stage1_run
+    from pipeline.stage10_parse import run as stage1_run
     ctx = PipelineContext.create(php_project_path=str(path))
     print(f"New run: {ctx.run_id} — running Stage 1 first...")
     stage1_run(ctx)

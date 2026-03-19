@@ -174,13 +174,13 @@ def _check_prerequisites(ctx: "PipelineContext") -> None:
     if ctx.domain_model is None:
         _die(
             "ctx.domain_model is None — Stage 4 (domain analysis) must be completed first.\n"
-            f"       Run: {resume_hint} --until stage4_domain"
+            f"       Run: {resume_hint} --until stage40_domain"
         )
 
     if ctx.graph_meta is None or not ctx.graph_meta.graph_path:
         _die(
             "ctx.graph_meta is missing — Stage 2 (knowledge graph) must be completed first.\n"
-            f"       Run: {resume_hint} --until stage2_graph"
+            f"       Run: {resume_hint} --until stage20_graph"
         )
 
     gpickle = Path(ctx.graph_meta.graph_path)
@@ -188,7 +188,7 @@ def _check_prerequisites(ctx: "PipelineContext") -> None:
         _die(
             f"Graph file not found: {gpickle}\n"
             f"       Stage 2 may have been run in a different location, or the file was deleted.\n"
-            f"       Run: {resume_hint} --force stage2_graph"
+            f"       Run: {resume_hint} --force stage20_graph"
         )
 
     # Warn (don't block) if stage15 was skipped — flows will still work,

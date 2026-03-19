@@ -1,5 +1,5 @@
 """
-pipeline/stage0_validate.py — Input Validation Stage
+pipeline/stage00_validate.py — Input Validation Stage
 
 The first gate in the pipeline. Validates that the PHP project path is
 usable before any expensive work (parsing, graph building, embedding) begins.
@@ -23,12 +23,12 @@ WARNINGS (stored in ctx — pipeline continues):
 
 Resume behaviour
 ----------------
-If stage0_validate is already COMPLETED, the stage is skipped on resume
-unless --force stage0_validate is passed.
+If stage00_validate is already COMPLETED, the stage is skipped on resume
+unless --force stage00_validate is passed.
 
 Output written to context
 -------------------------
-    ctx.stages["stage0_validate"]  — COMPLETED or FAILED
+    ctx.stages["stage00_validate"]  — COMPLETED or FAILED
     ctx.code_map.php_version       — detected PHP version string (e.g. "8.1.0")
     ctx.code_map.framework         — preliminary framework hint (refined in Stage 1)
     ctx.code_map.total_files       — PHP file count (exact count done in Stage 1)
@@ -76,7 +76,7 @@ def run(ctx: PipelineContext) -> None:
     Raises:
         PipelineError: On any hard blocker. Message includes remediation advice.
     """
-    if ctx.is_stage_done("stage0_validate"):
+    if ctx.is_stage_done("stage00_validate"):
         print("  [stage0] Already completed — skipping.")
         return
 
@@ -178,7 +178,7 @@ def run(ctx: PipelineContext) -> None:
     if total_lines > WARN_LINE_COUNT:
         warnings.append(
             f"Large codebase: ~{total_lines:,} lines of PHP. "
-            "Consider using --until stage3_embed to validate parsing first."
+            "Consider using --until stage30_embed to validate parsing first."
         )
 
     # ── WARNING W5: no config/env file ───────────────────────────────────────
@@ -227,7 +227,7 @@ def run(ctx: PipelineContext) -> None:
         warnings     = warnings,
     )
 
-    ctx.stage("stage0_validate").mark_completed(report_path)
+    ctx.stage("stage00_validate").mark_completed(report_path)
     ctx.save()
 
     status = "✓ PASSED" if not warnings else f"✓ PASSED with {len(warnings)} warning(s)"

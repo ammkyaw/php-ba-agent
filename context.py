@@ -831,40 +831,40 @@ class PipelineContext:
     created_at:       str = field(default_factory=lambda: datetime.utcnow().isoformat())
 
     stages: dict[str, StageResult] = field(default_factory=lambda: {
-        "stage0_validate":        StageResult(),
-        "stage1_parse":           StageResult(),
+        "stage00_validate":       StageResult(),
+        "stage10_parse":          StageResult(),
         "stage13_entrypoints":    StageResult(),  # system entry-point catalog (static)
         "stage15_paths":          StageResult(),
-        "stage2_graph":           StageResult(),
+        "stage20_graph":          StageResult(),
         "stage25_behavior":       StageResult(),  # behavior graph extraction
         "stage27_semanticroles":  StageResult(),  # semantic role tagging (static)
         "stage28_clusters":       StageResult(),  # action clustering (similarity)
         "stage29_invariants":     StageResult(),  # business rule / invariant detection
-        "stage3_embed":           StageResult(),
+        "stage30_embed":          StageResult(),
         "stage35_entities":       StageResult(),  # entity extraction (static)
         "stage36_relationships":  StageResult(),  # entity relationship reconstruction (static)
         "stage37_statemachines":  StageResult(),  # state machine reconstruction (static)
         "stage38_graphrag":       StageResult(),  # graph-aware context index (enriched by 3.5/3.6/3.7)
         "stage39_preflight":      StageResult(),  # pre-LLM gate
-        "stage4_domain":          StageResult(),
+        "stage40_domain":         StageResult(),
         "stage45_flows":          StageResult(),
         "stage46_specrules":      StageResult(),  # specification mining (business rule synthesis)
         "stage47_validate":       StageResult(),  # behavioral flow validation
         "stage48_triangulate":    StageResult(),  # evidence triangulation (static)
-        "stage5_brd":             StageResult(),
-        "stage5_srs":             StageResult(),
-        "stage5_ac":              StageResult(),
-        "stage5_userstories":     StageResult(),
+        "stage50_brd":            StageResult(),
+        "stage50_srs":            StageResult(),
+        "stage50_ac":             StageResult(),
+        "stage50_userstories":    StageResult(),
         "stage55_traceability":   StageResult(),  # automated traceability matrix (static)
         "stage58_doccoverage":    StageResult(),  # document coverage audit (static)
         "stage59_accuracy_report": StageResult(), # BA document accuracy report (static)
-        "stage6_qa":              StageResult(),
+        "stage60_qa":             StageResult(),
         "stage62_architecture":   StageResult(),  # architecture reconstruction (LLM)
         "stage65_postprocess":    StageResult(),
         "stage67_diagrams":       StageResult(),
-        "stage7_pdf":             StageResult(),
-        "stage8_tests":           StageResult(),  # test case generator
-        "stage9_knowledge_graph": StageResult(),  # system knowledge graph builder
+        "stage70_pdf":            StageResult(),
+        "stage80_tests":          StageResult(),  # test case generator
+        "stage90_knowledge_graph": StageResult(),  # system knowledge graph builder
     })
 
     code_map:              Optional[CodeMap]             = None

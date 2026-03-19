@@ -20,7 +20,7 @@ def main() -> None:
         sys.exit(1)
 
     from context import PipelineContext
-    from pipeline.stage4_domain import run as stage4_run
+    from pipeline.stage40_domain import run as stage4_run
 
     ctx = _load_or_create(sys.argv[1])
 
