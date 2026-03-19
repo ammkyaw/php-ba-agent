@@ -235,18 +235,31 @@ class CodeChunkIndex:
         if domain is None:
             return
         for e in (getattr(domain, "entities", None) or []):
-            name  = (e.get("name") if isinstance(e, dict) else getattr(e, "name", "")) or ""
-            attrs = (e.get("attributes") if isinstance(e, dict) else getattr(e, "attributes", [])) or []
+            if isinstance(e, dict):
+                name  = e.get("name", "")
+                attrs = e.get("attributes") or []
+                bc    = e.get("bounded_context", "")
+            else:
+                name  = getattr(e, "name", "") or ""
+                attrs = getattr(e, "attributes", []) or []
+                bc    = getattr(e, "bounded_context", "") or ""
             if not name:
                 continue
             cid = f"entity:{name}"
             if cid in seen:
                 continue
             seen.add(cid)
-            attr_names = [
-                (a.get("name") if isinstance(a, dict) else str(a)) for a in attrs[:10]
-            ]
-            content = f"Domain entity {name}. Attributes: {', '.join(str(a) for a in attr_names)}."
+            attr_names = []
+            for a in attrs[:10]:
+                if isinstance(a, dict):
+                    attr_names.append(a.get("name") or str(a))
+                else:
+                    attr_names.append(getattr(a, "name", None) or str(a))
+            content = (
+                f"Domain entity {name}"
+                + (f" in {bc}" if bc else "")
+                + (f". Attributes: {', '.join(attr_names)}." if attr_names else ".")
+            )
             yield (cid, "entity", name, "", content)
 
     def _chunks_from_tables(self, ctx: Any, seen: set):
@@ -267,19 +280,26 @@ class CodeChunkIndex:
             yield (cid, "table", tname, "", content)
 
     def _chunks_from_invariants(self, ctx: Any, seen: set):
-        cm = getattr(ctx, "code_map", ctx)
-        for inv in (getattr(cm, "invariants", None) or getattr(ctx, "invariants", None) or []):
-            if not isinstance(inv, dict):
-                continue
-            iid  = inv.get("id", "")
-            desc = inv.get("description", inv.get("rule", ""))[:200]
+        # ctx.invariants is an InvariantCollection dataclass; iterate .rules
+        inv_col = getattr(ctx, "invariants", None)
+        raw_rules = (getattr(inv_col, "rules", None) or []) if inv_col is not None else []
+        for inv in raw_rules:
+            # BusinessRule is a dataclass; fall back to dict access for safety
+            if isinstance(inv, dict):
+                iid  = inv.get("rule_id") or inv.get("id", "")
+                desc = (inv.get("description") or inv.get("rule", ""))[:200]
+                cat  = inv.get("category", "")
+            else:
+                iid  = getattr(inv, "rule_id", "") or ""
+                desc = (getattr(inv, "description", "") or "")[:200]
+                cat  = getattr(inv, "category", "") or ""
             if not desc:
                 continue
             cid = f"inv:{iid or desc[:40]}"
             if cid in seen:
                 continue
             seen.add(cid)
-            content = f"Business invariant {iid}: {desc}"
+            content = f"Business rule {iid} [{cat}]: {desc}"
             yield (cid, "invariant", iid or "rule", "", content)
 
     # ── SQLite helpers ──────────────────────────────────────────────────────────
