@@ -178,7 +178,13 @@ def run(ctx: PipelineContext) -> None:
     # Grounding list injected into the prompt: exec_paths first (most
     # informative for business logic), then html_pages, then controllers.
     # Capped to keep the prompt token budget manageable.
-    known_pages: list[str] = _build_grounding_pages(cm, cap=300)
+    # STAGE4_PAGES_CAP / STAGE4_TABLES_CAP: reduce for large codebases to avoid
+    # filling the context window with grounding lists before the LLM can output.
+    # SuiteCRM has 300+ pages — injecting all of them leaves almost no output budget.
+    # Recommended: 100-150 for 32K context, 200+ for 64K+ context.
+    _pages_cap  = int(os.environ.get("STAGE4_PAGES_CAP",  "150") or "150")
+    _tables_cap = int(os.environ.get("STAGE4_TABLES_CAP", "40")  or "40")
+    known_pages: list[str] = _build_grounding_pages(cm, cap=_pages_cap)
 
     # ── Self-consistency voting ───────────────────────────────────────────────
     # STAGE4_CONSISTENCY_RUNS=N runs Calls A and B N times independently and
@@ -575,7 +581,8 @@ def _format_schema_grounding(
     lines: list[str] = [
         "MANDATORY GROUNDING — DATABASE SCHEMA (actual tables and columns):"
     ]
-    for table in known_tables[:60]:          # cap to 60 tables
+    _tables_cap_grnd = int(os.environ.get("STAGE4_TABLES_CAP", "40") or "40")
+    for table in known_tables[:_tables_cap_grnd]:
         cols = col_index.get(table.lower(), [])
         if cols:
             col_parts: list[str] = []
