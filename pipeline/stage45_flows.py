@@ -2294,7 +2294,7 @@ def _enrich_with_llm(
 
         # Split into sub-batches if needed
         enrichments: list[dict] = []
-        system = _build_llm_system_prompt(domain)
+        system = _build_llm_system_prompt(domain, ctx=ctx)
         for batch_start in range(0, len(group_skeletons), MAX_LLM_BATCH):
             batch = group_skeletons[batch_start:batch_start + MAX_LLM_BATCH]
             batch_label = f"stage45_{context_name[:15]}_{batch_start//MAX_LLM_BATCH+1}"
@@ -2387,9 +2387,22 @@ def _enrich_with_llm(
     return flows
 
 
-def _build_llm_system_prompt(domain) -> str:
-    return f"""You are a senior Business Analyst extracting business flows from PHP codebase evidence.
-You will receive skeletons of user journeys (sequences of PHP pages with actions).
+def _build_llm_system_prompt(domain, ctx=None) -> str:
+    # Language-aware description
+    lang_desc = "codebase"
+    if ctx and ctx.code_map:
+        from context import Language  # noqa: PLC0415
+        _desc_map = {
+            Language.PHP:        "PHP codebase",
+            Language.TYPESCRIPT: "TypeScript/JavaScript codebase",
+            Language.JAVASCRIPT: "JavaScript codebase",
+            Language.JAVA:       "Java codebase",
+            Language.KOTLIN:     "Kotlin codebase",
+        }
+        lang_desc = _desc_map.get(ctx.code_map.language, "codebase")
+
+    return f"""You are a senior Business Analyst extracting business flows from {lang_desc} evidence.
+You will receive skeletons of user journeys (sequences of routes/handlers with actions).
 Your job is to assign each skeleton a meaningful business name, actor, trigger, termination,
 and any alternate/error branches evident from the redirect targets shown.
 
@@ -2399,7 +2412,7 @@ Bounded contexts: {", ".join(domain.bounded_contexts) or "General"}
 
 Rules:
 - Output ONLY valid JSON — no markdown fences, no explanation
-- Use business language, not technical PHP file names
+- Use business language, not technical file or class names
 - name: short verb-noun phrase e.g. "Customer Login", "Booking Submission"
 - actor: the user role performing the flow
 - trigger: one sentence — what causes the flow to begin

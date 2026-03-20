@@ -1,12 +1,14 @@
 """
-run_pipeline.py — PHP-BA Agent Pipeline Entry Point
+run_pipeline.py — BA Agent Pipeline Entry Point  (multi-language)
 
 Stages (in execution order):
     Stage 0    validate       — input validation
-    Stage 1    parse          — PHP parsing (tree-sitter)
+    Stage 0.5  detect         — language + framework auto-detection (NEW)
+    Stage 1    parse          — code parsing (PHP / TypeScript / Java dispatcher)
     Stage 1.3  entrypoints    — system entry-point catalog (cron/CLI/webhook/queue, static)
     Stage 1.5  paths          — execution-path / branch extraction
     Stage 2    graph          — knowledge graph (NetworkX)
+    Stage 2.2  components     — frontend component graph (Vue/React, skipped for PHP/Java)
     Stage 2.5  behavior       — behavior graph extraction (Route→Ctrl→Service→SQL→Redirect)
     Stage 2.7  semanticroles — semantic role tagging (action type + external systems)
     Stage 3    embed          — vector index (ChromaDB)
@@ -59,7 +61,9 @@ from context import PipelineContext, StageStatus
 
 # Stage imports (each is a self-contained module)
 from pipeline.stage00_validate     import run as stage0
+from pipeline.stage05_detect       import run as stage05
 from pipeline.stage10_parse        import run as stage1
+from pipeline.stage22_components   import run as stage22
 from pipeline.stage13_entrypoints  import run as stage13
 from pipeline.stage15_paths        import run as stage15
 from pipeline.stage20_graph        import run as stage2
@@ -94,10 +98,12 @@ from pipeline.stage90_knowledge_graph import run as stage9
 # Stage registry — defines execution order
 STAGES: list[tuple[str, any]] = [
     ("stage00_validate",     stage0),
+    ("stage05_detect",       stage05),   # language + framework auto-detection
     ("stage10_parse",        stage1),
     ("stage13_entrypoints",  stage13),  # entry-point catalog: cron/cli/webhook/queue (feeds stage15 + stage45 + stage5)
     ("stage15_paths",        stage15),  # execution-path extraction (feeds stage45 + stage5)
     ("stage20_graph",        stage2),
+    ("stage22_components",   stage22),   # frontend component graph (skipped for PHP/Java)
     ("stage25_behavior",     stage25),  # behavior graph extraction (feeds stage45 + stage6)
     ("stage27_semanticroles", stage27), # semantic role tagging (feeds stage28 + stage45 + stage9)
     ("stage28_clusters",     stage28),  # action clustering (feeds stage4 + stage45 bounded contexts)
@@ -139,7 +145,9 @@ class PipelineBlocker(Exception):
 
 async def run_pipeline(ctx: PipelineContext, until: Optional[str] = None, force: Optional[str] = None) -> None:
     print("\n" + "=" * 60)
-    print("  PHP-BA Agent Pipeline")
+    lang = getattr(getattr(ctx, "code_map", None), "language", None)
+    lang_label = lang.value.upper() if lang and lang.value != "unknown" else "Auto-Detect"
+    print(f"  BA Agent Pipeline  [{lang_label}]")
     print("=" * 60)
 
     stage5_triggered = False
