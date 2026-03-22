@@ -84,24 +84,24 @@ RETRIEVAL_QUERIES = [
     ("navigation flow redirect pages include session check",          "nav"),
     ("core functions business logic processing validation",           "logic"),
 ]
-TOP_K_PER_QUERY  = 5
-MAX_TOTAL_CHUNKS = 15     # hard cap on chunks sent to the LLM
-MAX_CONTEXT_CHARS = 5000  # soft cap on total context character length
+TOP_K_PER_QUERY   = 5
+MAX_TOTAL_CHUNKS  = 25    # hard cap on chunks sent to the LLM
+MAX_CONTEXT_CHARS = 20_000  # soft cap on total context character length
 
 # ── Per-section caps inside _build_user_prompt ────────────────────────────────
 # Large codebases (SuiteCRM, etc.) produce thousands of entries per section.
 # These caps keep the prompt within a manageable token budget while still
 # giving the LLM enough signal to identify patterns.
 # Override any cap with env vars (set to 0 to disable a section entirely).
-_CAP_EXEC_PATHS    = int(os.environ.get("STAGE4_CAP_EXEC_PATHS",    "40")  or "40")
-_CAP_HTTP_EPS      = int(os.environ.get("STAGE4_CAP_HTTP_EPS",      "80")  or "80")
-_CAP_TABLE_COLS    = int(os.environ.get("STAGE4_CAP_TABLE_COLS",     "60")  or "60")
-_CAP_DB_TABLES     = int(os.environ.get("STAGE4_CAP_DB_TABLES",      "60")  or "60")
-_CAP_FUNCTIONS     = int(os.environ.get("STAGE4_CAP_FUNCTIONS",      "80")  or "80")
-_CAP_CALL_GRAPH    = int(os.environ.get("STAGE4_CAP_CALL_GRAPH",     "40")  or "40")  # files
-_CAP_FORM_FILES    = int(os.environ.get("STAGE4_CAP_FORM_FILES",     "60")  or "60")
-_CAP_REDIRECTS     = int(os.environ.get("STAGE4_CAP_REDIRECTS",      "60")  or "60")
-_CAP_AUTH_SIGNALS  = int(os.environ.get("STAGE4_CAP_AUTH_SIGNALS",   "40")  or "40")
+_CAP_EXEC_PATHS    = int(os.environ.get("STAGE4_CAP_EXEC_PATHS",    "10")  or "10")   # very verbose — RAG-sorted
+_CAP_HTTP_EPS      = int(os.environ.get("STAGE4_CAP_HTTP_EPS",      "40")  or "40")
+_CAP_TABLE_COLS    = int(os.environ.get("STAGE4_CAP_TABLE_COLS",     "15")  or "15")   # verbose — columns per table
+_CAP_DB_TABLES     = int(os.environ.get("STAGE4_CAP_DB_TABLES",      "40")  or "40")
+_CAP_FUNCTIONS     = int(os.environ.get("STAGE4_CAP_FUNCTIONS",      "40")  or "40")
+_CAP_CALL_GRAPH    = int(os.environ.get("STAGE4_CAP_CALL_GRAPH",     "20")  or "20")   # files — RAG-sorted
+_CAP_FORM_FILES    = int(os.environ.get("STAGE4_CAP_FORM_FILES",     "20")  or "20")   # RAG-sorted
+_CAP_REDIRECTS     = int(os.environ.get("STAGE4_CAP_REDIRECTS",      "30")  or "30")
+_CAP_AUTH_SIGNALS  = int(os.environ.get("STAGE4_CAP_AUTH_SIGNALS",   "20")  or "20")
 
 # ── Context-window budget ─────────────────────────────────────────────────────
 # LLM_MAX_INPUT_TOKENS: maximum input tokens to send in a single LLM call.
@@ -922,12 +922,34 @@ Output ONLY this JSON (no other fields):
 Now produce the JSON for new features covering the uncovered modules/pages:"""
 
 
+def _rag_relevant_stems(chunks: list[dict]) -> set[str]:
+    """
+    Return the set of lowercase file stem names that appear in the top RAG chunks.
+    Used to RAG-sort static sections so the most relevant files survive the cap.
+    """
+    stems: set[str] = set()
+    for chunk in chunks:
+        src = chunk.get("metadata", {}).get("source_file", "")
+        if src:
+            stems.add(Path(src).stem.lower())
+    return stems
+
+
+def _rag_sort(items: list, key_fn, relevant_stems: set[str]) -> list:
+    """
+    Stable-sort *items* so entries whose key_fn(item) stem appears in
+    relevant_stems come first.  Order within each group is preserved.
+    """
+    return sorted(items, key=lambda x: (0 if Path(key_fn(x)).stem.lower() in relevant_stems else 1))
+
+
 def _build_user_prompt(ctx: PipelineContext, chunks: list[dict]) -> str:
     """
     Assemble the user prompt from retrieved chunks, CodeMap metadata,
     and graph summary.
     """
     parts: list[str] = []
+    _rel_stems = _rag_relevant_stems(chunks)   # files surfaced by RAG — prioritised in caps
 
     # ── System metadata header ────────────────────────────────────────────────
     cm = ctx.code_map
@@ -979,9 +1001,9 @@ def _build_user_prompt(ctx: PipelineContext, chunks: list[dict]) -> str:
         sg_by_file: dict[str, list] = defaultdict(list)
         for sg in cm.superglobals:
             sg_by_file[sg["file"]].append(sg)
-        _form_files = sorted(sg_by_file.items())
+        _form_files = _rag_sort(list(sg_by_file.items()), lambda x: x[0], _rel_stems)
         if _CAP_FORM_FILES > 0 and len(_form_files) > _CAP_FORM_FILES:
-            parts.append(f"  (showing {_CAP_FORM_FILES}/{len(_form_files)} files)")
+            parts.append(f"  (showing {_CAP_FORM_FILES}/{len(_form_files)} files — RAG-prioritised)")
             _form_files = _form_files[:_CAP_FORM_FILES]
         for filepath, sgs in _form_files:
             filename  = Path(filepath).name
@@ -996,7 +1018,7 @@ def _build_user_prompt(ctx: PipelineContext, chunks: list[dict]) -> str:
 
     # ── Redirect / navigation summary ────────────────────────────────────────
     if cm.redirects:
-        _redirects = cm.redirects
+        _redirects = _rag_sort(list(cm.redirects), lambda r: r.get("file", ""), _rel_stems)
         _omit_r = 0
         if _CAP_REDIRECTS > 0 and len(_redirects) > _CAP_REDIRECTS:
             _omit_r = len(_redirects) - _CAP_REDIRECTS
@@ -1044,7 +1066,7 @@ def _build_user_prompt(ctx: PipelineContext, chunks: list[dict]) -> str:
             by_file[edge.get("file","?")].append(
                 f"{edge.get('caller','?')} → {edge.get('callee','?')}"
             )
-        _cg_files = sorted(by_file.items())
+        _cg_files = _rag_sort(list(by_file.items()), lambda x: x[0], _rel_stems)
         _omit_cg = 0
         if _CAP_CALL_GRAPH > 0 and len(_cg_files) > _CAP_CALL_GRAPH:
             _omit_cg = len(_cg_files) - _CAP_CALL_GRAPH
@@ -1211,7 +1233,7 @@ def _build_user_prompt(ctx: PipelineContext, chunks: list[dict]) -> str:
     # ── Execution paths (stage15) ────────────────────────────────────────────
     exec_paths = getattr(cm, "execution_paths", None) or []
     if exec_paths:
-        _exps = exec_paths
+        _exps = _rag_sort(list(exec_paths), lambda ep: ep.get("file", ""), _rel_stems)
         _omit_exp = 0
         if _CAP_EXEC_PATHS > 0 and len(_exps) > _CAP_EXEC_PATHS:
             _omit_exp = len(_exps) - _CAP_EXEC_PATHS
