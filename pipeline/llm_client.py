@@ -358,6 +358,18 @@ def call_llm(
         except _NonRetryableError:
             raise   # bad key, safety block, empty response — don't retry
 
+        except _ContextLengthError as exc:
+            # Prompt too long — reduce max_tokens to what fits and retry once.
+            # Do NOT count this against MAX_RETRIES; it's a parameter fix, not a
+            # transient failure.
+            reduced = exc.available_tokens
+            print(
+                f"  {tag}Context overflow — reducing max_tokens "
+                f"{max_tokens} → {reduced} and retrying ..."
+            )
+            max_tokens = reduced
+            continue   # retry immediately with the new budget
+
         except Exception as exc:
             last_exc = exc
             if attempt == MAX_RETRIES:
@@ -435,6 +447,17 @@ class _NonRetryableError(RuntimeError):
     Wraps errors where retrying is pointless (bad API key, safety block, etc.).
     Raised inside provider functions; caught in call_llm and re-raised as-is.
     """
+
+class _ContextLengthError(Exception):
+    """
+    Raised when the server returns HTTP 400 because prompt + max_tokens
+    exceeds the model's context window.
+
+    Carries available_tokens so call_llm can retry with a reduced budget.
+    """
+    def __init__(self, message: str, available_tokens: int) -> None:
+        super().__init__(message)
+        self.available_tokens = available_tokens
     pass
 
 
@@ -806,10 +829,26 @@ def _handle_local_http_error(
             f"Response body: {body[:200]}"
         )
     if code == 400:
+        # Check for context-length overflow — auto-retry with a smaller budget
+        import re as _re
+        # Matches: "maximum context length is 16384 tokens ... 12385 input tokens"
+        _ctx_m = _re.search(
+            r"maximum context length is (\d+).*?(\d+)\s+input tokens",
+            body, _re.DOTALL | _re.IGNORECASE,
+        )
+        if _ctx_m:
+            ctx_max      = int(_ctx_m.group(1))
+            prompt_toks  = int(_ctx_m.group(2))
+            available    = max(256, ctx_max - prompt_toks - 64)   # 64-token safety margin
+            raise _ContextLengthError(
+                f"Context overflow: model max={ctx_max}, prompt={prompt_toks}, "
+                f"available for output={available} tokens.",
+                available_tokens=available,
+            )
         raise _NonRetryableError(
             f"Local LLM rejected the request (HTTP 400).\n"
             f"This may mean the model doesn't support the parameters sent.\n"
-            f"Response body: {body[:200]}"
+            f"Response body: {body[:300]}"
         )
     if code == 401:
         raise _NonRetryableError(
