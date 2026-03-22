@@ -294,13 +294,12 @@ Markdown table: Role | Description | Key Interests"""
             f"{ev_str}"
         )
 
-    req_header_written = False
+    _brd_req_args: list[tuple] = []
     for batch_start, batch in _feature_batches(domain.features, _SECTION_BATCH):
         br_from = batch_start + 1
         br_to   = batch_start + len(batch)
         scaffold = "\n\n".join(_br_entry(i, f) for i, f in enumerate(batch, br_from))
-        section_hdr = "## 5. Business Requirements\n\n" if not req_header_written else ""
-        req_header_written = True
+        section_hdr = "## 5. Business Requirements\n\n" if batch_start == 0 else ""
 
         req_user = f"""Write ONLY Business Requirements BR-{br_from:02d} through BR-{br_to:02d}.
 Do NOT write any other section. Do NOT repeat the document title or previous BRs.
@@ -309,9 +308,10 @@ Do NOT write any other section. Do NOT repeat the document title or previous BRs
 For trivial features write Priority: Low and a brief 1-line criterion.
 
 {scaffold}"""
-        parts.append(_call_section(system, req_user,
-                                   f"stage50_brd_req_{batch_start // _SECTION_BATCH + 1}",
-                                   0.4, _SECTION_TOKENS))
+        _brd_req_args.append((system, req_user,
+                               f"stage50_brd_req_{batch_start // _SECTION_BATCH + 1}",
+                               0.4, _SECTION_TOKENS))
+    parts.extend(_parallel_call_sections(_brd_req_args))
 
     # ── Section C: tail (6–9) ─────────────────────────────────────────────────
     entities_str = ", ".join(_to_str_list(domain.key_entities)) or "none"
@@ -433,13 +433,12 @@ For each user role: name, technical level, frequency of use, key tasks.
             f"{ev_str}"
         )
 
-    fr_header_written = False
+    _srs_fr_args: list[tuple] = []
     for batch_start, batch in _feature_batches(domain.features, _SECTION_BATCH):
         fr_from = batch_start + 1
         fr_to   = batch_start + len(batch)
         scaffold = "\n\n".join(_fr_entry(i, f) for i, f in enumerate(batch, fr_from))
-        section_hdr = "## 3. Functional Requirements\n\n" if not fr_header_written else ""
-        fr_header_written = True
+        section_hdr = "## 3. Functional Requirements\n\n" if batch_start == 0 else ""
 
         fr_user = f"""Write ONLY functional requirements 3.{fr_from} through 3.{fr_to}.
 Do NOT write any other section. Do NOT repeat the document title or previous FRs.
@@ -448,9 +447,10 @@ For trivial features write: Input=none, Processing=minimal, Output=redirect or d
 {section_hdr}Fill in all bracketed placeholders using the Evidence blocks provided.
 
 {scaffold}"""
-        parts.append(_call_section(system, fr_user,
-                                   f"stage50_srs_fr_{batch_start // _SECTION_BATCH + 1}",
-                                   0.4, _SECTION_TOKENS))
+        _srs_fr_args.append((system, fr_user,
+                              f"stage50_srs_fr_{batch_start // _SECTION_BATCH + 1}",
+                              0.4, _SECTION_TOKENS))
+    parts.extend(_parallel_call_sections(_srs_fr_args))
 
     # ── Section C: tail (4–6) ─────────────────────────────────────────────────
     tail_user = f"""Write ONLY sections 4, 5, and 6 of the SRS. Do NOT repeat earlier sections.
@@ -547,6 +547,7 @@ Brief description of how acceptance testing should be approached for this system
             f"- Then: [expected error/rejection]"
         )
 
+    _ac_batch_args: list[tuple] = []
     for batch_start, batch in _feature_batches(domain.features, _SECTION_BATCH):
         ac_from = batch_start + 1
         ac_to   = batch_start + len(batch)
@@ -559,9 +560,10 @@ Do NOT write any other section or repeat previous ACs.
 ---
 
 {scaffold}"""
-        parts.append(_call_section(system, ac_user,
-                                   f"stage50_ac_batch_{batch_start // _SECTION_BATCH + 1}",
-                                   0.35, _SECTION_TOKENS))
+        _ac_batch_args.append((system, ac_user,
+                                f"stage50_ac_batch_{batch_start // _SECTION_BATCH + 1}",
+                                0.35, _SECTION_TOKENS))
+    parts.extend(_parallel_call_sections(_ac_batch_args))
 
     # ── Section C: test data requirements ────────────────────────────────────
     tail_user = f"""Write ONLY the Test Data Requirements section. Do NOT repeat any AC sections.
@@ -661,6 +663,7 @@ Output EXACTLY:
             f"**Notes:** {desc}"
         )
 
+    _us_epic_args: list[tuple] = []
     for batch_start, batch in _feature_batches(domain.features, _SECTION_BATCH):
         scaffold = "\n\n---\n\n".join(_epic_block(f) for f in batch)
         epic_names = ", ".join(f["name"] for f in batch)
@@ -672,9 +675,10 @@ Do NOT write any other section or repeat previous epics.
 ---
 
 {scaffold}"""
-        parts.append(_call_section(system, epic_user,
-                                   f"stage50_us_epics_{batch_start // _SECTION_BATCH + 1}",
-                                   0.5, _SECTION_TOKENS))
+        _us_epic_args.append((system, epic_user,
+                               f"stage50_us_epics_{batch_start // _SECTION_BATCH + 1}",
+                               0.5, _SECTION_TOKENS))
+    parts.extend(_parallel_call_sections(_us_epic_args))
 
     # ── Section C: summary table + totals ─────────────────────────────────────
     # Collect US IDs for the table hint
@@ -721,6 +725,30 @@ def _call_section(
     from pipeline.llm_client import call_llm
     return call_llm(system, user, max_tokens=max_tokens,
                     temperature=temperature, label=label)
+
+
+def _parallel_call_sections(section_args: list[tuple]) -> list[str]:
+    """
+    Run multiple _call_section calls concurrently when vLLM backend is active.
+
+    Parameters
+    ----------
+    section_args : list of (system, user, label, temperature, max_tokens) tuples
+
+    Returns
+    -------
+    Ordered list of LLM responses matching the input order.
+    """
+    from concurrent.futures import ThreadPoolExecutor as _TPE
+    from pipeline.llm_client import get_max_workers as _max_w
+
+    _workers = _max_w()
+    if _workers > 1 and len(section_args) > 1:
+        with _TPE(max_workers=min(len(section_args), _workers)) as _pool:
+            _futures = [_pool.submit(_call_section, *args) for args in section_args]
+            return [f.result() for f in _futures]
+    else:
+        return [_call_section(*args) for args in section_args]
 
 
 def _feature_batches(features: list, batch_size: int):

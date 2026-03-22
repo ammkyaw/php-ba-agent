@@ -405,10 +405,25 @@ def _pass1_from_invariants(ctx: PipelineContext) -> list[dict]:
     # Build lookup from rule_id → original rule
     rule_by_id = {r.rule_id: r for r in eligible}
 
-    results: list[dict] = []
-    for batch_num, batch in enumerate(batches, 1):
+    from concurrent.futures import ThreadPoolExecutor as _TPE
+    from pipeline.llm_client import get_max_workers as _max_w
+    _workers = _max_w()
+
+    def _run_batch(args: tuple) -> tuple[int, list, list[dict]]:
+        batch_num, batch = args
         print(f"  [stage46]   batch {batch_num}/{len(batches)} ({len(batch)} rules) → LLM …")
-        llm_out = _llm_formalize_batch(batch, batch_num)
+        return batch_num, batch, _llm_formalize_batch(batch, batch_num)
+
+    results: list[dict] = []
+    if _workers > 1 and len(batches) > 1:
+        print(f"  [stage46] Running {len(batches)} rule batches in parallel (workers={_workers}) ...")
+        with _TPE(max_workers=min(len(batches), _workers)) as _pool:
+            _futures = [_pool.submit(_run_batch, (i + 1, b)) for i, b in enumerate(batches)]
+            _batch_results = sorted([f.result() for f in _futures], key=lambda x: x[0])
+    else:
+        _batch_results = [_run_batch((i + 1, b)) for i, b in enumerate(batches)]
+
+    for _batch_num, batch, llm_out in _batch_results:
 
         # Build id → llm result map — guard against non-dict elements
         # (_extract_json_array now enforces this, but keep the check as safety net)

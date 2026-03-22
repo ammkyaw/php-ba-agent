@@ -2270,8 +2270,10 @@ def _enrich_with_llm(
             skeletons to produce final BusinessFlow objects.
 
     One API call per bounded context keeps token usage bounded.
+    Context groups are processed concurrently when vLLM backend is active.
     """
-    from pipeline.llm_client import call_llm
+    from concurrent.futures import ThreadPoolExecutor as _TPE
+    from pipeline.llm_client import call_llm, get_max_workers as _max_w
 
     flows: list[BusinessFlow] = []
     flow_counter = 1
@@ -2289,12 +2291,13 @@ def _enrich_with_llm(
         if _raw_ens else [None]
     )
 
-    for context_name, indices in context_groups.items():
-        group_skeletons = [skeletons[i] for i in indices]
+    _system = _build_llm_system_prompt(domain, ctx=ctx)
+    _workers = _max_w()
 
-        # Split into sub-batches if needed
+    def _enrich_context_group(args: tuple) -> tuple[str, list[dict], list[dict]]:
+        """Run all LLM sub-batches for one context group; return enrichments."""
+        context_name, group_skeletons = args
         enrichments: list[dict] = []
-        system = _build_llm_system_prompt(domain, ctx=ctx)
         for batch_start in range(0, len(group_skeletons), MAX_LLM_BATCH):
             batch = group_skeletons[batch_start:batch_start + MAX_LLM_BATCH]
             batch_label = f"stage45_{context_name[:15]}_{batch_start//MAX_LLM_BATCH+1}"
@@ -2304,7 +2307,7 @@ def _enrich_with_llm(
             for _mdl in _ens_models:
                 _lbl = batch_label + (f"_{_ens_models.index(_mdl)+1}" if len(_ens_models) > 1 else "")
                 try:
-                    raw = call_llm(system, user, max_tokens=MAX_TOKENS,
+                    raw = call_llm(_system, user, max_tokens=MAX_TOKENS,
                                    temperature=0.1,   # flow analysis: structural JSON
                                    label=_lbl,
                                    json_schema=_FLOW_JSON_SCHEMA,
@@ -2324,6 +2327,24 @@ def _enrich_with_llm(
                     best = max(candidates, key=lambda e: sum(1 for v in e.values() if v))
                     batch_enr.append(best)
             enrichments.extend(batch_enr)
+        return context_name, group_skeletons, enrichments
+
+    # Build ordered task list (preserve context_groups insertion order)
+    _cg_tasks = [
+        (context_name, [skeletons[i] for i in indices])
+        for context_name, indices in context_groups.items()
+    ]
+
+    if _workers > 1 and len(_cg_tasks) > 1:
+        print(f"  [stage45] Running {len(_cg_tasks)} context groups in parallel (workers={_workers}) ...")
+        with _TPE(max_workers=min(len(_cg_tasks), _workers)) as _pool:
+            _futures = [_pool.submit(_enrich_context_group, t) for t in _cg_tasks]
+            # Preserve original order (dict insertion order)
+            _cg_results = [f.result() for f in _futures]
+    else:
+        _cg_results = [_enrich_context_group(t) for t in _cg_tasks]
+
+    for context_name, group_skeletons, enrichments in _cg_results:
 
         # Merge enrichments onto skeletons
         for sk, enr in zip(group_skeletons, enrichments):

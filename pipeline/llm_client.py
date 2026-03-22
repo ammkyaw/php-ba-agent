@@ -168,6 +168,35 @@ RETRY_MAX_DELAY    = 60.0       # cap so we never wait more than 1 minute
 
 # ─── Public API ────────────────────────────────────────────────────────────────
 
+def get_max_workers() -> int:
+    """
+    Recommended ThreadPoolExecutor size for concurrent LLM calls.
+
+    vLLM uses continuous batching — multiple requests are processed in
+    parallel on the GPU, so higher concurrency = higher throughput.
+    Ollama queues one request at a time, so concurrency > 1 gives no GPU
+    speedup but does eliminate Python hand-off overhead between calls.
+
+    Defaults:
+        vllm     → 4   (tune up if GPU has headroom)
+        ollama   → 1   (no GPU parallelism; sequential is fine)
+        lmstudio → 1
+        llamacpp → 1
+        cloud    → 1   (Claude / Gemini — rate-limited by the API)
+
+    Override any default with:
+        export LLM_MAX_WORKERS=8
+    """
+    explicit = os.environ.get("LLM_MAX_WORKERS", "").strip()
+    if explicit:
+        return max(1, int(explicit))
+    backend  = os.environ.get("LOCAL_LLM_BACKEND", "").strip().lower()
+    provider = get_provider()
+    if provider == "local" and backend == "vllm":
+        return 4
+    return 1
+
+
 def get_provider() -> str:
     """
     Determine which LLM provider to use.

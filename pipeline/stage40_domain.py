@@ -230,55 +230,77 @@ def run(ctx: PipelineContext) -> None:
     if len(_ensemble_models) > 1:
         print(f"  [stage4] Ensemble mode: {len(_ensemble_models)} models")
 
-    # ── Call A: meta + entities + contexts (fast, ~4K tokens) ────────────────
-    _total_a = _consistency_runs * len(_ensemble_models)
-    print(f"  [stage4] Call 1/3 — domain name, entities, contexts "
-          f"(x{_total_a} runs) ...")
-    _a_results: list[dict] = []
-    for _mdl in _ensemble_models:
-        for _run in range(_consistency_runs):
-            _suffix = f"{_ensemble_models.index(_mdl)+1}.{_run+1}" if len(_ensemble_models) > 1 else str(_run+1)
-            _lbl = f"stage4-A{_suffix}" if _total_a > 1 else "stage4-A"
-            _a_results.append(_parse_partial(
-                _call_part(_system_meta(quality_score), user_prompt, MAX_TOKENS_META, _lbl,
-                           model_override=_mdl),
-                f"A{_suffix}", debug_dir,
-            ))
-    data_a = _merge_consistency_a(_a_results)
+    # ── Calls A + B + C: submit concurrently when LLM_MAX_WORKERS > 1 ─────────
+    # A (entities/contexts), B (features), C (roles/workflows) are fully
+    # independent — they share the same user_prompt but have different system
+    # prompts and write different JSON fields.  Running them in parallel with
+    # vLLM's continuous batching cuts the stage40 wall-clock time by ~60%.
+    from concurrent.futures import ThreadPoolExecutor as _TPE
+    from pipeline.llm_client import get_max_workers as _max_w
+    _workers = _max_w()
 
-    # ── Call B: features (largest field, ~8K tokens) ──────────────────────────
-    _total_b = _consistency_runs * len(_ensemble_models)
-    print(f"  [stage4] Call 2/3 — features "
-          f"(x{_total_b} runs) ...")
-    _b_results: list[dict] = []
     _sys_b = _system_features(quality_score,
                                known_tables=known_tables,
                                known_pages=known_pages,
                                known_fields=known_fields,
                                table_columns=getattr(cm, "table_columns", None) or [])
     _user_prompt_b = (user_prompt + "\n\n" + _rag_ctx_b) if _rag_ctx_b else user_prompt
-    for _mdl in _ensemble_models:
-        for _run in range(_consistency_runs):
-            _suffix = f"{_ensemble_models.index(_mdl)+1}.{_run+1}" if len(_ensemble_models) > 1 else str(_run+1)
-            _lbl = f"stage4-B{_suffix}" if _total_b > 1 else "stage4-B"
-            _b_results.append(_parse_partial(
-                _call_part(_sys_b, _user_prompt_b, MAX_TOKENS_FEATURES, _lbl,
-                           model_override=_mdl),
-                f"B{_suffix}", debug_dir,
-            ))
-    data_b = _merge_consistency_b(_b_results)
 
-    # Filter hallucinated page/table names.
-    # Use known_files_all (not just known_pages) so that controller / service
-    # file references are preserved — only truly invented filenames are dropped.
+    # Build flat task list: (call_type, suffix, model_override, system, user, max_tok)
+    def _make_suffix(mdl_idx: int, run: int, total: int, letter: str) -> str:
+        if total == 1:
+            return letter
+        if len(_ensemble_models) > 1:
+            return f"{letter}{mdl_idx+1}.{run+1}"
+        return f"{letter}{run+1}"
+
+    _tasks: list[tuple] = []   # (letter, suffix, mdl, sys, usr, max_tok)
+    _total_a = _consistency_runs * len(_ensemble_models)
+    _total_b = _consistency_runs * len(_ensemble_models)
+    for _mi, _mdl in enumerate(_ensemble_models):
+        for _run in range(_consistency_runs):
+            _tasks.append(("A", _make_suffix(_mi, _run, _total_a, "A"), _mdl,
+                           _system_meta(quality_score), user_prompt, MAX_TOKENS_META))
+            _tasks.append(("B", _make_suffix(_mi, _run, _total_b, "B"), _mdl,
+                           _sys_b, _user_prompt_b, MAX_TOKENS_FEATURES))
+    _tasks.append(("C", "C", None,
+                   _system_roles_workflows(quality_score), user_prompt, MAX_TOKENS_ROLES_WF))
+
+    _total_tasks = len(_tasks)
+    print(f"  [stage4] Calls A+B+C — {_total_tasks} tasks "
+          f"({'parallel' if _workers > 1 else 'sequential'}, workers={_workers}) ...")
+
+    def _run_task(t: tuple) -> tuple[str, str, str]:
+        """Returns (letter, suffix, raw_response)."""
+        letter, suffix, mdl, sys_p, usr_p, max_tok = t
+        raw = _call_part(sys_p, usr_p, max_tok, f"stage4-{suffix}",
+                         model_override=mdl)
+        return letter, suffix, raw
+
+    if _workers > 1:
+        with _TPE(max_workers=min(_total_tasks, _workers)) as _pool:
+            _futures = [_pool.submit(_run_task, t) for t in _tasks]
+            _task_results = [f.result() for f in _futures]
+    else:
+        _task_results = [_run_task(t) for t in _tasks]
+
+    # Collect and parse results by call type
+    _a_results: list[dict] = []
+    _b_results: list[dict] = []
+    raw_c: str = ""
+    for _letter, _suffix, _raw in _task_results:
+        if _letter == "A":
+            _a_results.append(_parse_partial(_raw, _suffix, debug_dir))
+        elif _letter == "B":
+            _b_results.append(_parse_partial(_raw, _suffix, debug_dir))
+        else:
+            raw_c = _raw
+
+    data_a = _merge_consistency_a(_a_results)
+    data_b = _merge_consistency_b(_b_results)
     data_b = _filter_hallucinated_refs(data_b,
                                        known_pages_lower=known_files_all,
                                        known_tables_lower={t.lower() for t in known_tables})
-
-    # ── Call C: user roles + workflows (~8K tokens) ───────────────────────────
-    print(f"  [stage4] Call 3/3 — user roles, workflows ...")
-    raw_c = _call_part(_system_roles_workflows(quality_score), user_prompt,
-                       MAX_TOKENS_ROLES_WF, "stage4-C")
     data_c = _parse_partial(raw_c, "C", debug_dir)
 
     # ── Merge all three dicts (A wins on overlaps, B/C fill in their fields) ──
