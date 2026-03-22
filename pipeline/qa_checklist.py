@@ -61,6 +61,7 @@ def build_checklist(
     flow_coverage_data: dict | None,
     pass_d_issues:      list[dict],
     ev_idx:             dict[str, dict] | None,
+    dc_data:            dict | None = None,
 ) -> list[dict]:
     """
     Build and return the automated QA checklist.
@@ -70,6 +71,8 @@ def build_checklist(
     flow_coverage_data : dict loaded from flow_coverage.json (may be None).
     pass_d_issues      : list of issue dicts from consistency_check.run_checks().
     ev_idx             : evidence index from evidence_index.build_evidence_index().
+    dc_data            : dict from Stage 5.9 doc_coverage.json dimensions
+                         (keyed by dimension name; may be None).
 
     Returns
     -------
@@ -77,7 +80,9 @@ def build_checklist(
     """
     items: list[dict] = []
     items.extend(_completeness_items(flow_coverage_data or {}))
+    items.extend(_doc_coverage_items(dc_data or {}))          # Stage 5.9
     items.extend(_consistency_items(pass_d_issues))
+    items.extend(_cross_doc_items(pass_d_issues))             # Pass E
     items.extend(_evidence_items(ev_idx or {}))
     return items
 
@@ -173,6 +178,52 @@ def _cov_status(pct: float) -> tuple[str, str]:
     return "fail", "❌"
 
 
+# ─── Document Coverage (Stage 5.9) ────────────────────────────────────────────
+
+_DC_LABELS: dict[str, str] = {
+    "entities":   "Entity Coverage → SRS",
+    "flows":      "Flow Coverage → BRD",
+    "spec_rules": "Business Rule Coverage → SRS+BRD",
+    "states":     "State Machine Coverage → SRS",
+    "relations":  "Relationship Coverage → SRS",
+}
+
+
+def _doc_coverage_items(dc: dict) -> list[dict]:
+    """
+    Build checklist items from Stage 5.9 document coverage dimensions.
+
+    dc : {dimension_name: DimCoverage-as-dict} — may be empty when stage59
+         has not run, in which case no items are emitted.
+    """
+    items: list[dict] = []
+    for key, label in _DC_LABELS.items():
+        dim = dc.get(key)
+        if not isinstance(dim, dict):
+            continue
+        pct     = float(dim.get("pct", 0.0))
+        covered = int(dim.get("covered", 0))
+        total   = int(dim.get("total", 0))
+        status, icon = _cov_status(pct)
+        uncovered = dim.get("uncovered", [])
+        sample    = uncovered[:3]
+        suffix    = f" (+{len(uncovered) - 3} more)" if len(uncovered) > 3 else ""
+        detail = (
+            f"{covered}/{total} ({pct:.0%})"
+            + (f" — missing: {', '.join(sample)}{suffix}" if uncovered else " — fully covered")
+        )
+        items.append(_item(
+            category    = "Document Coverage",
+            check       = label,
+            status      = status,
+            icon        = icon,
+            score       = round(pct, 4),
+            issue_count = None,
+            detail      = detail,
+        ))
+    return items
+
+
 # ─── Consistency ───────────────────────────────────────────────────────────────
 
 def _consistency_items(pass_d_issues: list[dict]) -> list[dict]:
@@ -247,6 +298,84 @@ def _con_status(n: int) -> tuple[str, str]:
     if n <= _CON_WARN:
         return "warn", "⚠️"
     return "fail", "❌"
+
+
+# ─── Cross-Document Consistency (Pass E) ──────────────────────────────────────
+
+# Pass E issue category string (must match cross_doc_check.py)
+_CROSS_DOC_CATEGORY = "Cross-Document Consistency"
+
+# Thresholds for the roll-up checklist items
+_CROSS_PASS = 0    # 0 issues    → ✅
+_CROSS_WARN = 2    # 1-2 issues  → ⚠️
+                   # > 2 issues  → ❌
+
+_CROSS_CHECKS = {
+    # check_key: (label, artefact_hint)
+    "orphan_epics":    ("Orphan Epic Headings",          "UserStories"),
+    "orphan_ac":       ("Orphan AC Sections",            "AC"),
+    "undefined_actors":("Undefined Story Actors",        "UserStories"),
+    "srs_ac_gap":      ("SRS Feature → AC Test Coverage","SRS→AC"),
+}
+
+# Map artefact strings in issues to check keys
+_ARTEFACT_TO_KEY = {
+    "UserStories": ["orphan_epics", "undefined_actors"],
+    "AC":          ["orphan_ac"],
+    "SRS→AC":      ["srs_ac_gap"],
+}
+
+
+def _cross_doc_items(all_issues: list[dict]) -> list[dict]:
+    """
+    Produce one checklist item per Pass E check from the merged issue list.
+
+    Pass E issues are identified by category == "Cross-Document Consistency".
+    Each check gets its own row so the QA report clearly shows which
+    traceability relationship has problems.
+    """
+    # Filter to Pass E issues only
+    e_issues = [i for i in all_issues if i.get("category") == _CROSS_DOC_CATEGORY]
+
+    # Bucket by artefact
+    buckets: dict[str, list[dict]] = {k: [] for k in _CROSS_CHECKS}
+    for issue in e_issues:
+        art = issue.get("artefact", "")
+        for key in _ARTEFACT_TO_KEY.get(art, []):
+            buckets[key].append(issue)
+
+    items: list[dict] = []
+    for key, (label, artefact) in _CROSS_CHECKS.items():
+        n = len(buckets[key])
+        if n <= _CROSS_PASS:
+            status, icon = "pass", "✅"
+        elif n <= _CROSS_WARN:
+            status, icon = "warn", "⚠️"
+        else:
+            status, icon = "fail", "❌"
+
+        detail = (
+            f"No issues found"
+            if n == 0
+            else f"{n} issue(s) — "
+            + "; ".join(
+                i["description"][:80] + ("…" if len(i["description"]) > 80 else "")
+                for i in buckets[key][:2]
+            )
+            + (f" (+{n - 2} more)" if n > 2 else "")
+        )
+
+        items.append(_item(
+            category    = "Cross-Document Consistency",
+            check       = label,
+            status      = status,
+            icon        = icon,
+            score       = max(0.0, 1.0 - n * 0.25),   # indicative score
+            issue_count = n,
+            detail      = detail,
+        ))
+
+    return items
 
 
 # ─── Evidence ──────────────────────────────────────────────────────────────────

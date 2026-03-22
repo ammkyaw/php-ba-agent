@@ -19,16 +19,73 @@ Environment variables:
     GEMINI_API_KEY     required for gemini
     LLM_MODEL          override default model for any provider
 
-    Local LLM (Ollama / LM Studio / llama.cpp):
-    LOCAL_LLM_URL      base URL of the OpenAI-compatible server
-                       default: http://localhost:11434  (Ollama default)
+    Local LLM (Ollama / vLLM / LM Studio / llama.cpp):
+    LOCAL_LLM_BACKEND  Backend type — controls routing and payload format.
+                       "ollama"   (default) Ollama via /api/chat or /v1/chat/completions
+                       "vllm"               vLLM  via /v1/chat/completions only
+                       "lmstudio"           LM Studio via /v1/chat/completions
+                       "llamacpp"           llama.cpp server via /v1/chat/completions
+                         export LOCAL_LLM_BACKEND=vllm
+    LOCAL_LLM_URL      base URL of the server
+                       Ollama:    http://localhost:11434  (default)
+                       vLLM:      http://localhost:8000
                        LM Studio: http://localhost:1234
                        llama.cpp: http://localhost:8080
     LOCAL_LLM_MODEL    model name to request (required for local)
-                       Ollama:    "llama3.2", "mistral", "qwen2.5-coder:14b", ...
+                       Ollama:    "llama3.2", "qwen2.5-coder:14b", ...
+                       vLLM:      HuggingFace model ID used at server launch
                        LM Studio: exact model filename shown in the UI
-    LOCAL_LLM_API_KEY  optional bearer token (LM Studio supports this)
-                       Ollama does not require an API key
+    LOCAL_LLM_API_KEY  optional bearer token
+                       vLLM:      set via --api-key at server launch
+                       LM Studio: configured in the UI
+                       Ollama:    not required
+    LOCAL_LLM_NUM_CTX  Ollama-only: total context window size (input + output
+                       tokens).  When set, the request is routed to Ollama's
+                       native /api/chat endpoint which is the only path that
+                       accepts num_ctx at request time.  Ignored for vLLM
+                       (set --max-model-len at server launch instead).
+                       Recommended: 16384 or 32768 for large batches:
+                         export LOCAL_LLM_NUM_CTX=32768
+    LOCAL_LLM_NUM_PREDICT
+                       Ollama-only (native /api/chat path): maximum tokens the
+                       model may generate per response (num_predict).  Defaults
+                       to the per-call max_tokens value.  Set to -1 for
+                       unlimited output (recommended for thinking models and
+                       large flow/spec batches):
+                         export LOCAL_LLM_NUM_PREDICT=-1   # unlimited
+                         export LOCAL_LLM_NUM_PREDICT=32768
+                       vLLM equivalent: max_tokens is passed directly in the
+                       payload — set LOCAL_LLM_NUM_PREDICT=-1 has no effect;
+                       use a large LLM_MAX_TOKENS instead.
+    LOCAL_LLM_THINKING "1" | "true" to enable Ollama extended-thinking mode
+                       for models that support it (e.g. qwen3, deepseek-r1).
+                       Disabled by default; the pipeline uses explicit CoT
+                       system prompts instead.
+                         export LOCAL_LLM_THINKING=1
+    VLLM_GUIDED_JSON   "1" to use vLLM's guided_json field for constrained
+                       decoding instead of the OpenAI-style response_format.
+                       Use this with vLLM < 0.4.3 that predates structured-
+                       output support.  Default: 0 (use response_format).
+                         export VLLM_GUIDED_JSON=1
+
+    Response cache (pipeline/llm_cache.py):
+    LLM_CACHE_ENABLED  "1"|"true"|"yes" to enable the SQLite exact-match cache
+                       (default: disabled).  When enabled, identical calls
+                       (same model + prompts + temperature) return the cached
+                       response instantly — saves significant time and tokens
+                       when re-running the pipeline on the same codebase.
+                         export LLM_CACHE_ENABLED=1
+    LLM_CACHE_PATH     Path to the SQLite cache file
+                       (default: .llm_cache.db in the current directory)
+                         export LLM_CACHE_PATH=/tmp/llm_cache.db
+
+    Claude prefix caching:
+    CLAUDE_PREFIX_CACHE
+                       "1"|"true"|"yes" to attach cache_control breakpoints to
+                       Claude system prompts (default: enabled when provider=claude).
+                       Reduces cost for large, stable system prompts (stage4/5/6).
+                       Set to "0" to disable if you hit caching-related API errors.
+                         export CLAUDE_PREFIX_CACHE=0  # disable
 
 Default models:
     Claude : claude-sonnet-4-20250514
@@ -70,8 +127,24 @@ from __future__ import annotations
 
 import os
 import socket
+import threading
 import time
 from typing import Optional
+
+
+# ── Per-call token stats ───────────────────────────────────────────────────────
+# Thread-local so concurrent stage50 agents don't overwrite each other's counts.
+# Provider functions write here; call_llm reads after each call.
+_tok_stats = threading.local()
+
+def _set_tok(in_tok: int, out_tok: int) -> None:
+    """Called by provider functions to store real input/output token counts."""
+    _tok_stats.in_tok  = in_tok
+    _tok_stats.out_tok = out_tok
+
+def _get_tok() -> tuple[int, int]:
+    """Returns (in_tokens, out_tokens); (-1, -1) if provider did not report."""
+    return getattr(_tok_stats, "in_tok", -1), getattr(_tok_stats, "out_tok", -1)
 
 
 # ── Defaults ──────────────────────────────────────────────────────────────────
@@ -84,7 +157,7 @@ DEFAULT_LOCAL_LLM_URL = "http://localhost:11434" # Ollama default
 GEMINI_INTER_CALL_DELAY = 4   # seconds
 
 # Local LLM request timeout — local inference can be slow for large prompts
-LOCAL_LLM_TIMEOUT = 300   # seconds (5 minutes)
+LOCAL_LLM_TIMEOUT = 1800  # seconds (30 minutes)
 
 # ── Retry configuration ───────────────────────────────────────────────────────
 MAX_RETRIES        = 3          # maximum number of retry attempts after first failure
@@ -94,6 +167,35 @@ RETRY_MAX_DELAY    = 60.0       # cap so we never wait more than 1 minute
 
 
 # ─── Public API ────────────────────────────────────────────────────────────────
+
+def get_max_workers() -> int:
+    """
+    Recommended ThreadPoolExecutor size for concurrent LLM calls.
+
+    vLLM uses continuous batching — multiple requests are processed in
+    parallel on the GPU, so higher concurrency = higher throughput.
+    Ollama queues one request at a time, so concurrency > 1 gives no GPU
+    speedup but does eliminate Python hand-off overhead between calls.
+
+    Defaults:
+        vllm     → 4   (tune up if GPU has headroom)
+        ollama   → 1   (no GPU parallelism; sequential is fine)
+        lmstudio → 1
+        llamacpp → 1
+        cloud    → 1   (Claude / Gemini — rate-limited by the API)
+
+    Override any default with:
+        export LLM_MAX_WORKERS=8
+    """
+    explicit = os.environ.get("LLM_MAX_WORKERS", "").strip()
+    if explicit:
+        return max(1, int(explicit))
+    backend  = os.environ.get("LOCAL_LLM_BACKEND", "").strip().lower()
+    provider = get_provider()
+    if provider == "local" and backend == "vllm":
+        return 4
+    return 1
+
 
 def get_provider() -> str:
     """
@@ -176,6 +278,19 @@ def call_llm(
     temperature:   float = 0.2,
     label:         str = "",        # e.g. "stage4" — used in log messages
     json_mode:     bool = False,    # force JSON output (local provider only)
+    prefill:       str = "",        # assistant pre-fill text (Claude only)
+                                    # e.g. prefill="[" forces JSON array output,
+                                    # completely preventing any reasoning preamble.
+                                    # The prefill string is prepended to the
+                                    # returned text so callers see a complete value.
+    json_schema:   dict | None = None,  # optional JSON schema for constrained decoding
+                                        # (Ollama ≥0.4.6 native path only).
+                                        # When set, grammar-level enforcement replaces
+                                        # best-effort json_mode — invalid JSON is
+                                        # literally impossible.  json_mode is
+                                        # automatically set True when schema is given.
+    model_override: str | None = None,  # override the configured model for this call
+                                        # used by multi-model ensemble
 ) -> str:
     """
     Call the configured LLM provider and return the response text.
@@ -189,18 +304,38 @@ def call_llm(
         max_tokens:    Maximum tokens in the response.
         temperature:   Sampling temperature (0.0–1.0).
         label:         Optional stage label for log messages.
+        prefill:       Optional assistant pre-fill (Claude only).  When set,
+                       the string is sent as the start of the assistant turn
+                       so the model must continue from that exact text —
+                       prevents any chain-of-thought preamble.
 
     Returns:
-        Raw response text from the model.
+        Raw response text from the model (with prefill prepended when used).
 
     Raises:
         RuntimeError: On non-retryable API error, or after all retries exhausted.
     """
+    from pipeline import llm_cache as _cache
+
     provider = get_provider()
-    model    = get_model()
+    model    = model_override or get_model()
+    if json_schema is not None:
+        json_mode = True  # schema implies json_mode
     tag      = f"[{label}] " if label else ""
 
-    print(f"  {tag}LLM provider : {provider} ({model})")
+    _backend_label = os.environ.get("LOCAL_LLM_BACKEND", "").strip().lower()
+    _provider_str  = (
+        f"{provider}/{_backend_label}" if provider == "local" and _backend_label
+        else provider
+    )
+    print(f"  {tag}LLM provider : {_provider_str} ({model})")
+
+    # ── Exact-match cache lookup ───────────────────────────────────────────────
+    cache_key = _cache.make_key(model, system_prompt, user_prompt,
+                                temperature, json_mode, prefill)
+    cached = _cache.get(cache_key, label=label)
+    if cached is not None:
+        return cached
 
     if provider == "claude":
         call_fn = _call_claude
@@ -209,22 +344,92 @@ def call_llm(
     else:
         call_fn = _call_local
 
-    last_exc: Exception | None = None
-    delay = RETRY_BASE_DELAY
+    # For vLLM: omit max_tokens so the server uses remaining context space instead
+    # of pre-allocating a fixed KV-cache budget.  This avoids spurious 400 errors
+    # when prompt_tokens + max_tokens exceeds max_model_len even though the model
+    # would naturally stop well before that limit.
+    if provider == "local" and _backend_label == "vllm":
+        max_tokens = -1   # signals _call_local to omit the field from the payload
 
-    for attempt in range(MAX_RETRIES + 1):   # attempt 0 = first try
+    last_exc: Exception | None = None
+    delay    = RETRY_BASE_DELAY
+    attempt  = 0          # counts transient-error retries (sleeps); capped at MAX_RETRIES
+    _overflow_count  = 0  # counts _ContextLengthError reductions; has its own cap
+    _MAX_OVERFLOW    = 12 # allow up to 12 successive token-budget reductions
+    _overflow_buffer = 256  # initial safety margin; doubles on each overflow to converge
+
+    while True:
         try:
+            _set_tok(-1, -1)                  # reset before each attempt
+            _t0 = time.monotonic()
             if provider == "local":
-                return _call_local(system_prompt, user_prompt, max_tokens,
-                                   temperature, model, json_mode=json_mode)
-            return call_fn(system_prompt, user_prompt, max_tokens, temperature, model)
+                result = _call_local(system_prompt, user_prompt, max_tokens,
+                                     temperature, model, json_mode=json_mode,
+                                     prefill=prefill, json_schema=json_schema)
+            elif provider == "claude":
+                result = _call_claude(system_prompt, user_prompt, max_tokens,
+                                      temperature, model, prefill=prefill)
+            else:
+                result = call_fn(system_prompt, user_prompt, max_tokens,
+                                 temperature, model)
+            _elapsed = time.monotonic() - _t0
+            _in, _out = _get_tok()
+            if _in >= 0 and _out >= 0:
+                _tok_str = f"in={_in:,} out={_out:,} tok"
+            else:
+                _tok_str = f"~{len(result.split()):,} words"  # fallback if provider didn't report
+            print(f"  {tag}done in {_elapsed:.1f}s  ({_tok_str})")
+            # ── JSON validation + single correction retry ──────────────────
+            if json_mode:
+                ok, err = _validate_json(result)
+                if not ok:
+                    corrected = _json_correction_call(
+                        system_prompt, result, err,
+                        max_tokens, temperature, model, provider, label,
+                    )
+                    ok2, _ = _validate_json(corrected)
+                    if ok2:
+                        result = corrected
+                    else:
+                        print(f"  {tag}JSON correction also invalid — using original")
+            _cache.put(cache_key, result, label=label)
+            return result
 
         except _NonRetryableError:
             raise   # bad key, safety block, empty response — don't retry
 
+        except _ContextLengthError as exc:
+            # Prompt too long for the model's context window.
+            # Reduce max_tokens and retry immediately — this does NOT consume a
+            # transient-error retry slot (separate counter with its own cap).
+            #
+            # The server reports (ctx_max, prompt_toks) in the error body.
+            # We compute: available = ctx_max - prompt_toks - _overflow_buffer
+            # and double the buffer each time so successive retries converge
+            # quickly even when vLLM's token count drifts between requests.
+            _overflow_count += 1
+            if _overflow_count > _MAX_OVERFLOW:
+                raise RuntimeError(
+                    f"{tag}Context window still exceeded after {_MAX_OVERFLOW} "
+                    f"max_tokens reductions (current budget: {max_tokens}). "
+                    f"Reduce the prompt size or use a larger-context model."
+                )
+            # Re-apply the buffer with the current (doubled) margin so each
+            # successive call leaves more room, compensating for any tokeniser
+            # drift the server reports.
+            raw_available = exc.available_tokens   # ctx_max - prompt_toks - 64
+            reduced = max(256, raw_available - (_overflow_buffer - 64))
+            print(
+                f"  {tag}Context overflow (attempt {_overflow_count}/{_MAX_OVERFLOW}) — "
+                f"reducing max_tokens {max_tokens} → {reduced} and retrying ..."
+            )
+            max_tokens = reduced
+            _overflow_buffer = min(_overflow_buffer * 2, 4096)  # double, cap at 4096
+            # continue loop immediately without incrementing `attempt`
+
         except Exception as exc:
             last_exc = exc
-            if attempt == MAX_RETRIES:
+            if attempt >= MAX_RETRIES:
                 break   # exhausted — fall through to final raise
 
             wait = min(delay, RETRY_MAX_DELAY)
@@ -235,11 +440,62 @@ def call_llm(
             print(f"  {tag}Retrying in {wait:.0f}s ...")
             time.sleep(wait)
             delay *= RETRY_BACKOFF
+            attempt += 1
 
     raise RuntimeError(
-        f"LLM call failed after {MAX_RETRIES + 1} attempt(s). "
+        f"LLM call failed after {attempt + 1} attempt(s). "
         f"Last error: {last_exc}"
     )
+
+
+def _validate_json(text: str) -> tuple[bool, str]:
+    """
+    Try to parse *text* as JSON.  Returns (True, "") on success or
+    (False, error_message) on failure.  Strips markdown fences first.
+    """
+    import json as _json
+    t = text.strip()
+    if t.startswith("```"):
+        t = "\n".join(l for l in t.splitlines() if not l.strip().startswith("```")).strip()
+    try:
+        _json.loads(t)
+        return True, ""
+    except _json.JSONDecodeError as exc:
+        return False, str(exc)
+
+
+def _json_correction_call(
+    system_prompt: str,
+    bad_response:  str,
+    error_msg:     str,
+    max_tokens:    int,
+    temperature:   float,
+    model:         str,
+    provider:      str,
+    label:         str,
+) -> str:
+    """
+    Make a single correction call asking the model to fix its malformed JSON.
+    Returns the corrected text (may still be invalid — caller decides).
+    """
+    tag = f"[{label}] " if label else ""
+    fix_system = (
+        system_prompt
+        + "\n\nYour previous response was not valid JSON. "
+        "Return ONLY the corrected JSON — no prose, no fences, no explanation."
+    )
+    fix_user = (
+        f"Your previous response had a JSON parse error:\n{error_msg}\n\n"
+        f"Malformed response:\n{bad_response}\n\n"
+        "Please return the corrected JSON only."
+    )
+    print(f"  {tag}JSON invalid — requesting correction")
+    if provider == "local":
+        return _call_local(fix_system, fix_user, max_tokens, temperature, model, json_mode=True)
+    elif provider == "claude":
+        return _call_claude(fix_system, fix_user, max_tokens, temperature, model)
+    else:
+        return _call_gemini(fix_system, fix_user, max_tokens, temperature, model)
 
 
 # ─── Internal sentinel for errors that must not be retried ────────────────────
@@ -249,6 +505,17 @@ class _NonRetryableError(RuntimeError):
     Wraps errors where retrying is pointless (bad API key, safety block, etc.).
     Raised inside provider functions; caught in call_llm and re-raised as-is.
     """
+
+class _ContextLengthError(Exception):
+    """
+    Raised when the server returns HTTP 400 because prompt + max_tokens
+    exceeds the model's context window.
+
+    Carries available_tokens so call_llm can retry with a reduced budget.
+    """
+    def __init__(self, message: str, available_tokens: int) -> None:
+        super().__init__(message)
+        self.available_tokens = available_tokens
     pass
 
 
@@ -263,46 +530,91 @@ def _call_local(
     temperature:   float,
     model:         str,
     json_mode:     bool = False,
+    prefill:       str = "",
+    json_schema:   dict | None = None,
 ) -> str:
     """
-    Call a local LLM server via its OpenAI-compatible /v1/chat/completions endpoint.
+    Call a local LLM server (Ollama / vLLM / LM Studio / llama.cpp).
 
-    Supports any server that implements the OpenAI Chat Completions API:
-      - Ollama       (default port 11434) — https://ollama.com
-      - LM Studio    (default port 1234)  — https://lmstudio.ai
-      - llama.cpp    (default port 8080)  — https://github.com/ggerganov/llama.cpp
+    Routing
+    -------
+    LOCAL_LLM_BACKEND=ollama (default)
+      LOCAL_LLM_NUM_CTX set  → Ollama native /api/chat  (supports num_ctx at runtime)
+      LOCAL_LLM_NUM_CTX unset → OpenAI-compat /v1/chat/completions
 
-    All three expose POST /v1/chat/completions with the same request/response
-    shape as the OpenAI API, so a single implementation covers all of them.
+    LOCAL_LLM_BACKEND=vllm | lmstudio | llamacpp
+      Always → OpenAI-compat /v1/chat/completions
+      LOCAL_LLM_NUM_CTX is ignored (set --max-model-len at vLLM server launch)
 
-    No external SDK required — uses only the Python standard library (urllib).
+    Constrained decoding (JSON schema)
+    -----------------------------------
+    Ollama  (native path)  → payload["format"] = schema
+    Ollama  (compat path)  → response_format.json_schema
+    vLLM  ≥ 0.4.3          → response_format.json_schema   (default)
+    vLLM  < 0.4.3          → guided_json in body           (set VLLM_GUIDED_JSON=1)
+    LM Studio / llama.cpp  → response_format.json_schema
 
-    Environment variables consumed:
-        LOCAL_LLM_URL      Base URL  (default: http://localhost:11434)
-        LOCAL_LLM_MODEL    Model name (required — e.g. "llama3.2")
-        LOCAL_LLM_API_KEY  Bearer token (optional — LM Studio supports this)
+    No external SDK required — pure Python standard library (urllib).
     """
     import json
     import urllib.error
     import urllib.request
 
+    _backend = os.environ.get("LOCAL_LLM_BACKEND", "").strip().lower()
+    # "ollama" (default), "vllm", "lmstudio", "llamacpp"
+
+    # ── Ollama native path: only when backend is ollama AND num_ctx is set ──────
+    num_ctx = int(os.environ.get("LOCAL_LLM_NUM_CTX", "0") or "0")
+    if num_ctx > 0 and _backend not in ("vllm", "lmstudio", "llamacpp"):
+        return _call_local_ollama_native(
+            system_prompt, user_prompt, max_tokens, temperature,
+            model, num_ctx, prefill, json_mode=json_mode, json_schema=json_schema,
+        )
+    if num_ctx > 0 and _backend == "vllm":
+        print(f"  [llm_client] Note: LOCAL_LLM_NUM_CTX={num_ctx} is ignored for vLLM — "
+              f"set --max-model-len at server launch instead.")
+
     base_url = get_local_url()
     endpoint = f"{base_url}/v1/chat/completions"
     api_key  = os.environ.get("LOCAL_LLM_API_KEY", "").strip()
 
-    payload = {
+    messages_payload: list[dict] = [
+        {"role": "system",    "content": system_prompt},
+        {"role": "user",      "content": user_prompt},
+    ]
+    if prefill:
+        # OpenAI-compatible servers (Ollama ≥ 0.1, LM Studio ≥ 0.2) support
+        # assistant pre-fill — the model continues from the given text.
+        messages_payload.append({"role": "assistant", "content": prefill})
+
+    payload: dict = {
         "model":       model,
-        "messages": [
-            {"role": "system", "content": system_prompt},
-            {"role": "user",   "content": user_prompt},
-        ],
-        "max_tokens":  max_tokens,
+        "messages":    messages_payload,
         "temperature": temperature,
         "stream":      False,
     }
-    if json_mode:
-        # Forces Ollama / LM Studio / llama.cpp to output valid JSON.
-        # Supported by Ollama ≥ 0.1.14 and LM Studio ≥ 0.2.
+    # max_tokens ≤ 0 means "let the server decide" — omit the field so vLLM
+    # uses remaining context space rather than pre-allocating a fixed budget.
+    if max_tokens > 0:
+        payload["max_tokens"] = max_tokens
+    if json_schema is not None:
+        # Constrained decoding — grammar-level JSON schema enforcement.
+        # vLLM < 0.4.3: use guided_json in the request body (VLLM_GUIDED_JSON=1)
+        # vLLM ≥ 0.4.3 / Ollama ≥ 0.4.6 / LM Studio ≥ 0.3: response_format.json_schema
+        _use_guided = (
+            _backend == "vllm"
+            and os.environ.get("VLLM_GUIDED_JSON", "0").strip() == "1"
+        )
+        if _use_guided:
+            payload["guided_json"] = json_schema
+        else:
+            payload["response_format"] = {
+                "type": "json_schema",
+                "json_schema": {"name": "response", "strict": True, "schema": json_schema},
+            }
+    elif json_mode:
+        # JSON-object mode — valid JSON output without a fixed schema.
+        # Supported by Ollama ≥ 0.1.14, vLLM ≥ 0.3, LM Studio ≥ 0.2.
         payload["response_format"] = {"type": "json_object"}
 
     body    = json.dumps(payload).encode("utf-8")
@@ -319,12 +631,16 @@ def _call_local(
         _handle_local_http_error(exc, base_url, model)
     except urllib.error.URLError as exc:
         # Connection refused / DNS failure — server is not running
+        _backend_hint = {
+            "vllm":     "  vLLM:      python -m vllm.entrypoints.openai.api_server "
+                        "--model <model-id> --port 8000",
+            "lmstudio": "  LM Studio: start the Local Server in the LM Studio UI",
+            "llamacpp": "  llama.cpp: ./server -m your-model.gguf --port 8080",
+        }.get(_backend, "  Ollama:    ollama serve")
         raise RuntimeError(
             f"Cannot connect to local LLM server at {base_url}.\n"
             f"Is the server running?\n"
-            f"  Ollama:    ollama serve\n"
-            f"  LM Studio: start the Local Server in the LM Studio UI\n"
-            f"  llama.cpp: ./server -m your-model.gguf\n"
+            f"{_backend_hint}\n"
             f"Original error: {exc.reason}"
         )
     except TimeoutError:
@@ -381,7 +697,171 @@ def _call_local(
             f"Response length: {len(content)} chars."
         )
 
-    return content
+    # Report real token counts from OpenAI usage field
+    usage = data.get("usage", {})
+    _set_tok(
+        in_tok  = usage.get("prompt_tokens",     -1),
+        out_tok = usage.get("completion_tokens",  -1),
+    )
+
+    # Restore prefill so the caller sees the complete value
+    return (prefill + content) if prefill else content
+
+
+def _call_local_ollama_native(
+    system_prompt: str,
+    user_prompt:   str,
+    max_tokens:    int,
+    temperature:   float,
+    model:         str,
+    num_ctx:       int,
+    prefill:       str = "",
+    json_mode:     bool = False,
+    json_schema:   dict | None = None,
+) -> str:
+    """
+    Call Ollama via its native /api/chat endpoint.
+
+    The OpenAI-compat /v1/chat/completions endpoint silently ignores num_ctx;
+    the native endpoint accepts it under options.num_ctx and reloads the model
+    context if needed.  This is the only reliable way to override the default
+    context window (often 2048–4096) for large-batch workloads.
+
+    Response shape differs from OpenAI:
+        { "message": { "role": "assistant", "content": "..." },
+          "done": true, "done_reason": "stop" }
+    """
+    import json
+    import urllib.error
+    import urllib.request
+
+    base_url = get_local_url()
+    endpoint = f"{base_url}/api/chat"
+    api_key  = os.environ.get("LOCAL_LLM_API_KEY", "").strip()
+
+    messages_payload: list[dict] = [
+        {"role": "system", "content": system_prompt},
+        {"role": "user",   "content": user_prompt},
+    ]
+    if prefill:
+        messages_payload.append({"role": "assistant", "content": prefill})
+
+    # Disable extended-thinking by default for Ollama thinking models
+    # (qwen3, deepseek-r1, etc.).  When thinking is active, Ollama puts the
+    # reasoning trace in message.thinking and leaves message.content empty,
+    # which breaks every structured-output parser downstream.  The pipeline
+    # uses explicit chain-of-thought system prompts instead.
+    # Set LOCAL_LLM_THINKING=1 to re-enable if you specifically want traces.
+    thinking_enabled = os.environ.get("LOCAL_LLM_THINKING", "").strip().lower() in (
+        "1", "true", "yes"
+    )
+
+    # LOCAL_LLM_NUM_PREDICT lets users override the per-response token budget
+    # independently of max_tokens.  Thinking models burn most of max_tokens on
+    # the reasoning trace before writing the final answer, hitting the limit and
+    # returning empty content.  Set to -1 (unlimited) or a large value like
+    # 32768 when using qwen3, deepseek-r1, or any other thinking model.
+    _num_predict_env = os.environ.get("LOCAL_LLM_NUM_PREDICT", "").strip()
+    num_predict = int(_num_predict_env) if _num_predict_env else max_tokens
+
+    payload = {
+        "model":    model,
+        "messages": messages_payload,
+        "stream":   False,
+        "options": {
+            "num_predict": num_predict,
+            "num_ctx":     num_ctx,
+            "temperature": temperature,
+        },
+    }
+    if not thinking_enabled:
+        # Ollama ≥0.6: top-level "think" key suppresses the reasoning trace
+        # and forces all output into message.content.
+        payload["think"] = False
+    if json_schema is not None:
+        # Ollama ≥0.4.6: pass JSON schema directly as "format" for grammar-level
+        # constrained decoding — the model cannot emit anything that violates the schema.
+        payload["format"] = json_schema
+    elif json_mode:
+        # Ollama native /api/chat uses a top-level "format" field (not inside
+        # "options") to constrain output to valid JSON.
+        payload["format"] = "json"
+
+    body    = json.dumps(payload).encode("utf-8")
+    headers = {"Content-Type": "application/json"}
+    if api_key:
+        headers["Authorization"] = f"Bearer {api_key}"
+
+    req = urllib.request.Request(endpoint, data=body, headers=headers, method="POST")
+    try:
+        with urllib.request.urlopen(req, timeout=LOCAL_LLM_TIMEOUT) as resp:
+            raw = resp.read().decode("utf-8")
+    except urllib.error.HTTPError as exc:
+        _handle_local_http_error(exc, base_url, model)
+    except urllib.error.URLError as exc:
+        raise RuntimeError(
+            f"Cannot connect to Ollama at {base_url}.\n"
+            f"Is 'ollama serve' running?\n"
+            f"Original error: {exc.reason}"
+        )
+    except TimeoutError:
+        raise RuntimeError(
+            f"Ollama request timed out after {LOCAL_LLM_TIMEOUT}s."
+        )
+
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(
+            f"Ollama returned non-JSON.\nRaw: {raw[:200]!r}\nError: {exc}"
+        )
+
+    # Native /api/chat response: data["message"]["content"]
+    msg = data.get("message", {})
+    content = (msg.get("content") or "").strip()
+
+    # Strip <think>...</think> from Qwen3 scratchpad (inline thinking tags)
+    import re as _re
+    content = _re.sub(r"<think>.*?</think>", "", content, flags=_re.DOTALL).strip()
+
+    if not content:
+        # Thinking models (qwen3, deepseek-r1) sometimes emit an empty content
+        # field and place the entire response inside message.thinking when the
+        # model ignores our think=false flag (older Ollama builds) or the model
+        # was custom-built without the no-think patch.
+        # Try to recover by using the thinking field as the response text.
+        thinking_fallback = (msg.get("thinking") or "").strip()
+        if thinking_fallback:
+            print(
+                "  [llm_client] ⚠ Ollama returned empty content but non-empty "
+                "thinking field — using thinking output as response fallback.\n"
+                "  Most likely cause: num_predict budget exhausted during thinking "
+                "before the model wrote its final answer.\n"
+                "  Fix: export LOCAL_LLM_NUM_PREDICT=-1  (unlimited) or a large "
+                "value like 32768."
+            )
+            content = thinking_fallback
+        else:
+            raise _NonRetryableError(
+                f"Ollama /api/chat returned empty content.\n"
+                f"Full response: {json.dumps(data)[:300]}"
+            )
+
+    done_reason = data.get("done_reason", "")
+    if done_reason == "length":
+        print(
+            f"  Warning: Ollama hit num_predict limit ({num_predict}) "
+            f"with num_ctx={num_ctx}. Response: {len(content)} chars.\n"
+            f"  Fix: export LOCAL_LLM_NUM_PREDICT=-1  (unlimited) or a larger value."
+        )
+
+    # Report real token counts (Ollama native fields)
+    _set_tok(
+        in_tok  = data.get("prompt_eval_count", -1),
+        out_tok = data.get("eval_count", -1),
+    )
+
+    return (prefill + content) if prefill else content
 
 
 def _handle_local_http_error(
@@ -410,10 +890,26 @@ def _handle_local_http_error(
             f"Response body: {body[:200]}"
         )
     if code == 400:
+        # Check for context-length overflow — auto-retry with a smaller budget
+        import re as _re
+        # Matches: "maximum context length is 16384 tokens ... 12385 input tokens"
+        _ctx_m = _re.search(
+            r"maximum context length is (\d+).*?(\d+)\s+input tokens",
+            body, _re.DOTALL | _re.IGNORECASE,
+        )
+        if _ctx_m:
+            ctx_max      = int(_ctx_m.group(1))
+            prompt_toks  = int(_ctx_m.group(2))
+            available    = max(256, ctx_max - prompt_toks - 64)   # 64-token safety margin
+            raise _ContextLengthError(
+                f"Context overflow: model max={ctx_max}, prompt={prompt_toks}, "
+                f"available for output={available} tokens.",
+                available_tokens=available,
+            )
         raise _NonRetryableError(
             f"Local LLM rejected the request (HTTP 400).\n"
             f"This may mean the model doesn't support the parameters sent.\n"
-            f"Response body: {body[:200]}"
+            f"Response body: {body[:300]}"
         )
     if code == 401:
         raise _NonRetryableError(
@@ -445,8 +941,17 @@ def _call_claude(
     max_tokens:    int,
     temperature:   float,
     model:         str,
+    prefill:       str = "",
 ) -> str:
-    """Call Anthropic Claude API."""
+    """Call Anthropic Claude API.
+
+    When `prefill` is set it is appended as a partial assistant message so the
+    model must continue from that exact text.  The prefill string is prepended
+    to the returned text so callers see a complete response value.
+
+    Example — force immediate JSON array output (no chain-of-thought preamble):
+        _call_claude(..., prefill="[")
+    """
     try:
         import anthropic
     except ImportError:
@@ -462,18 +967,57 @@ def _call_claude(
             "Export it: export ANTHROPIC_API_KEY=sk-ant-..."
         )
 
+    messages: list[dict] = [{"role": "user", "content": user_prompt}]
+    if prefill:
+        messages.append({"role": "assistant", "content": prefill})
+
+    # Prefix caching: mark the system prompt for server-side KV caching.
+    # Anthropic caches content blocks whose cumulative token count exceeds
+    # ~1024 tokens; smaller prompts are cached but the saving is minimal.
+    # Disable via CLAUDE_PREFIX_CACHE=0 if you hit unexpected API errors.
+    prefix_cache = os.environ.get("CLAUDE_PREFIX_CACHE", "1").strip().lower() not in (
+        "0", "false", "no"
+    )
+    if prefix_cache:
+        system_param: list[dict] | str = [
+            {
+                "type":          "text",
+                "text":          system_prompt,
+                "cache_control": {"type": "ephemeral"},
+            }
+        ]
+    else:
+        system_param = system_prompt
+
     client  = anthropic.Anthropic(api_key=api_key)
     message = client.messages.create(
-        model      = model,
-        max_tokens = max_tokens,
-        system     = system_prompt,
-        messages   = [{"role": "user", "content": user_prompt}],
+        model       = model,
+        max_tokens  = max_tokens,
+        temperature = temperature,
+        system      = system_param,
+        messages    = messages,
     )
 
     if not message.content:
         raise _NonRetryableError("Claude returned an empty response.")
 
-    return message.content[0].text
+    # Find the first text block (skip thinking blocks on extended-thinking models)
+    text = next(
+        (block.text for block in message.content if getattr(block, "type", "") == "text"),
+        None,
+    )
+    if text is None:
+        raise _NonRetryableError("Claude returned no text content block.")
+
+    # Report real token counts (includes cache_read / cache_creation breakdowns)
+    usage = message.usage
+    _set_tok(
+        in_tok  = getattr(usage, "input_tokens",  -1),
+        out_tok = getattr(usage, "output_tokens", -1),
+    )
+
+    # Restore prefill so the caller gets the complete value
+    return (prefill + text) if prefill else text
 
 
 # ─── Gemini ────────────────────────────────────────────────────────────────────
@@ -559,6 +1103,13 @@ def _call_gemini(
 
     if not text:
         raise _NonRetryableError("Gemini returned an empty text response.")
+
+    # Report real token counts
+    meta = getattr(response, "usage_metadata", None)
+    _set_tok(
+        in_tok  = getattr(meta, "prompt_token_count",     -1) if meta else -1,
+        out_tok = getattr(meta, "candidates_token_count", -1) if meta else -1,
+    )
 
     return text
 

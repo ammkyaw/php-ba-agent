@@ -123,7 +123,7 @@ def _check_dependencies(ctx: PipelineContext, args: argparse.Namespace) -> None:
     if ctx.domain_model is None:
         errors.append(
             "ctx.domain_model is None — run Stage 4 first:\n"
-            f"       python run_pipeline.py --resume {args.resume} --until stage4_domain"
+            f"       python run_pipeline.py --resume {args.resume} --until stage40_domain"
         )
     if ctx.business_flows is None:
         errors.append(

@@ -1,5 +1,5 @@
 """
-pipeline/stage3_embed.py — Embedding & Vector Index Stage
+pipeline/stage30_embed.py — Embedding & Vector Index Stage
 
 Converts the CodeMap (Stage 1) and Knowledge Graph (Stage 2) into semantically
 rich text chunks, embeds them with a local sentence-transformers model (all-MiniLM-L6-v2), and stores
@@ -56,7 +56,7 @@ Metadata stored per chunk (used for filtering in Stage 4):
 
 Resume behaviour
 ----------------
-If stage3_embed is COMPLETED and the ChromaDB collection already contains
+If stage30_embed is COMPLETED and the ChromaDB collection already contains
 documents, the stage is skipped.
 
 Dependencies
@@ -118,7 +118,7 @@ def run(ctx: PipelineContext) -> None:
     chroma_path = ctx.output_path(CHROMA_SUBDIR)
 
     # ── Resume check ─────────────────────────────────────────────────────────
-    if ctx.is_stage_done("stage3_embed"):
+    if ctx.is_stage_done("stage30_embed"):
         existing = _try_load_collection(chroma_path, COLLECTION_NAME)
         if existing and existing.count() > 0:
             print(f"  [stage3] Resuming — collection '{COLLECTION_NAME}' "
@@ -174,7 +174,7 @@ def run(ctx: PipelineContext) -> None:
     manifest_path = ctx.output_path("chunks_manifest.json")
     _save_manifest(chunks, manifest_path)
 
-    ctx.stage("stage3_embed").mark_completed(chroma_path)
+    ctx.stage("stage30_embed").mark_completed(chroma_path)
     ctx.save()
 
     print(f"  [stage3] Done — {total} chunks in collection '{COLLECTION_NAME}'")

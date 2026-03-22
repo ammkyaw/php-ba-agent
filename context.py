@@ -41,12 +41,36 @@ class StageStatus(str, Enum):
     FAILED    = "failed"
 
 
+class Language(str, Enum):
+    """Primary programming language of the analysed project."""
+    PHP        = "php"
+    TYPESCRIPT = "typescript"
+    JAVASCRIPT = "javascript"
+    JAVA       = "java"
+    KOTLIN     = "kotlin"
+    UNKNOWN    = "unknown"
+
+
 class Framework(str, Enum):
+    # ── PHP frameworks ────────────────────────────────────────────────────────
     LARAVEL     = "laravel"
     SYMFONY     = "symfony"
     CODEIGNITER = "codeigniter"
     WORDPRESS   = "wordpress"
     RAW_PHP     = "raw_php"
+    # ── TypeScript / JavaScript frameworks ───────────────────────────────────
+    NEXTJS      = "nextjs"
+    NUXTJS      = "nuxtjs"
+    VUE         = "vue"
+    REACT       = "react"
+    EXPRESS     = "express"
+    FASTIFY     = "fastify"
+    NESTJS      = "nestjs"
+    # ── Java / Kotlin frameworks ──────────────────────────────────────────────
+    SPRING_BOOT = "spring_boot"
+    QUARKUS     = "quarkus"
+    MICRONAUT   = "micronaut"
+    # ── Fallback ──────────────────────────────────────────────────────────────
     UNKNOWN     = "unknown"
 
 
@@ -81,43 +105,51 @@ class StageResult:
 @dataclass
 class CodeMap:
     """
-    Full extracted representation of a PHP codebase produced by Stage 1.
+    Full extracted representation of a codebase produced by Stage 1.
 
-    Original fields (OOP structure)
-    --------------------------------
-    framework       — detected framework enum
-    php_version     — e.g. "8.1"
-    classes         — all class definitions (raw, non-categorised)
-    routes          — HTTP route registrations (Laravel/Symfony/raw)
-    models          — OOP model / entity classes
-    controllers     — OOP controller classes
-    services        — service, repository, and other OOP classes
-    db_schema       — migration / CREATE TABLE definitions with column info
+    Language-neutral fields (all parsers must populate these)
+    ----------------------------------------------------------
+    language        — primary language enum  (NEW)
+    language_version — e.g. "8.1" / "20" / "17"  (NEW, replaces php_version)
+    framework       — detected framework enum (extended for TS + Java)
+    classes         — all class / interface / type definitions
+    routes          — HTTP route registrations
+    models          — ORM model / entity classes
+    controllers     — controller classes / handler functions
+    services        — service, repository, and other backend classes
+    db_schema       — migration / CREATE TABLE / schema definitions
     config_files    — list of config file paths found
-    total_files     — total PHP files scanned
-    total_lines     — total lines of PHP code
-
-    Extended fields (added by Stage 1 enhancements)
-    ------------------------------------------------
-    html_pages      — PHP files that mix HTML output (entry points)
-    functions       — standalone / global function definitions
-    includes        — include/require relationships between files
+    total_files     — total source files scanned
+    total_lines     — total lines of source code
+    functions       — standalone / exported function definitions
+    imports         — import/require/include relationships (NEW, language-neutral)
     sql_queries     — raw SQL operations with caller, table, operation
-    redirects       — header("Location:...") calls with source + target
-    superglobals    — $_POST/$_GET/$_SESSION/$_COOKIE key accesses
-    call_graph      — function-to-function call edges
-    form_fields     — HTML <form> elements with action, method, fields
-    service_deps    — constructor DI / Facade usage (class -> dep_class)
-    env_vars        — getenv() / $_ENV / config() references
-    auth_signals    — session checks, middleware, role guards detected
+    call_graph      — function/method call edges
+    form_fields     — form elements / API request bodies with fields
+    service_deps    — constructor DI / injection edges (class → dep_class)
+    env_vars        — environment variable references
+    auth_signals    — auth checks, middleware, role guards detected
     http_endpoints  — inferred HTTP entry points with method + handler
-    table_columns   — per-table column definitions from migrations
-    globals         — global variable declarations
+    table_columns   — per-table column definitions
+    globals         — global / module-level variable declarations
     execution_paths — static-analysis execution paths (from Stage 1.5)
+    components      — frontend UI components (Vue/React) — NEW
+    input_params    — request parameters / form inputs / superglobals — NEW
+
+    PHP-specific fields (kept for backward compat, deprecated for new langs)
+    -------------------------------------------------------------------------
+    php_version     — DEPRECATED: use language_version
+    html_pages      — PHP files mixing HTML output (PHP-only)
+    includes        — DEPRECATED: use imports
+    superglobals    — DEPRECATED: use input_params
+    redirects       — PHP header("Location:…") calls
     """
-    # -- Original fields ------------------------------------------------------
+    # -- Language identity (NEW) -----------------------------------------------
+    language:         Language             = Language.UNKNOWN
+    language_version: Optional[str]        = None
+
+    # -- Core fields (all parsers populate) -----------------------------------
     framework:    Framework            = Framework.UNKNOWN
-    php_version:  Optional[str]        = None
     classes:      list[dict[str, Any]] = field(default_factory=list)
     routes:       list[dict[str, Any]] = field(default_factory=list)
     models:       list[dict[str, Any]] = field(default_factory=list)
@@ -128,13 +160,10 @@ class CodeMap:
     total_files:  int = 0
     total_lines:  int = 0
 
-    # -- Extended fields -------------------------------------------------------
-    html_pages:      list[str]            = field(default_factory=list)
+    # -- Language-neutral extended fields -------------------------------------
     functions:       list[dict[str, Any]] = field(default_factory=list)
-    includes:        list[dict[str, Any]] = field(default_factory=list)
+    imports:         list[dict[str, Any]] = field(default_factory=list)   # NEW (replaces includes)
     sql_queries:     list[dict[str, Any]] = field(default_factory=list)
-    redirects:       list[dict[str, Any]] = field(default_factory=list)
-    superglobals:    list[dict[str, Any]] = field(default_factory=list)
     call_graph:      list[dict[str, Any]] = field(default_factory=list)
     form_fields:     list[dict[str, Any]] = field(default_factory=list)
     service_deps:    list[dict[str, Any]] = field(default_factory=list)
@@ -144,6 +173,20 @@ class CodeMap:
     table_columns:   list[dict[str, Any]] = field(default_factory=list)
     globals:         list[dict[str, Any]] = field(default_factory=list)
     execution_paths: list[dict[str, Any]] = field(default_factory=list)
+    components:      list[dict[str, Any]] = field(default_factory=list)   # NEW (Vue/React/Angular)
+    input_params:    list[dict[str, Any]] = field(default_factory=list)   # NEW (replaces superglobals)
+
+    # -- PHP-specific fields (backward compat, avoid in new parsers) ----------
+    php_version:  Optional[str]        = None   # DEPRECATED → language_version
+    html_pages:      list[str]            = field(default_factory=list)
+    includes:        list[dict[str, Any]] = field(default_factory=list)   # DEPRECATED → imports
+    redirects:       list[dict[str, Any]] = field(default_factory=list)
+    superglobals:    list[dict[str, Any]] = field(default_factory=list)   # DEPRECATED → input_params
+
+    @property
+    def effective_language_version(self) -> Optional[str]:
+        """Return language_version, falling back to php_version for old runs."""
+        return self.language_version or self.php_version
 
 
 @dataclass
@@ -167,7 +210,7 @@ class EmbeddingMeta:
 
 @dataclass
 class PreflightResult:
-    """Results of Stage 3.5 context pre-flight checks."""
+    """Results of Stage 3.9 context pre-flight checks."""
     passed:   bool      = True
     warnings: list[str] = field(default_factory=list)
     blockers: list[str] = field(default_factory=list)
@@ -218,6 +261,7 @@ class BusinessFlow:
     termination:       str                   # Success end-state description
     evidence_files:    list[str]             # Source PHP files that back this flow
     confidence:        float = 1.0           # 0.0-1.0
+    flow_type:         str   = "http"        # "http"|"scheduled"|"cli"|"webhook"|"queue_worker"
     replaces_workflow: Optional[str] = None  # domain_model.workflow it supersedes
 
 
@@ -232,12 +276,72 @@ class BusinessFlowCollection:
 
 
 @dataclass
+class EntryPoint:
+    """
+    One non-HTTP system entry point discovered by Stage 1.3.
+
+    Types
+    -----
+    http         — Standard browser-facing page; also covers webhook receivers
+                   that arrive via HTTP POST from an external system
+    scheduled    — Cron job or scheduled console command
+    cli          — Admin / maintenance CLI script (artisan command, bin/*.php)
+    webhook      — Incoming HTTP callback from an external system (Stripe, etc.)
+    queue_worker — Async queue / message-queue job handler
+    """
+    ep_id:        str   = ""       # e.g. "ep_001"
+    ep_type:      str   = "http"   # "http"|"scheduled"|"cli"|"webhook"|"queue_worker"
+    handler_file: str   = ""       # path relative to php_project_path
+    name:         str   = ""       # human-readable, e.g. "Send Nightly Digest"
+    schedule:     str   = ""       # cron expression or "" (non-scheduled types)
+    trigger:      str   = ""       # e.g. "POST /webhook/stripe" | "php artisan cmd:name"
+    confidence:   float = 0.8      # 1.0=config-backed, 0.8=pattern, 0.6=heuristic
+
+
+@dataclass
+class EntryPointCatalog:
+    """
+    Complete catalog of all system entry points produced by Stage 1.3.
+
+    Consumed by:
+      Stage 1.5  — seeds execution-path analysis from non-HTTP handlers
+      Stage 4.5  — tags BusinessFlow.flow_type from source file → entry point type
+      Stage 5    — injects background operation descriptions into BRD
+    """
+    entry_points: list[EntryPoint]     = field(default_factory=list)
+    by_type:      dict[str, list[str]] = field(default_factory=dict)   # ep_type → [ep_id]
+    total:        int                  = 0
+    generated_at: str                  = field(default_factory=lambda: datetime.utcnow().isoformat())
+
+
+@dataclass
+class CriticPass:
+    """
+    Result of one Critic-loop pass on a Stage 5 BA document.
+
+    Produced by Stage 5.0 CriticAgent.  One entry per document per turn.
+    Stage 6 QA can inspect these to see what the critic already addressed.
+    """
+    doc_type:              str   = ""     # "brd" | "srs" | "ac" | "us"
+    turn:                  int   = 1      # 1 = after first draft, 2 = after refinement
+    score:                 float = 0.0   # 0.0–1.0 (≥ CRITIC_THRESHOLD → passed)
+    passed:                bool  = False
+    uncovered_rule_ids:    list  = field(default_factory=list)   # list[str]
+    hallucinated_entities: list  = field(default_factory=list)   # list[str]
+    structural_issues:     list  = field(default_factory=list)   # list[str]
+    rewrite_hints:         list  = field(default_factory=list)   # list[str]
+    generated_at:          str   = field(default_factory=lambda: datetime.utcnow().isoformat())
+
+
+@dataclass
 class BAArtifacts:
     """Paths to the four BA document artefacts produced by Stage 5."""
     brd_path:          Optional[str] = None
     srs_path:          Optional[str] = None
     ac_path:           Optional[str] = None
     user_stories_path: Optional[str] = None
+    # Critic-loop results: doc_key → list of CriticPass dicts (one per turn attempted)
+    critic_passes:     dict          = field(default_factory=dict)
 
 
 @dataclass
@@ -274,6 +378,376 @@ class KnowledgeGraphMeta:
 
 
 @dataclass
+class BusinessRule:
+    """
+    One extracted business invariant from Stage 2.9.
+
+    Populated entirely by static analysis — no LLM.
+    """
+    rule_id:         str            # e.g. "rule_001"
+    category:        str            # VALIDATION | AUTHORIZATION | STATE_TRANSITION |
+                                    # BUSINESS_LIMIT | TEMPORAL | REFERENTIAL
+    description:     str            # Human-readable, e.g. "Password must be ≥ 8 chars"
+    raw_expression:  str            # Code snippet, e.g. "strlen($password) < 8"
+    entity:          str            # Linked field, e.g. "User.password"
+    bounded_context: str            # Cluster/module name from Stage 2.8
+    source_files:    list[str]      # PHP files where this rule was found
+    confidence:      float = 0.8    # 1.0=schema, 0.8=guard-clause, 0.6=source-scan
+    tables:          list[str] = field(default_factory=list)
+    plain_english:   str   = ""    # BA-ready phrasing, populated at end of Stage 2.9
+
+
+@dataclass
+class InvariantCollection:
+    """Container written to rule_catalog.json by Stage 2.9."""
+    rules:        list[BusinessRule]   = field(default_factory=list)
+    total:        int                  = 0
+    by_category:  dict[str, list[str]] = field(default_factory=dict)
+    by_context:   dict[str, list[str]] = field(default_factory=dict)
+    generated_at: str                  = field(default_factory=lambda: datetime.utcnow().isoformat())
+
+
+@dataclass
+class StateTransition:
+    """
+    One detected state transition for a state-machine entity field.
+
+    Produced by Stage 3.7 — fully static, no LLM.
+    """
+    from_state:   str            # e.g. "Draft"
+    to_state:     str            # e.g. "Submitted"
+    trigger:      str            # PHP file stem or operation label, e.g. "save_case"
+    guard:        str            # guard condition if known, else ""
+    source_files: list[str]
+    confidence:   float = 0.75   # 0.9=SQL SET+WHERE, 0.75=branch+action, 0.5=proximity
+
+
+@dataclass
+class StateMachine:
+    """
+    State machine for one (table, field) pair, produced by Stage 3.7.
+
+    Consumed by Stage 4.5 (flow validation), Stage 6.7 (diagrams),
+    Stage 8 (test generation).
+    """
+    machine_id:      str           # e.g. "sm_001"
+    entity:          str           # human name, e.g. "Email"
+    table:           str           # e.g. "emails"
+    field:           str           # e.g. "status"
+    bounded_context: str           # cluster name from Stage 2.8
+    states:          list[str]     # all distinct states detected
+    initial_states:  list[str]     # states with no incoming transition
+    terminal_states: list[str]     # states with no outgoing transition
+    dead_states:     list[str]     # unreachable states
+    transitions:     list[StateTransition]
+    mermaid:         str           # stateDiagram-v2 source
+
+
+@dataclass
+class StateMachineCollection:
+    """Container written to state_machine_catalog.json by Stage 3.7."""
+    machines:     list[StateMachine] = field(default_factory=list)
+    total:        int                = 0
+    generated_at: str                = field(default_factory=lambda: datetime.utcnow().isoformat())
+
+
+@dataclass
+class ActionTag:
+    """
+    Semantic role assigned to one HTTP endpoint / controller action by Stage 2.7.
+    """
+    symbol:      str          # "OrderController::store" or "create_order"
+    file:        str
+    role:        str          # BUSINESS_ACTION | AUTH_ACTION | CRUD_ACTION | INTEGRATION_ACTION | INFRASTRUCTURE_ACTION
+    confidence:  float        # 0.0 – 1.0
+    signals:     list[str]    = field(default_factory=list)  # human-readable evidence
+    actor:       str          = ""  # "Admin" | "Authenticated User" | "Guest" | "API Client"
+    entities:    list[str]    = field(default_factory=list)  # DB tables written/read
+    http_method: str          = ""  # "POST" | "GET" | ""
+    route_path:  str          = ""  # "/orders" | ""
+
+
+@dataclass
+class ExternalSystem:
+    """
+    An external system detected by Stage 2.7 (payment gateway, email, storage…).
+    """
+    name:         str                   # "Stripe"
+    category:     str                   # PAYMENT | EMAIL | STORAGE | SMS_PUSH | AUTH_OAUTH | MONITORING | CRM | ERP | INFRA
+    env_keys:     list[str]  = field(default_factory=list)   # ["STRIPE_KEY", "STRIPE_SECRET"]
+    class_hints:  list[str]  = field(default_factory=list)   # ["StripeService", "StripeGateway"]
+    dep_hints:    list[str]  = field(default_factory=list)   # ["Stripe\StripeClient"]
+    detected_via: list[str]  = field(default_factory=list)   # ["env_var", "class_name", "service_dep"]
+
+
+@dataclass
+class SemanticRoleIndex:
+    """
+    Full semantic-role index produced by Stage 2.7.
+    Written to 2.7_semanticroles/semantic_roles.json.
+    Consumed by Stage 2.8 (clustering), Stage 4 (domain model), Stage 4.5 (flows).
+    """
+    actions:          list[ActionTag]      = field(default_factory=list)
+    external_systems: list[ExternalSystem] = field(default_factory=list)
+    role_summary:     dict[str, int]       = field(default_factory=dict)  # role → count
+    infra_files:      list[str]            = field(default_factory=list)  # files whose dominant role is INFRASTRUCTURE
+    business_files:   list[str]            = field(default_factory=list)  # files with ≥1 BUSINESS_ACTION tag
+    generated_at:     str                  = field(default_factory=lambda: datetime.utcnow().isoformat())
+
+
+@dataclass
+class ActionCluster:
+    """
+    One action cluster produced by Stage 2.8 — a group of PHP files that share
+    a common bounded context (module folder, DB tables, route prefix, redirects).
+    """
+    cluster_id:   str            # e.g. "cluster_001"
+    name:         str            # e.g. "Accounts" or "CalendarProvider"
+    files:        list[str]      # absolute paths of member files
+    tables:       list[str]      # DB tables touched by member files
+    route_prefix: str            # common route prefix, if any (e.g. "/accounts")
+    module:       str            # SugarCRM/framework module name, or ""
+    file_count:   int = 0        # len(files) convenience field
+
+
+@dataclass
+class ActionClusterCollection:
+    """Container written to action_clusters.json by Stage 2.8."""
+    clusters:     list[ActionCluster] = field(default_factory=list)
+    total:        int                 = 0
+    generated_at: str                 = field(default_factory=lambda: datetime.utcnow().isoformat())
+
+
+@dataclass
+class EntityColumn:
+    """One column of a DB table, produced by Stage 3.5."""
+    name:              str
+    data_type:         str  = ""
+    nullable:          bool = True
+    is_primary_key:    bool = False
+    is_foreign_key:    bool = False
+    references_table:  str  = ""
+    references_column: str  = ""
+
+
+@dataclass
+class Entity:
+    """
+    One business entity extracted by Stage 3.5.
+
+    Covers every table/model in the codebase.  Use is_core / is_system /
+    is_pivot flags to filter for different consumers (ER diagram vs full graph).
+    """
+    entity_id:       str            # "ent_001"
+    name:            str            # "Customer"  (humanized from table name)
+    table:           str            # "customers"
+    bounded_context: str            # cluster name from Stage 2.8
+    columns:         list[EntityColumn]
+    primary_key:     str            # e.g. "id"
+    is_pivot:        bool = False   # junction table for N:M
+    is_core:         bool = True    # has ≥1 relationship OR ≥1 state machine OR in action cluster
+    is_system:       bool = False   # infra/log/config tables (sugar_config, log_messages…)
+    source_files:    list[str] = field(default_factory=list)
+    confidence:      float = 1.0
+
+
+@dataclass
+class EntityCollection:
+    """Container written to entity_catalog.json by Stage 3.5."""
+    entities:     list[Entity] = field(default_factory=list)
+    total:        int          = 0
+    core_count:   int          = 0   # entities where is_core=True
+    generated_at: str          = field(default_factory=lambda: datetime.utcnow().isoformat())
+
+
+@dataclass
+class EntityRelationship:
+    """
+    One detected relationship between two entities, produced by Stage 3.6.
+
+    Multiple signals (FK, JOIN, ORM, column pattern) are merged into a single
+    entry per (from_entity, to_entity) pair.
+    """
+    rel_id:       str            # "rel_001"
+    from_entity:  str            # table name e.g. "customers"
+    to_entity:    str            # table name e.g. "orders"
+    cardinality:  str            # "1:1" | "1:N" | "N:M"
+    rel_type:     str            # "has_many" | "has_one" | "belongs_to" | "many_to_many"
+    via_column:   str            # FK column, e.g. "customer_id"
+    via_table:    str            # pivot table name (N:M only), else ""
+    confidence:   float
+    signals:      list[str]      # ["foreign_key","column_pattern","sql_join","orm"]
+    source_files: list[str]
+
+
+@dataclass
+class EntityRelationshipCollection:
+    """Container written to relationship_catalog.json by Stage 3.6."""
+    relationships: list[EntityRelationship] = field(default_factory=list)
+    entity_names:  list[str]                = field(default_factory=list)
+    total:         int                      = 0
+    mermaid_path:  str                      = ""   # path to erDiagram .mmd file
+    generated_at:  str                      = field(default_factory=lambda: datetime.utcnow().isoformat())
+
+
+@dataclass
+class SpecRule:
+    """
+    One formal business rule produced by Stage 4.6 Specification Mining.
+
+    Unlike Stage 2.9 BusinessRule (which stores raw code-centric invariants),
+    SpecRule is BA-ready: Given/When/Then phrased in business language,
+    cross-referenced to all evidence sources.
+    """
+    rule_id:           str            # "BR-001"
+    category:          str            # VALIDATION | AUTHORIZATION | WORKFLOW |
+                                      # STATE | REFERENTIAL | BUSINESS_LIMIT
+    title:             str            # ≤10-word business-friendly name
+    description:       str            # fuller prose
+    given:             str            # "Given the user is registering…"
+    when:              str            # "When they submit a password shorter than 8 chars"
+    then:              str            # "Then the system rejects the input with an error"
+    entities:          list[str]      # ["User"]
+    bounded_context:   str            # "Users"
+    source_invariants: list[str]      # rule_ids from Stage 2.9
+    source_machines:   list[str]      # machine_ids from Stage 3.7
+    source_flows:      list[str]      # flow_ids from Stage 4.5
+    source_files:      list[str]
+    confidence:        float          # 0.0–1.0
+    tags:              list[str]      # ["password", "security", "validation"]
+    pass_origin:       str            # "pass1_invariant" | "pass2_state" |
+                                      # "pass3_flow"      | "pass4_referential"
+
+
+@dataclass
+class SpecRuleCollection:
+    """Container written to spec_rules.json by Stage 4.6."""
+    rules:        list[SpecRule]            = field(default_factory=list)
+    total:        int                       = 0
+    by_category:  dict[str, list[str]]      = field(default_factory=dict)
+    by_entity:    dict[str, list[str]]      = field(default_factory=dict)
+    by_flow:      dict[str, list[str]]      = field(default_factory=dict)
+    by_context:   dict[str, list[str]]      = field(default_factory=dict)
+    generated_at: str                       = field(default_factory=lambda: datetime.utcnow().isoformat())
+
+
+@dataclass
+class TriangulatedRule:
+    """
+    Triangulation result for one SpecRule, produced by Stage 4.8.
+
+    corroborating_types — independent evidence streams that agree with the rule
+    contradicting_types — streams whose data actively conflicts with the rule
+    triangulation_score — corroborating / max_applicable  (0.0–1.0)
+    triangulation_status — STRONG (≥0.60) | MODERATE (≥0.33) | WEAK (<0.33)
+    """
+    rule_id:               str
+    title:                 str
+    category:              str
+    corroborating_types:   list[str]   # subset of 6 evidence type labels
+    contradicting_types:   list[str]
+    triangulation_score:   float
+    triangulation_status:  str         # "STRONG" | "MODERATE" | "WEAK"
+    max_applicable:        int         # denominator (category-dependent)
+    contradiction_notes:   list[str]   = field(default_factory=list)
+
+
+@dataclass
+class TriangulationReport:
+    """Container written to evidence_triangulation.json by Stage 4.8."""
+    rules:               list[TriangulatedRule] = field(default_factory=list)
+    total:               int                    = 0
+    strong_count:        int                    = 0
+    moderate_count:      int                    = 0
+    weak_count:          int                    = 0
+    contradiction_count: int                    = 0
+    weak_rule_ids:       list[str]              = field(default_factory=list)
+    contradiction_ids:   list[str]              = field(default_factory=list)
+    generated_at:        str                    = field(default_factory=lambda: datetime.utcnow().isoformat())
+
+
+@dataclass
+class TraceableRequirement:
+    """
+    A single traceable requirement produced by Stage 5.5.
+
+    Forward links  (code → req): populated from spec_rules source catalogs.
+    Backward links (doc  → req): populated from [BR-XXX] citations or keyword overlap.
+    """
+    tr_id:                str        = ""        # e.g. "TR-BR-001"
+    source_type:          str        = ""        # "spec_rule" | "business_flow" | "entity" | "state_machine"
+    source_id:            str        = ""        # original catalog ID (rule_id / flow_id / …)
+    title:                str        = ""
+    category:             str        = ""
+    bounded_context:      str        = ""
+    # Forward links: code artifacts that provide evidence for this requirement
+    code_artifacts:       list       = field(default_factory=list)   # list[dict]
+    # Backward links: sections in generated docs that cite this requirement
+    document_citations:   list       = field(default_factory=list)   # list[dict]
+    covered_in_brd:       bool       = False
+    covered_in_srs:       bool       = False
+    covered_in_ac:        bool       = False
+    covered_in_us:        bool       = False
+    doc_coverage_score:   float      = 0.0       # fraction of docs that cover this req
+    code_link_count:      int        = 0
+    triangulation_status: str        = ""        # "STRONG" | "MODERATE" | "WEAK" | ""
+
+
+@dataclass
+class TraceabilityMeta:
+    """
+    Summary metadata for the Automated Traceability Matrix (Stage 5.5).
+
+    The full matrix lives in traceability_matrix.json; the human report in
+    traceability_report.md.  Downstream stages consume uncited_ids and
+    coverage percentages.
+    """
+    matrix_path:        str        = ""
+    report_path:        str        = ""
+    total_requirements: int        = 0
+    covered_brd:        float      = 0.0   # fraction of reqs cited in BRD
+    covered_srs:        float      = 0.0
+    covered_ac:         float      = 0.0
+    covered_us:         float      = 0.0
+    avg_code_links:     float      = 0.0
+    uncited_count:      int        = 0
+    uncited_ids:        list       = field(default_factory=list)   # list[str]
+    generated_at:       str        = field(default_factory=lambda: datetime.utcnow().isoformat())
+
+
+@dataclass
+class DocCoverageResult:
+    """
+    Document coverage audit produced by Stage 5.9.
+
+    Records how many static-analysis signals (entities, flows, spec rules,
+    state machines, relationships) made it into the generated BA documents.
+    Consumed by Stage 6 to inject gap context into the QA review prompt.
+    """
+    dimensions:     list        = field(default_factory=list)   # DimCoverage objects or dicts
+    overall_pct:    float       = 0.0
+    overall_status: str         = "fail"                        # "pass" | "warn" | "fail"
+    gap_summary:    list[str]   = field(default_factory=list)   # human-readable gaps
+    generated_at:   str         = field(default_factory=lambda: datetime.utcnow().isoformat())
+
+
+@dataclass
+class GraphRAGMeta:
+    """
+    Metadata for the Graph-Aware Context Index produced by Stage 3.8.
+
+    The full index lives in graph_context_index.json; this dataclass carries
+    only the path and node counts.  Downstream stages call ctx.graph_query()
+    which lazily loads and caches the index from index_path.
+    """
+    index_path:    str = ""
+    file_count:    int = 0
+    entity_count:  int = 0
+    cluster_count: int = 0
+    generated_at:  str = field(default_factory=lambda: datetime.utcnow().isoformat())
+
+
+@dataclass
 class ArchitectureMeta:
     """
     Lightweight summary of the architecture reconstruction produced by Stage 6.2.
@@ -295,36 +769,66 @@ class ArchitectureMeta:
 _STAGE_SUBDIRS: dict[str, str] = {
     # Stage 0 — Validation
     "validation_report.json":      "0_validation",
+    # Stage 0.5 — Language Detection (NEW)
+    "language_detect.json":        "0.5_detect",
     # Stage 1 — PHP Parsing
     "code_map.json":               "1_parse",
+    # Stage 1.3 — Entry-Point Catalog
+    "entry_point_catalog.json":    "1.3_entrypoints",
     # Stage 1.5 — Execution Paths
     "execution_paths.json":        "1.5_paths",
     "execution_paths_errors.json": "1.5_paths",
     # Stage 2 — Knowledge Graph
+    "component_graph.json":        "2.2_components",   # Stage 2.2 (NEW)
     "code_graph.gpickle":          "2_graph",
     "code_graph.json":             "2_graph",
     "code_graph.png":              "2_graph",
     # Stage 2.5 — Behavior Graph
     "behavior_graph.json":         "2.5_behavior",
+    # Stage 2.7 — Semantic Role Tagging
+    "semantic_roles.json":         "2.7_semanticroles",
+    # Stage 2.8 — Action Clustering
+    "action_clusters.json":        "2.8_clusters",
+    # Stage 2.9 — Invariant Detection
+    "rule_catalog.json":           "2.9_invariants",
     # Stage 3 — Vector Embeddings
     "chromadb":                    "3_embed",
     "chunks_manifest.json":        "3_embed",
-    # Stage 3.5 — Preflight
-    "preflight_report.json":       "3.5_preflight",
+    # Stage 3.5 — Entity Extraction
+    "entity_catalog.json":         "3.5_entities",
+    # Stage 3.6 — Entity Relationship Reconstruction
+    "relationship_catalog.json":   "3.6_relationships",
+    # Stage 3.7 — State Machine Reconstruction
+    "state_machine_catalog.json":  "3.7_statemachines",
+    # Stage 3.8 — Graph-Aware Context Index (enriched by 3.5/3.6/3.7)
+    "graph_context_index.json":    "3.8_graphrag",
+    # Stage 3.9 — Pre-LLM Preflight Gate
+    "preflight_report.json":       "3.9_preflight",
     # Stage 4 — Domain Model
     "domain_model.json":           "4_domain",
     "coverage_report.json":        "4_domain",
     # Stage 4.5 — Business Flows
     "business_flows.json":         "4.5_flows",
     "flow_coverage.json":          "4.5_flows",
+    "feature_stubs.feature":       "4.5_flows",
+    # Stage 4.6 — Specification Mining
+    "spec_rules.json":             "4.6_specrules",
     # Stage 4.7 — Behavioral Validation
     "flow_validation.json":        "4.7_validation",
     "flow_validation.md":          "4.7_validation",
+    # Stage 4.8 — Evidence Triangulation
+    "evidence_triangulation.json": "4.8_triangulate",
     # Stage 5 — BA Documents (Markdown)
     "brd.md":                      "5_documents",
     "srs.md":                      "5_documents",
     "ac.md":                       "5_documents",
     "user_stories.md":             "5_documents",
+    # Stage 5.5 — Automated Traceability Matrix
+    "traceability_matrix.json":    "5.5_traceability",
+    "traceability_report.md":      "5.5_traceability",
+    # Stage 5.9 — Document Coverage Audit
+    "doc_coverage.json":           "5.9_doccoverage",
+    "doc_coverage_summary.md":     "5.9_doccoverage",
     # Stage 6 — QA Review
     "qa_report.md":                "6_qa",
     "qa_result.json":              "6_qa",
@@ -373,38 +877,65 @@ class PipelineContext:
     created_at:       str = field(default_factory=lambda: datetime.utcnow().isoformat())
 
     stages: dict[str, StageResult] = field(default_factory=lambda: {
-        "stage0_validate":      StageResult(),
-        "stage1_parse":         StageResult(),
-        "stage15_paths":        StageResult(),
-        "stage2_graph":         StageResult(),
-        "stage25_behavior":     StageResult(),   # behavior graph extraction
-        "stage3_embed":         StageResult(),
-        "stage35_preflight":    StageResult(),
-        "stage4_domain":        StageResult(),
-        "stage45_flows":        StageResult(),
-        "stage47_validate":     StageResult(),   # behavioral flow validation
-        "stage5_brd":           StageResult(),
-        "stage5_srs":           StageResult(),
-        "stage5_ac":            StageResult(),
-        "stage5_userstories":   StageResult(),
-        "stage6_qa":            StageResult(),
-        "stage62_architecture": StageResult(),  # architecture reconstruction (LLM)
-        "stage65_postprocess":  StageResult(),
-        "stage67_diagrams":     StageResult(),
-        "stage7_pdf":           StageResult(),
-        "stage8_tests":         StageResult(),  # test case generator
-        "stage9_knowledge_graph": StageResult(),  # system knowledge graph builder
+        "stage00_validate":       StageResult(),
+        "stage05_detect":         StageResult(),  # language + framework auto-detection (NEW)
+        "stage10_parse":          StageResult(),
+        "stage13_entrypoints":    StageResult(),  # system entry-point catalog (static)
+        "stage15_paths":          StageResult(),
+        "stage20_graph":          StageResult(),
+        "stage22_components":     StageResult(),  # frontend component graph (Vue/React) — NEW
+        "stage25_behavior":       StageResult(),  # behavior graph extraction
+        "stage27_semanticroles":  StageResult(),  # semantic role tagging (static)
+        "stage28_clusters":       StageResult(),  # action clustering (similarity)
+        "stage29_invariants":     StageResult(),  # business rule / invariant detection
+        "stage30_embed":          StageResult(),
+        "stage35_entities":       StageResult(),  # entity extraction (static)
+        "stage36_relationships":  StageResult(),  # entity relationship reconstruction (static)
+        "stage37_statemachines":  StageResult(),  # state machine reconstruction (static)
+        "stage38_graphrag":       StageResult(),  # graph-aware context index (enriched by 3.5/3.6/3.7)
+        "stage39_preflight":      StageResult(),  # pre-LLM gate
+        "stage40_domain":         StageResult(),
+        "stage45_flows":          StageResult(),
+        "stage46_specrules":      StageResult(),  # specification mining (business rule synthesis)
+        "stage47_validate":       StageResult(),  # behavioral flow validation
+        "stage48_triangulate":    StageResult(),  # evidence triangulation (static)
+        "stage50_brd":            StageResult(),
+        "stage50_srs":            StageResult(),
+        "stage50_ac":             StageResult(),
+        "stage50_userstories":    StageResult(),
+        "stage55_traceability":   StageResult(),  # automated traceability matrix (static)
+        "stage58_doccoverage":    StageResult(),  # document coverage audit (static)
+        "stage59_accuracy_report": StageResult(), # BA document accuracy report (static)
+        "stage60_qa":             StageResult(),
+        "stage62_architecture":   StageResult(),  # architecture reconstruction (LLM)
+        "stage65_postprocess":    StageResult(),
+        "stage67_diagrams":       StageResult(),
+        "stage70_pdf":            StageResult(),
+        "stage80_tests":          StageResult(),  # test case generator
+        "stage90_knowledge_graph": StageResult(),  # system knowledge graph builder
     })
 
-    code_map:          Optional[CodeMap]                = None
-    graph_meta:        Optional[GraphMeta]              = None
+    code_map:              Optional[CodeMap]             = None
+    entry_point_catalog:   Optional[EntryPointCatalog]  = None  # Stage 1.3
+    graph_meta:            Optional[GraphMeta]           = None
     behavior_graph:    Optional[dict]                   = None   # Stage 2.5
+    semantic_roles:    Optional[SemanticRoleIndex]       = None  # Stage 2.7
+    action_clusters:   Optional[ActionClusterCollection] = None  # Stage 2.8
+    invariants:        Optional[InvariantCollection]      = None  # Stage 2.9
+    entities:          Optional[EntityCollection]          = None  # Stage 3.5
+    relationships:     Optional[EntityRelationshipCollection] = None  # Stage 3.6
+    state_machines:    Optional[StateMachineCollection]   = None  # Stage 3.7
+    spec_rules:        Optional[SpecRuleCollection]        = None  # Stage 4.6
+    triangulation:     Optional[TriangulationReport]       = None  # Stage 4.8
     embedding_meta:    Optional[EmbeddingMeta]          = None
     preflight:         Optional[PreflightResult]        = None
+    graph_rag_meta:    Optional[GraphRAGMeta]           = None  # Stage 3.8
     domain_model:      Optional[DomainModel]            = None
     business_flows:    Optional[BusinessFlowCollection] = None
     flow_validation:   Optional[dict]                   = None   # Stage 4.7
     ba_artifacts:      Optional[BAArtifacts]            = None
+    traceability_meta: Optional[TraceabilityMeta]        = None  # Stage 5.5
+    doc_coverage:      Optional[DocCoverageResult]      = None  # Stage 5.9
     qa_result:         Optional[QAResult]               = None
     architecture_meta: Optional[ArchitectureMeta]       = None  # Stage 6.2
     test_suite:            Optional[TestSuiteArtifacts]     = None  # Stage 8
@@ -423,6 +954,11 @@ class PipelineContext:
         )
         ctx.save()
         return ctx
+
+    @property
+    def project_path(self) -> str:
+        """Language-neutral alias for php_project_path."""
+        return self.php_project_path
 
     @property
     def context_file(self) -> str:
@@ -448,6 +984,25 @@ class PipelineContext:
 
     def is_stage_done(self, name: str) -> bool:
         return self.stage(name).status == StageStatus.COMPLETED
+
+    def graph_query(self, topic: str, depth: int = 2, max_chars: int = 3000) -> str:
+        """
+        Graph-aware context retrieval using the Stage 3.8 index.
+
+        Returns a structured Markdown context block suitable for LLM prompt
+        injection.  Empty string if the index was not built or the topic has no
+        matching nodes.
+
+        The index JSON is loaded lazily on the first call and cached on a
+        transient ``_graph_rag_cache`` attribute (not serialised to context.json).
+        """
+        if not self.graph_rag_meta or not self.graph_rag_meta.index_path:
+            return ""
+        # Late import to avoid circular dependency (stage37 imports from context).
+        from pipeline.stage38_graphrag import load_index, query_graph  # noqa: PLC0415
+        if not hasattr(self, "_graph_rag_cache"):
+            self._graph_rag_cache = load_index(self.graph_rag_meta.index_path)
+        return query_graph(self._graph_rag_cache, topic, depth=depth, max_chars=max_chars)
 
     def output_path(self, filename: str) -> str:
         stage_subdir = _STAGE_SUBDIRS.get(filename)
@@ -493,9 +1048,22 @@ class PipelineContext:
         # ── optional rich objects ─────────────────────────────────────────────
         if data.get("code_map") is not None:
             d = data["code_map"]
+            # Resolve Language enum (new field; default UNKNOWN for old runs)
+            _lang_raw = d.get("language", Language.UNKNOWN.value)
+            try:
+                _lang = Language(_lang_raw)
+            except ValueError:
+                _lang = Language.UNKNOWN
+            # If old run had no language but had php_version, treat as PHP
+            if _lang == Language.UNKNOWN and (d.get("php_version") or d.get("includes")):
+                _lang = Language.PHP
+
             ctx.code_map = CodeMap(
+                # Language identity (new)
+                language         = _lang,
+                language_version = d.get("language_version") or d.get("php_version"),
+                # Core fields
                 framework       = Framework(d.get("framework", Framework.UNKNOWN.value)),
-                php_version     = d.get("php_version"),
                 classes         = d.get("classes", []),
                 routes          = d.get("routes", []),
                 models          = d.get("models", []),
@@ -505,12 +1073,10 @@ class PipelineContext:
                 config_files    = d.get("config_files", []),
                 total_files     = d.get("total_files", 0),
                 total_lines     = d.get("total_lines", 0),
-                html_pages      = d.get("html_pages", []),
+                # Language-neutral extended fields
                 functions       = d.get("functions", []),
-                includes        = d.get("includes", []),
+                imports         = d.get("imports", d.get("includes", [])),  # new name, fallback old
                 sql_queries     = d.get("sql_queries", []),
-                redirects       = d.get("redirects", []),
-                superglobals    = d.get("superglobals", []),
                 call_graph      = d.get("call_graph", []),
                 form_fields     = d.get("form_fields", []),
                 service_deps    = d.get("service_deps", []),
@@ -520,6 +1086,14 @@ class PipelineContext:
                 table_columns   = d.get("table_columns", []),
                 globals         = d.get("globals", []),
                 execution_paths = d.get("execution_paths", []),
+                components      = d.get("components", []),   # new
+                input_params    = d.get("input_params", d.get("superglobals", [])),  # new name, fallback old
+                # PHP-specific compat fields
+                php_version     = d.get("php_version"),
+                html_pages      = d.get("html_pages", []),
+                includes        = d.get("includes", []),
+                redirects       = d.get("redirects", []),
+                superglobals    = d.get("superglobals", []),
             )
 
         if data.get("graph_meta") is not None:
@@ -588,6 +1162,7 @@ class PipelineContext:
                     termination       = f.get("termination", ""),
                     evidence_files    = f.get("evidence_files", []),
                     confidence        = f.get("confidence", 1.0),
+                    flow_type         = f.get("flow_type", "http"),
                     replaces_workflow = f.get("replaces_workflow"),
                 )
                 for f in d.get("flows", [])
@@ -600,6 +1175,26 @@ class PipelineContext:
                 generated_at = d.get("generated_at", ""),
             )
 
+        if data.get("entry_point_catalog") is not None:
+            d = data["entry_point_catalog"]
+            ctx.entry_point_catalog = EntryPointCatalog(
+                entry_points = [
+                    EntryPoint(
+                        ep_id        = ep.get("ep_id", ""),
+                        ep_type      = ep.get("ep_type", "http"),
+                        handler_file = ep.get("handler_file", ""),
+                        name         = ep.get("name", ""),
+                        schedule     = ep.get("schedule", ""),
+                        trigger      = ep.get("trigger", ""),
+                        confidence   = ep.get("confidence", 0.8),
+                    )
+                    for ep in d.get("entry_points", [])
+                ],
+                by_type      = d.get("by_type", {}),
+                total        = d.get("total", 0),
+                generated_at = d.get("generated_at", ""),
+            )
+
         if data.get("ba_artifacts") is not None:
             d = data["ba_artifacts"]
             ctx.ba_artifacts = BAArtifacts(
@@ -607,6 +1202,16 @@ class PipelineContext:
                 srs_path          = d.get("srs_path"),
                 ac_path           = d.get("ac_path"),
                 user_stories_path = d.get("user_stories_path"),
+            )
+
+        if data.get("doc_coverage") is not None:
+            d = data["doc_coverage"]
+            ctx.doc_coverage = DocCoverageResult(
+                dimensions      = d.get("dimensions", []),
+                overall_pct     = d.get("overall_pct", 0.0),
+                overall_status  = d.get("overall_status", "fail"),
+                gap_summary     = d.get("gap_summary", []),
+                generated_at    = d.get("generated_at", ""),
             )
 
         if data.get("qa_result") is not None:
@@ -638,6 +1243,214 @@ class PipelineContext:
                 scenario_count  = d.get("scenario_count", 0),
             )
 
+        if data.get("invariants") is not None:
+            d = data["invariants"]
+            rules = [
+                BusinessRule(
+                    rule_id         = r["rule_id"],
+                    category        = r["category"],
+                    description     = r["description"],
+                    raw_expression  = r["raw_expression"],
+                    entity          = r["entity"],
+                    bounded_context = r.get("bounded_context", ""),
+                    source_files    = r.get("source_files", []),
+                    confidence      = r.get("confidence", 0.8),
+                    tables          = r.get("tables", []),
+                )
+                for r in d.get("rules", [])
+            ]
+            ctx.invariants = InvariantCollection(
+                rules        = rules,
+                total        = d.get("total", len(rules)),
+                by_category  = d.get("by_category", {}),
+                by_context   = d.get("by_context", {}),
+                generated_at = d.get("generated_at", ""),
+            )
+
+        if data.get("semantic_roles") is not None:
+            d = data["semantic_roles"]
+            actions = [
+                ActionTag(
+                    symbol      = a["symbol"],
+                    file        = a["file"],
+                    role        = a["role"],
+                    confidence  = a.get("confidence", 0.0),
+                    signals     = a.get("signals", []),
+                    actor       = a.get("actor", ""),
+                    entities    = a.get("entities", []),
+                    http_method = a.get("http_method", ""),
+                    route_path  = a.get("route_path", ""),
+                )
+                for a in d.get("actions", [])
+            ]
+            ext_systems = [
+                ExternalSystem(
+                    name         = e["name"],
+                    category     = e["category"],
+                    env_keys     = e.get("env_keys", []),
+                    class_hints  = e.get("class_hints", []),
+                    dep_hints    = e.get("dep_hints", []),
+                    detected_via = e.get("detected_via", []),
+                )
+                for e in d.get("external_systems", [])
+            ]
+            ctx.semantic_roles = SemanticRoleIndex(
+                actions          = actions,
+                external_systems = ext_systems,
+                role_summary     = d.get("role_summary", {}),
+                infra_files      = d.get("infra_files", []),
+                business_files   = d.get("business_files", []),
+                generated_at     = d.get("generated_at", ""),
+            )
+
+        if data.get("action_clusters") is not None:
+            d = data["action_clusters"]
+            clusters = [
+                ActionCluster(
+                    cluster_id   = c["cluster_id"],
+                    name         = c["name"],
+                    files        = c.get("files", []),
+                    tables       = c.get("tables", []),
+                    route_prefix = c.get("route_prefix", ""),
+                    module       = c.get("module", ""),
+                    file_count   = c.get("file_count", 0),
+                )
+                for c in d.get("clusters", [])
+            ]
+            ctx.action_clusters = ActionClusterCollection(
+                clusters     = clusters,
+                total        = d.get("total", len(clusters)),
+                generated_at = d.get("generated_at", ""),
+            )
+
+        if data.get("entities") is not None:
+            d = data["entities"]
+            ents = [
+                Entity(
+                    entity_id       = e["entity_id"],
+                    name            = e["name"],
+                    table           = e["table"],
+                    bounded_context = e.get("bounded_context", ""),
+                    columns         = [
+                        EntityColumn(
+                            name              = c["name"],
+                            data_type         = c.get("data_type", ""),
+                            nullable          = c.get("nullable", True),
+                            is_primary_key    = c.get("is_primary_key", False),
+                            is_foreign_key    = c.get("is_foreign_key", False),
+                            references_table  = c.get("references_table", ""),
+                            references_column = c.get("references_column", ""),
+                        )
+                        for c in e.get("columns", [])
+                    ],
+                    primary_key     = e.get("primary_key", ""),
+                    is_pivot        = e.get("is_pivot", False),
+                    is_core         = e.get("is_core", True),
+                    is_system       = e.get("is_system", False),
+                    source_files    = e.get("source_files", []),
+                    confidence      = e.get("confidence", 1.0),
+                )
+                for e in d.get("entities", [])
+            ]
+            ctx.entities = EntityCollection(
+                entities     = ents,
+                total        = d.get("total", len(ents)),
+                core_count   = d.get("core_count", 0),
+                generated_at = d.get("generated_at", ""),
+            )
+
+        if data.get("relationships") is not None:
+            d = data["relationships"]
+            rels = [
+                EntityRelationship(
+                    rel_id       = r["rel_id"],
+                    from_entity  = r["from_entity"],
+                    to_entity    = r["to_entity"],
+                    cardinality  = r.get("cardinality", "1:N"),
+                    rel_type     = r.get("rel_type", "has_many"),
+                    via_column   = r.get("via_column", ""),
+                    via_table    = r.get("via_table", ""),
+                    confidence   = r.get("confidence", 0.75),
+                    signals      = r.get("signals", []),
+                    source_files = r.get("source_files", []),
+                )
+                for r in d.get("relationships", [])
+            ]
+            ctx.relationships = EntityRelationshipCollection(
+                relationships = rels,
+                entity_names  = d.get("entity_names", []),
+                total         = d.get("total", len(rels)),
+                mermaid_path  = d.get("mermaid_path", ""),
+                generated_at  = d.get("generated_at", ""),
+            )
+
+        if data.get("state_machines") is not None:
+            d = data["state_machines"]
+            machines = [
+                StateMachine(
+                    machine_id      = m["machine_id"],
+                    entity          = m["entity"],
+                    table           = m["table"],
+                    field           = m["field"],
+                    bounded_context = m.get("bounded_context", ""),
+                    states          = m.get("states", []),
+                    initial_states  = m.get("initial_states", []),
+                    terminal_states = m.get("terminal_states", []),
+                    dead_states     = m.get("dead_states", []),
+                    transitions     = [
+                        StateTransition(
+                            from_state   = t["from_state"],
+                            to_state     = t["to_state"],
+                            trigger      = t.get("trigger", ""),
+                            guard        = t.get("guard", ""),
+                            source_files = t.get("source_files", []),
+                            confidence   = t.get("confidence", 0.75),
+                        )
+                        for t in m.get("transitions", [])
+                    ],
+                    mermaid         = m.get("mermaid", ""),
+                )
+                for m in d.get("machines", [])
+            ]
+            ctx.state_machines = StateMachineCollection(
+                machines     = machines,
+                total        = d.get("total", len(machines)),
+                generated_at = d.get("generated_at", ""),
+            )
+
+        if data.get("spec_rules") is not None:
+            d = data["spec_rules"]
+            srules = [
+                SpecRule(
+                    rule_id           = r["rule_id"],
+                    category          = r["category"],
+                    title             = r.get("title", ""),
+                    description       = r.get("description", ""),
+                    given             = r.get("given", ""),
+                    when              = r.get("when", ""),
+                    then              = r.get("then", ""),
+                    entities          = r.get("entities", []),
+                    bounded_context   = r.get("bounded_context", ""),
+                    source_invariants = r.get("source_invariants", []),
+                    source_machines   = r.get("source_machines", []),
+                    source_flows      = r.get("source_flows", []),
+                    source_files      = r.get("source_files", []),
+                    confidence        = r.get("confidence", 0.75),
+                    tags              = r.get("tags", []),
+                    pass_origin       = r.get("pass_origin", ""),
+                )
+                for r in d.get("rules", [])
+            ]
+            ctx.spec_rules = SpecRuleCollection(
+                rules        = srules,
+                total        = d.get("total", len(srules)),
+                by_category  = d.get("by_category", {}),
+                by_entity    = d.get("by_entity", {}),
+                by_flow      = d.get("by_flow", {}),
+                by_context   = d.get("by_context", {}),
+                generated_at = d.get("generated_at", ""),
+            )
+
         if data.get("knowledge_graph_meta") is not None:
             d = data["knowledge_graph_meta"]
             ctx.knowledge_graph_meta = KnowledgeGraphMeta(
@@ -646,6 +1459,60 @@ class PipelineContext:
                 edge_count       = d.get("edge_count", 0),
                 node_types       = d.get("node_types", []),
                 edge_type_counts = d.get("edge_type_counts", {}),
+            )
+
+        if data.get("graph_rag_meta") is not None:
+            d = data["graph_rag_meta"]
+            ctx.graph_rag_meta = GraphRAGMeta(
+                index_path    = d.get("index_path", ""),
+                file_count    = d.get("file_count", 0),
+                entity_count  = d.get("entity_count", 0),
+                cluster_count = d.get("cluster_count", 0),
+                generated_at  = d.get("generated_at", ""),
+            )
+
+        if data.get("triangulation") is not None:
+            d = data["triangulation"]
+            trules = [
+                TriangulatedRule(
+                    rule_id              = r["rule_id"],
+                    title                = r.get("title", ""),
+                    category             = r.get("category", ""),
+                    corroborating_types  = r.get("corroborating_types", []),
+                    contradicting_types  = r.get("contradicting_types", []),
+                    triangulation_score  = r.get("triangulation_score", 0.0),
+                    triangulation_status = r.get("triangulation_status", "WEAK"),
+                    max_applicable       = r.get("max_applicable", 4),
+                    contradiction_notes  = r.get("contradiction_notes", []),
+                )
+                for r in d.get("rules", [])
+            ]
+            ctx.triangulation = TriangulationReport(
+                rules               = trules,
+                total               = d.get("total", len(trules)),
+                strong_count        = d.get("strong_count", 0),
+                moderate_count      = d.get("moderate_count", 0),
+                weak_count          = d.get("weak_count", 0),
+                contradiction_count = d.get("contradiction_count", 0),
+                weak_rule_ids       = d.get("weak_rule_ids", []),
+                contradiction_ids   = d.get("contradiction_ids", []),
+                generated_at        = d.get("generated_at", ""),
+            )
+
+        if data.get("traceability_meta") is not None:
+            d = data["traceability_meta"]
+            ctx.traceability_meta = TraceabilityMeta(
+                matrix_path        = d.get("matrix_path", ""),
+                report_path        = d.get("report_path", ""),
+                total_requirements = d.get("total_requirements", 0),
+                covered_brd        = d.get("covered_brd", 0.0),
+                covered_srs        = d.get("covered_srs", 0.0),
+                covered_ac         = d.get("covered_ac", 0.0),
+                covered_us         = d.get("covered_us", 0.0),
+                avg_code_links     = d.get("avg_code_links", 0.0),
+                uncited_count      = d.get("uncited_count", 0),
+                uncited_ids        = d.get("uncited_ids", []),
+                generated_at       = d.get("generated_at", ""),
             )
 
         return ctx

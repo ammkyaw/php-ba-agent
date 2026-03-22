@@ -62,6 +62,7 @@ use PhpParser\NodeVisitorAbstract;
 use PhpParser\ParserFactory;
 use PhpParser\PhpVersion;
 use PhpParser\Comment\Doc;
+use PhpParser\PrettyPrinter;
 
 // ─── CLI Arguments ────────────────────────────────────────────────────────────
 
@@ -631,6 +632,15 @@ class ProjectVisitor extends NodeVisitorAbstract
             $handler = $this->extractRouteHandler($node->args);
 
             if ($path !== null || $handler !== null) {
+                // Reject non-HTTP strings: DI container keys ('beanAliases'),
+                // config dotted keys ('external_cache.memcache.host'),
+                // date offsets ('-1 day'), etc.
+                // Only record when the path is dynamic OR starts with '/' or '{'.
+                if ($path !== null
+                        && !str_starts_with($path, '/')
+                        && !str_starts_with($path, '{')) {
+                    return;
+                }
                 $this->routes[] = array_merge($this->currentGroupContext(), [
                     'method'  => strtoupper($methodName),
                     'path'    => $path ?? '(dynamic)',
@@ -1028,6 +1038,16 @@ class ProceduralVisitor extends NodeVisitorAbstract
     public array $sqlQueries = [];
     public array $redirects  = [];
     public array $includes   = [];
+
+    /**
+     * Condition stack: each entry is ['cond' => string, 'branch' => 'if'|'elseif'|'else'].
+     * Pushed/popped as we enter/leave If_ nodes so that redirect calls can record
+     * which branch condition triggered them — feeds V-04 branch accuracy.
+     */
+    private array $conditionStack = [];
+
+    /** Lazily-initialised pretty-printer for converting condition AST nodes to text. */
+    private static ?PrettyPrinter\Standard $printer = null;
     public array $globals    = [];
     public array $envVars    = [];   // getenv / $_ENV / env() usages
     public bool  $isHtmlPage = false;
@@ -1081,6 +1101,27 @@ class ProceduralVisitor extends NodeVisitorAbstract
 
     public function enterNode(Node $node): ?int
     {
+        // ── Condition stack: track if/elseif/else branches for redirect context ─
+        if ($node instanceof Node\Stmt\If_) {
+            $this->conditionStack[] = [
+                'cond'   => $this->printExpr($node->cond),
+                'branch' => 'if',
+            ];
+        } elseif ($node instanceof Node\Stmt\ElseIf_) {
+            // Update the top entry — we're now in an elseif branch of the same if
+            if (!empty($this->conditionStack)) {
+                $this->conditionStack[count($this->conditionStack) - 1] = [
+                    'cond'   => $this->printExpr($node->cond),
+                    'branch' => 'elseif',
+                ];
+            }
+        } elseif ($node instanceof Node\Stmt\Else_) {
+            // Keep the parent condition text; just update the branch label
+            if (!empty($this->conditionStack)) {
+                $this->conditionStack[count($this->conditionStack) - 1]['branch'] = 'else';
+            }
+        }
+
         // Track current function scope
         if ($node instanceof Node\Stmt\Function_) {
             $this->handleFunctionDef($node);
@@ -1129,6 +1170,9 @@ class ProceduralVisitor extends NodeVisitorAbstract
     {
         if ($node instanceof Node\Stmt\Function_) {
             $this->currentFunction = null;
+        }
+        if ($node instanceof Node\Stmt\If_) {
+            array_pop($this->conditionStack);
         }
     }
 
@@ -1266,12 +1310,27 @@ class ProceduralVisitor extends NodeVisitorAbstract
 
         $target = trim(preg_replace('/^location:\s*/i', '', $headerVal));
 
+        // Capture enclosing if/else condition so downstream stages can build
+        // accurate branch descriptions (feeds V-04 missing-branch detection).
+        $condEntry = !empty($this->conditionStack) ? end($this->conditionStack) : null;
+
         $this->redirects[] = [
-            'target' => $target,
-            'caller' => $caller,
-            'file'   => $this->currentFile,
-            'line'   => $node->getStartLine(),
+            'target'    => $target,
+            'caller'    => $caller,
+            'file'      => $this->currentFile,
+            'line'      => $node->getStartLine(),
+            'condition' => $condEntry ? $condEntry['cond']   : '',
+            'branch'    => $condEntry ? $condEntry['branch'] : '',
         ];
+    }
+
+    /** Convert a condition expression node to a readable string (max 120 chars). */
+    private function printExpr(Node\Expr $expr): string
+    {
+        if (self::$printer === null) {
+            self::$printer = new PrettyPrinter\Standard();
+        }
+        return substr(self::$printer->prettyPrintExpr($expr), 0, 120);
     }
 
     // ── Procedural SQL ───────────────────────────────────────────────────────

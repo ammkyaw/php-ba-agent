@@ -1,5 +1,5 @@
 """
-pipeline/stage9_knowledge_graph.py — System Knowledge Graph Builder (Stage 9)
+pipeline/stage90_knowledge_graph.py — System Knowledge Graph Builder (Stage 9)
 
 Produces a *business-level* knowledge graph that connects domain concepts
 across all prior pipeline outputs into a single navigable JSON structure.
@@ -49,12 +49,12 @@ Sources required
 
 Resume behaviour
 ----------------
-If stage9_knowledge_graph is COMPLETED and knowledge_graph.json exists, the
+If stage90_knowledge_graph is COMPLETED and knowledge_graph.json exists, the
 stage is skipped and ctx.knowledge_graph_meta is restored from the file header.
 
 Placement in the pipeline
 -------------------------
-  … stage8_tests → stage9_knowledge_graph
+  … stage80_tests → stage90_knowledge_graph
 
 Stage 9 runs last — it consumes *all* prior structured outputs to produce a
 complete cross-domain graph.  It does not feed back into any earlier stage.
@@ -72,7 +72,7 @@ from context import KnowledgeGraphMeta, PipelineContext
 
 # ── Constants ──────────────────────────────────────────────────────────────────
 
-STAGE_NAME   = "stage9_knowledge_graph"
+STAGE_NAME   = "stage90_knowledge_graph"
 OUTPUT_FILE  = "knowledge_graph.json"
 
 # SQL operation keywords → edge type

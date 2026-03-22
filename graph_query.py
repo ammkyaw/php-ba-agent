@@ -117,7 +117,7 @@ class GraphQueryEngine:
         """
         ctx = PipelineContext.load(context_file)
 
-        if not ctx.is_stage_done("stage9_knowledge_graph"):
+        if not ctx.is_stage_done("stage90_knowledge_graph"):
             raise RuntimeError(
                 "Stage 9 (knowledge graph) has not been completed.\n"
                 f"Run: python run_stage9.py --resume {context_file}"

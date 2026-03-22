@@ -19,7 +19,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from context import CodeMap, Framework, PipelineContext
-from pipeline.stage1_parse import (
+from pipeline.stage10_parse import (
     _build_code_map,
     _detect_project_php_version,
     _run_parser,
@@ -222,7 +222,7 @@ class TestDetectProjectPhpVersion:
 
     def test_falls_back_to_default(self, tmp_path):
         # No hints, PHP binary also unavailable in mock
-        with patch("pipeline.stage1_parse.PHP_BIN", "nonexistent_php_binary_xyz"):
+        with patch("pipeline.stage10_parse.PHP_BIN", "nonexistent_php_binary_xyz"):
             version = _detect_project_php_version(str(tmp_path))
         assert version == "8.1"
 
@@ -245,33 +245,33 @@ class TestRunParser:
 
     def test_returns_stdout_on_success(self):
         payload = json.dumps(MINIMAL_PAYLOAD)
-        with patch("pipeline.stage1_parse.subprocess.run",
+        with patch("pipeline.stage10_parse.subprocess.run",
                    return_value=self._make_proc(payload)):
             result = _run_parser("/fake/project", "8.1")
         assert result == payload
 
     def test_raises_on_nonzero_exit(self):
-        with patch("pipeline.stage1_parse.subprocess.run",
+        with patch("pipeline.stage10_parse.subprocess.run",
                    return_value=self._make_proc("", returncode=1, stderr="Fatal error")):
             with pytest.raises(RuntimeError, match="exited with code 1"):
                 _run_parser("/fake/project", "8.1")
 
     def test_raises_on_timeout(self):
         import subprocess as sp
-        with patch("pipeline.stage1_parse.subprocess.run",
+        with patch("pipeline.stage10_parse.subprocess.run",
                    side_effect=sp.TimeoutExpired(cmd="php", timeout=300)):
             with pytest.raises(RuntimeError, match="timed out"):
                 _run_parser("/fake/project", "8.1")
 
     def test_raises_on_missing_binary(self):
-        with patch("pipeline.stage1_parse.subprocess.run",
+        with patch("pipeline.stage10_parse.subprocess.run",
                    side_effect=FileNotFoundError()):
             with pytest.raises(RuntimeError, match="Could not execute"):
                 _run_parser("/fake/project", "8.1")
 
     def test_stderr_warning_does_not_raise(self, capsys):
         payload = json.dumps(MINIMAL_PAYLOAD)
-        with patch("pipeline.stage1_parse.subprocess.run",
+        with patch("pipeline.stage10_parse.subprocess.run",
                    return_value=self._make_proc(payload, stderr="PHP Notice: something")):
             result = _run_parser("/fake/project", "8.1")
         assert result == payload
@@ -299,7 +299,7 @@ class TestStage1Integration:
             pytest.skip("PHPBA_TEST_PROJECT not set")
 
         ctx = PipelineContext.create(php_project_path=project, output_base=str(tmp_path))
-        from pipeline.stage1_parse import run
+        from pipeline.stage10_parse import run
         run(ctx)
 
         assert ctx.code_map is not None

@@ -1,5 +1,5 @@
 """
-pipeline/stage4_domain.py — Domain Analyst Agent
+pipeline/stage40_domain.py — Domain Analyst Agent
 
 Uses the Claude API (claude-sonnet-4-20250514) to analyse the embedded
 codebase and produce a structured DomainModel that all Stage 5 agents
@@ -42,7 +42,7 @@ Uses ctx.preflight.quality_score to adjust Claude's instruction tone:
 
 Resume behaviour
 ----------------
-If stage4_domain is COMPLETED and domain_model.json exists, the stage
+If stage40_domain is COMPLETED and domain_model.json exists, the stage
 is skipped and ctx.domain_model is restored from the saved file.
 """
 
@@ -69,8 +69,11 @@ COVERAGE_FILE    = "coverage_report.json"
 GAP_FILL_MAX_MODULES = 30
 # Gap-fill: max individual files per call (fallback when no module structure)
 GAP_FILL_MAX_PAGES = 100
-# Gap-fill: maximum number of loop rounds
-MAX_GAP_ROUNDS = 20
+# Gap-fill: maximum number of loop rounds.
+# Override with STAGE4_MAX_GAP_ROUNDS=N (e.g. 5 for speed, 20 for thoroughness).
+# Set STAGE4_SKIP_GAP_FILL=1 to bypass all D-calls (fastest, lower page coverage).
+MAX_GAP_ROUNDS = int(os.environ.get("STAGE4_MAX_GAP_ROUNDS", "20") or "20")
+_SKIP_GAP_FILL = os.environ.get("STAGE4_SKIP_GAP_FILL", "0").strip() == "1"
 
 # Retrieval: queries × top-k chunks each
 RETRIEVAL_QUERIES = [
@@ -81,9 +84,25 @@ RETRIEVAL_QUERIES = [
     ("navigation flow redirect pages include session check",          "nav"),
     ("core functions business logic processing validation",           "logic"),
 ]
-TOP_K_PER_QUERY  = 5
-MAX_TOTAL_CHUNKS = 15     # hard cap on chunks sent to Claude
-MAX_CONTEXT_CHARS = 5000  # soft cap on total context character length
+TOP_K_PER_QUERY   = 5
+MAX_TOTAL_CHUNKS  = 25    # hard cap on chunks sent to the LLM
+MAX_CONTEXT_CHARS = 20_000  # soft cap on total context character length
+
+# ── Per-section caps inside _build_user_prompt ────────────────────────────────
+# Large codebases (SuiteCRM, etc.) produce thousands of entries per section.
+# These caps keep the prompt within a manageable token budget while still
+# giving the LLM enough signal to identify patterns.
+# Override any cap with env vars (set to 0 to disable a section entirely).
+_CAP_EXEC_PATHS    = int(os.environ.get("STAGE4_CAP_EXEC_PATHS",    "40")  or "40")
+_CAP_HTTP_EPS      = int(os.environ.get("STAGE4_CAP_HTTP_EPS",      "80")  or "80")
+_CAP_TABLE_COLS    = int(os.environ.get("STAGE4_CAP_TABLE_COLS",     "60")  or "60")
+_CAP_DB_TABLES     = int(os.environ.get("STAGE4_CAP_DB_TABLES",      "60")  or "60")
+_CAP_FUNCTIONS     = int(os.environ.get("STAGE4_CAP_FUNCTIONS",      "80")  or "80")
+_CAP_CALL_GRAPH    = int(os.environ.get("STAGE4_CAP_CALL_GRAPH",     "40")  or "40")
+_CAP_FORM_FILES    = int(os.environ.get("STAGE4_CAP_FORM_FILES",     "60")  or "60")
+_CAP_REDIRECTS     = int(os.environ.get("STAGE4_CAP_REDIRECTS",      "60")  or "60")
+_CAP_AUTH_SIGNALS  = int(os.environ.get("STAGE4_CAP_AUTH_SIGNALS",   "40")  or "40")
+
 
 
 # ─── Public Entry Point ────────────────────────────────────────────────────────
@@ -102,12 +121,16 @@ def run(ctx: PipelineContext) -> None:
     output_path = ctx.output_path(DOMAIN_FILE)
 
     # ── Resume check ─────────────────────────────────────────────────────────
-    if ctx.is_stage_done("stage4_domain") and Path(output_path).exists():
+    if ctx.is_stage_done("stage40_domain") and Path(output_path).exists():
         ctx.domain_model = _load_domain_model(output_path)
         print(f"  [stage4] Already completed — "
               f"domain='{ctx.domain_model.domain_name}', "
               f"{len(ctx.domain_model.features)} feature(s).")
         return
+
+    # ── Language-aware preamble ───────────────────────────────────────────────
+    global _ACTIVE_PREAMBLE
+    _ACTIVE_PREAMBLE = _build_system_preamble(ctx)
 
     # ── Pre-flight ────────────────────────────────────────────────────────────
     _assert_prerequisites(ctx)
@@ -122,6 +145,34 @@ def run(ctx: PipelineContext) -> None:
     # ── Build shared user prompt (same evidence for all 3 calls) ─────────────
     quality_score = _get_quality_score(ctx)
     user_prompt   = _build_user_prompt(ctx, chunks)
+    print(f"  [stage4] User prompt assembled: {len(user_prompt):,} chars "
+          f"(~{len(user_prompt) // 4:,} tokens)")
+
+    # ── RAG augmentation ──────────────────────────────────────────────────────
+    # When RAG_ENABLED=1, build an FTS5 code chunk index and append the most
+    # relevant snippets to the user prompt.  Particularly useful for large
+    # codebases where the main prompt is already near the context window limit.
+    from pipeline.rag import CodeChunkIndex, is_enabled as _rag_enabled, get_top_k as _rag_top_k
+    if _rag_enabled():
+        _rag_idx = CodeChunkIndex(str(Path(output_path).parent))
+        _rag_idx.build(ctx)
+        _rag_ctx_a = _rag_idx.format_context(
+            "domain entities data models user roles business objects database tables",
+            top_k=_rag_top_k(),
+            header="## RAG: Top relevant code chunks (entities / tables)",
+        )
+        _rag_ctx_b = _rag_idx.format_context(
+            "business features use cases workflows user actions forms authentication",
+            top_k=_rag_top_k(),
+            header="## RAG: Top relevant code chunks (features / workflows)",
+        )
+        _rag_idx.close()
+        if _rag_ctx_a:
+            user_prompt = user_prompt + "\n\n" + _rag_ctx_a
+        print(f"  [stage4] RAG augmentation: +{len(_rag_ctx_a)} chars (entities), "
+              f"+{len(_rag_ctx_b)} chars (features)")
+    else:
+        _rag_ctx_b = ""
 
     from pipeline.llm_client import get_provider, get_model
     print(f"  [stage4] LLM: {get_provider()} / {get_model()} | "
@@ -152,36 +203,70 @@ def run(ctx: PipelineContext) -> None:
     # Grounding list injected into the prompt: exec_paths first (most
     # informative for business logic), then html_pages, then controllers.
     # Capped to keep the prompt token budget manageable.
-    known_pages: list[str] = _build_grounding_pages(cm, cap=300)
+    # STAGE4_PAGES_CAP / STAGE4_TABLES_CAP: reduce for large codebases to avoid
+    # filling the context window with grounding lists before the LLM can output.
+    # SuiteCRM has 300+ pages — injecting all of them leaves almost no output budget.
+    # Recommended: 100-150 for 32K context, 200+ for 64K+ context.
+    _pages_cap  = int(os.environ.get("STAGE4_PAGES_CAP",  "150") or "150")
+    _tables_cap = int(os.environ.get("STAGE4_TABLES_CAP", "40")  or "40")
+    known_pages: list[str] = _build_grounding_pages(cm, cap=_pages_cap)
 
-    # ── Call A: meta + entities + contexts (fast, ~4K tokens) ────────────────
-    print(f"  [stage4] Call 1/3 — domain name, entities, contexts ...")
-    raw_a = _call_part(_system_meta(quality_score), user_prompt,
-                       MAX_TOKENS_META, "stage4-A")
-    data_a = _parse_partial(raw_a, "A", debug_dir)
+    # ── Self-consistency voting ───────────────────────────────────────────────
+    # STAGE4_CONSISTENCY_RUNS=N runs Calls A and B N times independently and
+    # merges results by taking the union of entities/features/contexts.
+    # Default is 1 (off) to preserve speed; set to 3 for higher accuracy.
+    _consistency_runs = max(1, int(os.environ.get("STAGE4_CONSISTENCY_RUNS", "1") or "1"))
 
-    # ── Call B: features (largest field, ~8K tokens) ──────────────────────────
-    print(f"  [stage4] Call 2/3 — features ...")
-    raw_b = _call_part(
-        _system_features(quality_score,
-                         known_tables=known_tables,
-                         known_pages=known_pages,
-                         known_fields=known_fields),
-        user_prompt, MAX_TOKENS_FEATURES, "stage4-B",
+    # ── Multi-model ensemble ──────────────────────────────────────────────────
+    # LLM_ENSEMBLE_MODELS=model1,model2 runs each call once per model and
+    # merges by union.  Combines orthogonal model strengths: one model may
+    # catch entities the other misses.  Works with local (Ollama) models only.
+    _raw_ensemble = os.environ.get("LLM_ENSEMBLE_MODELS", "").strip()
+    _ensemble_models: list[str | None] = (
+        [m.strip() for m in _raw_ensemble.split(",") if m.strip()]
+        if _raw_ensemble else [None]
     )
-    data_b = _parse_partial(raw_b, "B", debug_dir)
+    if len(_ensemble_models) > 1:
+        print(f"  [stage4] Ensemble mode: {len(_ensemble_models)} models")
 
-    # Filter hallucinated page/table names.
-    # Use known_files_all (not just known_pages) so that controller / service
-    # file references are preserved — only truly invented filenames are dropped.
+    # ── Calls A + B + C (sequential — Ollama processes one request at a time) ───
+    _sys_b = _system_features(quality_score,
+                               known_tables=known_tables,
+                               known_pages=known_pages,
+                               known_fields=known_fields,
+                               table_columns=getattr(cm, "table_columns", None) or [])
+    _user_prompt_b = (user_prompt + "\n\n" + _rag_ctx_b) if _rag_ctx_b else user_prompt
+
+    def _make_suffix(mdl_idx: int, run: int, total: int, letter: str) -> str:
+        if total == 1:
+            return letter
+        if len(_ensemble_models) > 1:
+            return f"{letter}{mdl_idx+1}.{run+1}"
+        return f"{letter}{run+1}"
+
+    _a_results: list[dict] = []
+    _b_results: list[dict] = []
+    _total_a = _consistency_runs * len(_ensemble_models)
+    _total_b = _consistency_runs * len(_ensemble_models)
+    for _mi, _mdl in enumerate(_ensemble_models):
+        for _run in range(_consistency_runs):
+            raw_a = _call_part(_system_meta(quality_score), user_prompt,
+                               MAX_TOKENS_META, f"stage4-{_make_suffix(_mi, _run, _total_a, 'A')}",
+                               model_override=_mdl)
+            _a_results.append(_parse_partial(raw_a, _make_suffix(_mi, _run, _total_a, "A"), debug_dir))
+            raw_b = _call_part(_sys_b, _user_prompt_b,
+                               MAX_TOKENS_FEATURES, f"stage4-{_make_suffix(_mi, _run, _total_b, 'B')}",
+                               model_override=_mdl)
+            _b_results.append(_parse_partial(raw_b, _make_suffix(_mi, _run, _total_b, "B"), debug_dir))
+
+    raw_c = _call_part(_system_roles_workflows(quality_score), user_prompt,
+                       MAX_TOKENS_ROLES_WF, "stage4-C")
+
+    data_a = _merge_consistency_a(_a_results)
+    data_b = _merge_consistency_b(_b_results)
     data_b = _filter_hallucinated_refs(data_b,
                                        known_pages_lower=known_files_all,
                                        known_tables_lower={t.lower() for t in known_tables})
-
-    # ── Call C: user roles + workflows (~8K tokens) ───────────────────────────
-    print(f"  [stage4] Call 3/3 — user roles, workflows ...")
-    raw_c = _call_part(_system_roles_workflows(quality_score), user_prompt,
-                       MAX_TOKENS_ROLES_WF, "stage4-C")
     data_c = _parse_partial(raw_c, "C", debug_dir)
 
     # ── Merge all three dicts (A wins on overlaps, B/C fill in their fields) ──
@@ -196,20 +281,29 @@ def run(ctx: PipelineContext) -> None:
     # ── Gap-fill pass ─────────────────────────────────────────────────────────
     # Use the wide filter set for gap-fill too so new features can reference
     # any real file (not only html_pages).
-    domain_model = _gap_fill_pass(
-        ctx, domain_model, coverage_report, user_prompt, quality_score, debug_dir,
-        known_tables=known_tables, known_pages_lower=known_files_all,
-        known_fields=known_fields,
-    )
+    # Skip entirely when STAGE4_SKIP_GAP_FILL=1 (saves 15-30 min on large repos).
+    if _SKIP_GAP_FILL:
+        print(f"  [stage4] Gap-fill skipped (STAGE4_SKIP_GAP_FILL=1)")
+    else:
+        if MAX_GAP_ROUNDS < 20:
+            print(f"  [stage4] Gap-fill capped at {MAX_GAP_ROUNDS} rounds "
+                  f"(STAGE4_MAX_GAP_ROUNDS={MAX_GAP_ROUNDS})")
+        domain_model = _gap_fill_pass(
+            ctx, domain_model, coverage_report, user_prompt, quality_score, debug_dir,
+            known_tables=known_tables, known_pages_lower=known_files_all,
+            known_fields=known_fields,
+        )
 
     # ── Post-gap-fill coverage (shows improvement vs initial report) ───────────
+    # Store result on ctx so stage58/stage59 can reference final coverage data
+    # without re-running the computation.  Also writes coverage_report.json.
     print(f"  [stage4] Coverage after gap-fill:")
-    _compute_coverage(ctx, domain_model, debug_dir)
+    ctx.domain_coverage = _compute_coverage(ctx, domain_model, debug_dir)
 
     # ── Save ──────────────────────────────────────────────────────────────────
     _save_domain_model(domain_model, output_path)
     ctx.domain_model = domain_model
-    ctx.stage("stage4_domain").mark_completed(output_path)
+    ctx.stage("stage40_domain").mark_completed(output_path)
     ctx.save()
 
     print(f"  [stage4] Done — domain='{domain_model.domain_name}'")
@@ -220,6 +314,78 @@ def run(ctx: PipelineContext) -> None:
     print(f"  [stage4] Saved → {output_path}")
 
 
+# ─── Self-Consistency Merge Helpers ───────────────────────────────────────────
+
+def _merge_consistency_a(results: list[dict]) -> dict:
+    """
+    Merge multiple Call-A results (domain_name, key_entities, bounded_contexts).
+
+    Strategy:
+      - domain_name / description: take from the run that produced the most entities
+      - key_entities: union across all runs, deduplicated case-insensitively
+      - bounded_contexts: union across all runs, deduplicated case-insensitively
+    """
+    if len(results) == 1:
+        return results[0]
+
+    # Pick the base result (most entities → likely highest quality run)
+    base = max(results, key=lambda r: len(r.get("key_entities") or []))
+    merged = dict(base)
+
+    # Union of entities
+    seen_ent: set[str] = set()
+    entities: list[str] = []
+    for r in results:
+        for e in (r.get("key_entities") or []):
+            key = str(e).strip().lower()
+            if key and key not in seen_ent:
+                seen_ent.add(key)
+                entities.append(e)
+    merged["key_entities"] = entities
+
+    # Union of bounded contexts
+    seen_ctx: set[str] = set()
+    contexts: list[str] = []
+    for r in results:
+        for c in (r.get("bounded_contexts") or []):
+            key = str(c).strip().lower()
+            if key and key not in seen_ctx:
+                seen_ctx.add(key)
+                contexts.append(c)
+    merged["bounded_contexts"] = contexts
+
+    if len(results) > 1:
+        print(f"  [stage4] Consistency merge A: "
+              f"{len(entities)} entities, {len(contexts)} contexts "
+              f"(from {len(results)} runs)")
+    return merged
+
+
+def _merge_consistency_b(results: list[dict]) -> dict:
+    """
+    Merge multiple Call-B results (features list).
+
+    Strategy: union of all features across runs, deduplicated by name
+    (case-insensitive).  Features from later runs fill gaps not covered by
+    earlier runs.
+    """
+    if len(results) == 1:
+        return results[0]
+
+    seen_names: set[str] = set()
+    merged_features: list[dict] = []
+    for r in results:
+        for f in (r.get("features") or []):
+            key = (f.get("name") or "").strip().lower()
+            if key and key not in seen_names:
+                seen_names.add(key)
+                merged_features.append(f)
+
+    print(f"  [stage4] Consistency merge B: "
+          f"{len(merged_features)} unique features (from {len(results)} runs)")
+    return {"features": merged_features}
+
+
 # ─── Retrieval ─────────────────────────────────────────────────────────────────
 
 def _retrieve_context(ctx: PipelineContext) -> list[dict[str, Any]]:
@@ -227,7 +393,7 @@ def _retrieve_context(ctx: PipelineContext) -> list[dict[str, Any]]:
     Fire all retrieval queries against ChromaDB and return a deduplicated,
     ranked list of the most relevant chunks.
     """
-    from pipeline.stage3_embed import query_collection
+    from pipeline.stage30_embed import query_collection
 
     seen_ids: set[str]      = set()
     scored:   list[tuple]   = []   # (score, chunk_dict)
@@ -382,6 +548,35 @@ def _evidence_instruction(quality_score: int) -> str:
     )
 
 
+def _build_system_preamble(ctx) -> str:
+    """Return a language-aware system preamble for the domain analyst LLM."""
+    from context import Language  # avoid circular at module level  # noqa: PLC0415
+    lang = Language.PHP
+    fw   = "unknown"
+    if ctx.code_map:
+        lang = ctx.code_map.language
+        fw   = ctx.code_map.framework.value
+
+    _lang_desc = {
+        Language.PHP:        f"legacy PHP ({fw}) applications",
+        Language.TYPESCRIPT: f"TypeScript ({fw}) applications",
+        Language.JAVASCRIPT: f"JavaScript ({fw}) applications",
+        Language.JAVA:       f"Java ({fw}) applications",
+        Language.KOTLIN:     f"Kotlin ({fw}) applications",
+        Language.UNKNOWN:    "software applications",
+    }
+    desc = _lang_desc.get(lang, "software applications")
+    return (
+        f"You are a senior Business Analyst and software architect specialising in\n"
+        f"reverse-engineering {desc} into structured business domain models.\n\n"
+        f"Your task is to analyse the provided codebase evidence and extract specific\n"
+        f"parts of the domain model in JSON format."
+    )
+
+
+# Set by run() to inject a language-aware preamble before calling prompt builders.
+_ACTIVE_PREAMBLE: str = ""
+
 _SYSTEM_PREAMBLE = """\
 You are a senior Business Analyst and software architect specialising in
 reverse-engineering legacy PHP applications into structured business domain models.
@@ -397,9 +592,14 @@ CRITICAL OUTPUT RULES — you MUST follow these exactly:
 """
 
 
+def _get_preamble() -> str:
+    """Return language-aware preamble if set, else the PHP default."""
+    return _ACTIVE_PREAMBLE if _ACTIVE_PREAMBLE else _SYSTEM_PREAMBLE
+
+
 def _system_meta(quality_score: int) -> str:
     """Call A — domain name, description, key entities, bounded contexts."""
-    return f"""{_SYSTEM_PREAMBLE}
+    return f"""{_get_preamble()}
 {_evidence_instruction(quality_score)}
 
 Output ONLY this JSON (no other fields):
@@ -415,28 +615,68 @@ Rename for clarity, merge near-empty ones, but anchor to detected module names.
 Now produce the JSON for domain_name, description, key_entities, and bounded_contexts:"""
 
 
+def _format_schema_grounding(
+    known_tables: list[str],
+    table_columns: list[dict],
+) -> str:
+    """
+    Build a rich DB schema grounding block.
+
+    When table_columns is available, emit full column info (name + type +
+    nullable + FK) for each table.  Falls back to the flat table-name list
+    when column data is absent.
+    """
+    # Index column data by table name (lower-cased for case-insensitive match)
+    col_index: dict[str, list[dict]] = {}
+    for entry in (table_columns or []):
+        tname = (entry.get("table") or "").strip().lower()
+        if tname:
+            col_index.setdefault(tname, []).extend(entry.get("columns") or [])
+
+    lines: list[str] = [
+        "MANDATORY GROUNDING — DATABASE SCHEMA (actual tables and columns):"
+    ]
+    _tables_cap_grnd = int(os.environ.get("STAGE4_TABLES_CAP", "40") or "40")
+    for table in known_tables[:_tables_cap_grnd]:
+        cols = col_index.get(table.lower(), [])
+        if cols:
+            col_parts: list[str] = []
+            for c in cols[:20]:              # cap to 20 cols per table
+                cname = c.get("name", "?")
+                ctype = c.get("type", "")
+                nullable = " NULL" if c.get("nullable") else " NOT NULL"
+                default  = f" DEFAULT {c['default']}" if c.get("default") not in (None, "") else ""
+                col_parts.append(f"{cname} ({ctype}{nullable}{default})")
+            lines.append(f"  {table}: {', '.join(col_parts)}")
+        else:
+            lines.append(f"  {table}")
+
+    lines += [
+        "You MUST use ONLY table names from the schema above in 'tables' arrays.",
+        "Do NOT invent table names. Use the exact column names shown when writing business_rules.",
+    ]
+    return "\n".join(lines)
+
+
 def _system_features(
-    quality_score: int,
-    known_tables: list[str] | None = None,
-    known_pages:  list[str] | None = None,
-    known_fields: list[str] | None = None,
+    quality_score:  int,
+    known_tables:   list[str] | None = None,
+    known_pages:    list[str] | None = None,
+    known_fields:   list[str] | None = None,
+    table_columns:  list[dict] | None = None,
 ) -> str:
     """Call B — features list only.
 
-    known_tables / known_pages / known_fields: when provided, injected as
-    mandatory grounding so the model cannot hallucinate names that don't exist
-    in the actual codebase.
+    known_tables / known_pages / known_fields / table_columns: when provided,
+    injected as mandatory grounding so the model cannot hallucinate names that
+    don't exist in the actual codebase.  table_columns enriches table grounding
+    with column names and types for more accurate business_rules generation.
     """
     # ── Build grounding block ────────────────────────────────────────────────
     grounding_parts: list[str] = []
     if known_tables:
-        tables_str = ", ".join(known_tables[:100])   # cap to avoid token overflow
         grounding_parts.append(
-            "MANDATORY GROUNDING — ACTUAL DATABASE TABLES IN THIS CODEBASE:\n"
-            f"{tables_str}\n"
-            "You MUST use ONLY table names from the list above in 'tables' arrays.\n"
-            "Do NOT invent table names like 'products', 'orders', 'cart_items' "
-            "unless they actually appear in this list."
+            _format_schema_grounding(known_tables, table_columns or [])
         )
     if known_pages:
         pages_str = ", ".join(known_pages[:250])     # cap to avoid token overflow
@@ -458,7 +698,7 @@ def _system_features(
         )
     grounding = ("\n\n" + "\n\n".join(grounding_parts)) if grounding_parts else ""
 
-    return f"""{_SYSTEM_PREAMBLE}
+    return f"""{_get_preamble()}
 {_evidence_instruction(quality_score)}{grounding}
 
 Output ONLY this JSON (no other fields):
@@ -483,7 +723,7 @@ Now produce the JSON for features only:"""
 
 def _system_roles_workflows(quality_score: int) -> str:
     """Call C — user roles and workflows."""
-    return f"""{_SYSTEM_PREAMBLE}
+    return f"""{_get_preamble()}
 {_evidence_instruction(quality_score)}
 
 Output ONLY this JSON (no other fields):
@@ -605,7 +845,7 @@ Existing features already extracted (do NOT duplicate): {existing_str}
 For each uncovered page, determine what business feature it represents.
 Group multiple uncovered pages under one feature if they implement the same business function."""
 
-    return f"""{_SYSTEM_PREAMBLE}
+    return f"""{_get_preamble()}
 {_evidence_instruction(quality_score)}{tables_grounding}
 
 {coverage_instruction}
@@ -628,12 +868,34 @@ Output ONLY this JSON (no other fields):
 Now produce the JSON for new features covering the uncovered modules/pages:"""
 
 
+def _rag_relevant_stems(chunks: list[dict]) -> set[str]:
+    """
+    Return the set of lowercase file stem names that appear in the top RAG chunks.
+    Used to RAG-sort static sections so the most relevant files survive the cap.
+    """
+    stems: set[str] = set()
+    for chunk in chunks:
+        src = chunk.get("metadata", {}).get("source_file", "")
+        if src:
+            stems.add(Path(src).stem.lower())
+    return stems
+
+
+def _rag_sort(items: list, key_fn, relevant_stems: set[str]) -> list:
+    """
+    Stable-sort *items* so entries whose key_fn(item) stem appears in
+    relevant_stems come first.  Order within each group is preserved.
+    """
+    return sorted(items, key=lambda x: (0 if Path(key_fn(x)).stem.lower() in relevant_stems else 1))
+
+
 def _build_user_prompt(ctx: PipelineContext, chunks: list[dict]) -> str:
     """
     Assemble the user prompt from retrieved chunks, CodeMap metadata,
     and graph summary.
     """
     parts: list[str] = []
+    _rel_stems = _rag_relevant_stems(chunks)   # files surfaced by RAG — prioritised in caps
 
     # ── System metadata header ────────────────────────────────────────────────
     cm = ctx.code_map
@@ -655,11 +917,15 @@ def _build_user_prompt(ctx: PipelineContext, chunks: list[dict]) -> str:
         if q.get("table") and q["table"] not in ("UNKNOWN", "")
     })
     if unique_tables:
-        parts.append(f"\n=== DATABASE TABLES ===")
-        parts.append(", ".join(unique_tables))
+        _shown_tables = unique_tables[:_CAP_DB_TABLES] if _CAP_DB_TABLES > 0 else unique_tables
+        _omitted_tbl  = len(unique_tables) - len(_shown_tables)
+        parts.append(f"\n=== DATABASE TABLES ({len(unique_tables)} total"
+                     + (f", showing {len(_shown_tables)})" if _omitted_tbl else ")"))
+        parts.append(", ".join(_shown_tables)
+                     + (f"  … +{_omitted_tbl} more omitted" if _omitted_tbl else ""))
 
         # Per-table: which files read/write it
-        for table in unique_tables:
+        for table in _shown_tables:
             readers = sorted({q["file"] for q in cm.sql_queries
                               if q.get("table") == table and q.get("operation") == "SELECT"})
             writers = sorted({q["file"] for q in cm.sql_queries
@@ -681,7 +947,11 @@ def _build_user_prompt(ctx: PipelineContext, chunks: list[dict]) -> str:
         sg_by_file: dict[str, list] = defaultdict(list)
         for sg in cm.superglobals:
             sg_by_file[sg["file"]].append(sg)
-        for filepath, sgs in sorted(sg_by_file.items()):
+        _form_files = _rag_sort(list(sg_by_file.items()), lambda x: x[0], _rel_stems)
+        if _CAP_FORM_FILES > 0 and len(_form_files) > _CAP_FORM_FILES:
+            parts.append(f"  (showing {_CAP_FORM_FILES}/{len(_form_files)} files — RAG-prioritised)")
+            _form_files = _form_files[:_CAP_FORM_FILES]
+        for filepath, sgs in _form_files:
             filename  = Path(filepath).name
             post_keys = sorted({s["key"] for s in sgs
                                 if s["var"] == "$_POST" and s.get("key")})
@@ -694,10 +964,18 @@ def _build_user_prompt(ctx: PipelineContext, chunks: list[dict]) -> str:
 
     # ── Redirect / navigation summary ────────────────────────────────────────
     if cm.redirects:
-        parts.append(f"\n=== NAVIGATION / REDIRECTS ===")
-        for r in cm.redirects:
+        _redirects = _rag_sort(list(cm.redirects), lambda r: r.get("file", ""), _rel_stems)
+        _omit_r = 0
+        if _CAP_REDIRECTS > 0 and len(_redirects) > _CAP_REDIRECTS:
+            _omit_r = len(_redirects) - _CAP_REDIRECTS
+            _redirects = _redirects[:_CAP_REDIRECTS]
+        parts.append(f"\n=== NAVIGATION / REDIRECTS"
+                     + (f" ({len(cm.redirects)} total, showing {len(_redirects)})" if _omit_r else "") + " ===")
+        for r in _redirects:
             filename = Path(r["file"]).name
             parts.append(f"{filename} → {r['target']}")
+        if _omit_r:
+            parts.append(f"  … +{_omit_r} more redirects omitted")
 
     # ── HTML pages (entry points) ─────────────────────────────────────────────
     if cm.html_pages:
@@ -706,14 +984,22 @@ def _build_user_prompt(ctx: PipelineContext, chunks: list[dict]) -> str:
 
     # ── Functions ─────────────────────────────────────────────────────────────
     if cm.functions:
-        parts.append(f"\n=== USER-DEFINED FUNCTIONS ===")
-        for fn in cm.functions:
+        _fns = cm.functions
+        _omit_fn = 0
+        if _CAP_FUNCTIONS > 0 and len(_fns) > _CAP_FUNCTIONS:
+            _omit_fn = len(_fns) - _CAP_FUNCTIONS
+            _fns = _fns[:_CAP_FUNCTIONS]
+        parts.append(f"\n=== USER-DEFINED FUNCTIONS ({len(cm.functions)} total"
+                     + (f", showing {len(_fns)})" if _omit_fn else ")"))
+        for fn in _fns:
             params = [p["name"] for p in fn.get("params", [])]
             doc    = fn.get("docblock") or ""
             line   = f"  {fn['name']}({', '.join(params)})"
             if doc:
                 line += f" — {doc}"
             parts.append(line)
+        if _omit_fn:
+            parts.append(f"  … +{_omit_fn} more functions omitted")
 
     # ── Call graph ────────────────────────────────────────────────────────────
     call_graph = getattr(cm, "call_graph", None) or []
@@ -726,9 +1012,16 @@ def _build_user_prompt(ctx: PipelineContext, chunks: list[dict]) -> str:
             by_file[edge.get("file","?")].append(
                 f"{edge.get('caller','?')} → {edge.get('callee','?')}"
             )
-        for fpath, edges in sorted(by_file.items()):
+        _cg_files = _rag_sort(list(by_file.items()), lambda x: x[0], _rel_stems)
+        _omit_cg = 0
+        if _CAP_CALL_GRAPH > 0 and len(_cg_files) > _CAP_CALL_GRAPH:
+            _omit_cg = len(_cg_files) - _CAP_CALL_GRAPH
+            _cg_files = _cg_files[:_CAP_CALL_GRAPH]
+        for fpath, edges in _cg_files:
             parts.append(f"{Path(fpath).name}: {', '.join(edges[:8])}"
                          + (" ..." if len(edges) > 8 else ""))
+        if _omit_cg:
+            parts.append(f"  … +{_omit_cg} more files omitted")
 
     # ── Form fields ───────────────────────────────────────────────────────────
     form_fields = getattr(cm, "form_fields", None) or []
@@ -768,6 +1061,58 @@ def _build_user_prompt(ctx: PipelineContext, chunks: list[dict]) -> str:
         for prefix in sorted(by_prefix):
             parts.append(f"  {prefix}_*: {', '.join(sorted(set(by_prefix[prefix])))}")
 
+    # ── Semantic actor roles (stage27) ───────────────────────────────────────
+    # Pre-computed actor/role tags from SemanticRoleIndex — gives the LLM
+    # grounded user-role names instead of having to guess from file names.
+    # Also exposes detected external integrations (Stripe, email, S3, …).
+    sr = getattr(ctx, "semantic_roles", None)
+    if sr:
+        biz_actions = [t for t in (sr.actions or [])
+                       if t.role == "BUSINESS_ACTION" and t.confidence >= 0.70]
+        if biz_actions:
+            parts.append(f"\n=== SEMANTIC ACTOR ROLES — STAGE 2.7 ===")
+            parts.append(
+                "These actors were pre-computed from route/controller semantic analysis. "
+                "Use them to name user roles in bounded_contexts accurately."
+            )
+            from collections import defaultdict as _dd27
+            _by_actor: dict = _dd27(list)
+            for _t in biz_actions:
+                _actor = _t.actor or "User"
+                _by_actor[_actor].append(_t.symbol)
+            for _actor, _syms in sorted(_by_actor.items()):
+                parts.append(f"  Actor '{_actor}': {', '.join(_syms[:6])}"
+                             + (" …" if len(_syms) > 6 else ""))
+        if sr.external_systems:
+            parts.append(f"\n=== EXTERNAL SYSTEM INTEGRATIONS — STAGE 2.7 ===")
+            parts.append(
+                "These external systems were detected from env-var keys, class names, "
+                "and service dependencies. Document their integration contracts."
+            )
+            for _ext in sr.external_systems:
+                _env = f"  env_keys=[{', '.join(_ext.env_keys[:3])}]" if _ext.env_keys else ""
+                parts.append(f"  {_ext.name} [{_ext.category}]{_env}")
+
+    # ── DB schema / migrations (stage1) ──────────────────────────────────────
+    # Migration history gives schema-evolution context: which tables were
+    # created/altered and with what columns — useful for entity lifecycle.
+    db_schema = getattr(cm, "db_schema", None) or []
+    if db_schema:
+        parts.append(f"\n=== DB SCHEMA / MIGRATIONS ({len(db_schema)} migration(s)) ===")
+        parts.append("Use for entity lifecycle, column-level data model, and schema evolution.")
+        _seen_mig: set = set()
+        for _mig in db_schema[:30]:
+            _op    = _mig.get("operation", "?")
+            _tbl   = _mig.get("table", "?")
+            _cols  = [c.get("name") or c if isinstance(c, str) else str(c)
+                      for c in (_mig.get("columns") or [])[:8]]
+            _key   = f"{_op}:{_tbl}"
+            if _key in _seen_mig:
+                continue
+            _seen_mig.add(_key)
+            _col_str = f"  cols=[{', '.join(_cols)}]" if _cols else ""
+            parts.append(f"  {_op} {_tbl}{_col_str}")
+
     # ── Auth signals ──────────────────────────────────────────────────────────
     auth_signals = getattr(cm, "auth_signals", None) or []
     if auth_signals:
@@ -777,11 +1122,16 @@ def _build_user_prompt(ctx: PipelineContext, chunks: list[dict]) -> str:
         parts.append("  Signal counts: " + ", ".join(
             f"{t}={n}" for t, n in sorted(by_type.items())))
         seen_pats: set = set()
+        _auth_shown = 0
         for sig in auth_signals:
+            if _CAP_AUTH_SIGNALS > 0 and _auth_shown >= _CAP_AUTH_SIGNALS:
+                parts.append(f"  … +{len(auth_signals) - _auth_shown} more signals omitted")
+                break
             pat = sig.get("pattern", "?")
             if pat in seen_pats:
                 continue
             seen_pats.add(pat)
+            _auth_shown += 1
             detail = f" [{sig['detail']}]" if sig.get("detail") else ""
             parts.append(f"  {sig['type']}: {pat}{detail}"
                          f" ({Path(sig.get('file','?')).name}:{sig.get('line','?')})")
@@ -789,19 +1139,33 @@ def _build_user_prompt(ctx: PipelineContext, chunks: list[dict]) -> str:
     # ── HTTP entry points ─────────────────────────────────────────────────────
     http_endpoints = getattr(cm, "http_endpoints", None) or []
     if http_endpoints:
-        parts.append(f"\n=== HTTP ENTRY POINTS ({len(http_endpoints)}) ===")
-        for ep in http_endpoints:
+        _eps = http_endpoints
+        _omit_ep = 0
+        if _CAP_HTTP_EPS > 0 and len(_eps) > _CAP_HTTP_EPS:
+            _omit_ep = len(_eps) - _CAP_HTTP_EPS
+            _eps = _eps[:_CAP_HTTP_EPS]
+        parts.append(f"\n=== HTTP ENTRY POINTS ({len(http_endpoints)} total"
+                     + (f", showing {len(_eps)})" if _omit_ep else ")"))
+        for ep in _eps:
             handler  = ep.get("handler") or Path(ep.get("file", "?")).name
             accepts  = "/".join(ep.get("accepts", []))
             produces = ep.get("produces", "?")
             ep_type  = ep.get("type", "page")
             parts.append(f"  [{ep_type}] {handler} — accepts {accepts}, produces {produces}")
+        if _omit_ep:
+            parts.append(f"  … +{_omit_ep} more endpoints omitted")
 
     # ── Table/column definitions ──────────────────────────────────────────────
     table_columns = getattr(cm, "table_columns", None) or []
     if table_columns:
-        parts.append(f"\n=== DATABASE TABLES & COLUMNS ({len(table_columns)} tables) ===")
-        for tbl in table_columns:
+        _tcols = table_columns
+        _omit_tc = 0
+        if _CAP_TABLE_COLS > 0 and len(_tcols) > _CAP_TABLE_COLS:
+            _omit_tc = len(_tcols) - _CAP_TABLE_COLS
+            _tcols = _tcols[:_CAP_TABLE_COLS]
+        parts.append(f"\n=== DATABASE TABLES & COLUMNS ({len(table_columns)} tables"
+                     + (f", showing {len(_tcols)})" if _omit_tc else ")"))
+        for tbl in _tcols:
             tname   = tbl.get("table", "?")
             source  = tbl.get("source", "?")
             cols    = tbl.get("columns", [])
@@ -809,16 +1173,24 @@ def _build_user_prompt(ctx: PipelineContext, chunks: list[dict]) -> str:
             if len(cols) > 12:
                 col_str += f" ... +{len(cols) - 12} more"
             parts.append(f"  {tname} ({source}): {col_str}")
+        if _omit_tc:
+            parts.append(f"  … +{_omit_tc} more tables omitted")
 
     # ── Execution paths (stage15) ────────────────────────────────────────────
     exec_paths = getattr(cm, "execution_paths", None) or []
     if exec_paths:
-        parts.append(f"\n=== EXECUTION PATHS & BRANCH ANALYSIS ===")
+        _exps = _rag_sort(list(exec_paths), lambda ep: ep.get("file", ""), _rel_stems)
+        _omit_exp = 0
+        if _CAP_EXEC_PATHS > 0 and len(_exps) > _CAP_EXEC_PATHS:
+            _omit_exp = len(_exps) - _CAP_EXEC_PATHS
+            _exps = _exps[:_CAP_EXEC_PATHS]
+        parts.append(f"\n=== EXECUTION PATHS & BRANCH ANALYSIS ({len(exec_paths)} files"
+                     + (f", showing {len(_exps)})" if _omit_exp else ")"))
         parts.append(
             "Each entry below is derived from static analysis of a PHP file. "
             "Use this to identify workflows, auth requirements, and business rules."
         )
-        for ep in exec_paths:
+        for ep in _exps:
             fname = ep.get("file", "?")
             parts.append(f"\nFile: {fname}")
 
@@ -864,6 +1236,8 @@ def _build_user_prompt(ctx: PipelineContext, chunks: list[dict]) -> str:
                     parts.append(f"      then: {', '.join(then) or 'none'}")
                     if els:
                         parts.append(f"      else: {', '.join(els)}")
+        if _omit_exp:
+            parts.append(f"\n  … +{_omit_exp} more execution-path files omitted")
 
     # ── Detected modules from Stage 2 Pass 15 ───────────────────────────────
     # Pre-seed the LLM with structurally-detected bounded contexts so it
@@ -890,6 +1264,154 @@ def _build_user_prompt(ctx: PipelineContext, chunks: list[dict]) -> str:
                 f"  ({type_summary})"
             )
 
+    # ── Action Clusters from Stage 2.8 ───────────────────────────────────────
+    # Provide the similarity-based cluster map as an alternative bounded-context
+    # seed.  This is especially useful when the Stage 2 graph was built without
+    # community detection (no detected_modules) or the graph is absent.
+    ac = getattr(ctx, "action_clusters", None)
+    if ac and ac.clusters and not detected_modules:
+        parts.append(f"\n=== ACTION CLUSTERS — STAGE 2.8 ({len(ac.clusters)}) ===")
+        parts.append(
+            "These clusters were computed from shared DB tables, route prefixes, "
+            "and module directory structure.  Use them as the basis for "
+            "bounded_contexts — merge near-empty ones, rename for clarity, "
+            "but anchor to these cluster names."
+        )
+        for c in ac.clusters[:40]:   # cap to avoid prompt bloat
+            tbl_preview = ", ".join(c.tables[:5])
+            if len(c.tables) > 5:
+                tbl_preview += f" (+{len(c.tables)-5} more)"
+            parts.append(
+                f"  [{c.name}]  files={c.file_count}"
+                + (f"  tables=[{tbl_preview}]" if tbl_preview else "")
+                + (f"  route={c.route_prefix}" if c.route_prefix else "")
+            )
+
+    # ── Entities from Stage 4.1 ──────────────────────────────────────────────
+    ent_col = getattr(ctx, "entities", None)
+    if ent_col and ent_col.entities:
+        core_ents = [e for e in ent_col.entities if e.is_core and not e.is_system]
+        if core_ents:
+            parts.append(
+                f"\n=== DETECTED ENTITIES — STAGE 4.1 ({len(core_ents)} core) ==="
+            )
+            parts.append(
+                "These entities were extracted statically from the DB schema. "
+                "Use them as your key_entities and as the basis for bounded_contexts."
+            )
+            for ent in core_ents[:30]:
+                col_names = [c.name for c in ent.columns[:6]]
+                pk_note   = f"  pk={ent.primary_key}" if ent.primary_key else ""
+                pivot_note = "  [pivot]" if ent.is_pivot else ""
+                parts.append(
+                    f"  • {ent.name:<30} table={ent.table:<25} "
+                    f"context={ent.bounded_context}{pk_note}{pivot_note}"
+                    + (f"  cols=[{', '.join(col_names)}{'…' if len(ent.columns) > 6 else ''}]"
+                       if col_names else "")
+                )
+            if len(core_ents) > 30:
+                parts.append(f"  … and {len(core_ents) - 30} more core entities")
+
+    # ── Relationships from Stage 4.2 ─────────────────────────────────────────
+    rel_col = getattr(ctx, "relationships", None)
+    if rel_col and rel_col.relationships:
+        high_rel = [r for r in rel_col.relationships if r.confidence >= 0.75]
+        if high_rel:
+            parts.append(
+                f"\n=== DETECTED RELATIONSHIPS — STAGE 4.2 "
+                f"({len(high_rel)} high-confidence) ==="
+            )
+            parts.append(
+                "These entity relationships were reconstructed from FK constraints, "
+                "SQL JOINs, ORM declarations, and column naming patterns. "
+                "Use them to define accurate cardinality in bounded_contexts and "
+                "data models.  Do NOT invent relationships that contradict these."
+            )
+            for rel in high_rel[:40]:
+                parts.append(
+                    f"  • {rel.from_entity:<25} {rel.cardinality:<5} {rel.to_entity:<25}"
+                    f"  via={rel.via_column or rel.via_table or '?':<20}"
+                    f"  [{','.join(rel.signals)}]"
+                )
+            if len(high_rel) > 40:
+                parts.append(f"  … and {len(high_rel) - 40} more")
+
+    # ── Detected Business Rules from Stage 2.9 ───────────────────────────────
+    # High-confidence rules (schema-enforced ≥ 0.9, guard-clause ≥ 0.75) are
+    # injected as hard constraints.  The LLM must surface these in features,
+    # workflows, and key_entities rather than inventing its own constraints.
+    inv = getattr(ctx, "invariants", None)
+    if inv and inv.rules:
+        high_conf = [r for r in inv.rules if r.confidence >= 0.75]
+        if high_conf:
+            parts.append(
+                f"\n=== DETECTED BUSINESS RULES — STAGE 2.9 "
+                f"({len(high_conf)} high-confidence) ==="
+            )
+            parts.append(
+                "These rules were extracted statically from DB schema and guard "
+                "clauses.  When generating features and workflows, reference these "
+                "exact constraints.  Do NOT contradict them."
+            )
+            # Group by category for readability
+            by_cat: dict[str, list] = {}
+            for r in high_conf:
+                by_cat.setdefault(r.category, []).append(r)
+            for cat, cat_rules in sorted(by_cat.items()):
+                parts.append(f"\n  [{cat}]")
+                for r in cat_rules[:15]:      # cap per category
+                    parts.append(f"    • {r.description}  [{r.entity}]")
+
+    # ── State machines (Stage 4.3) ───────────────────────────────────────────
+    sm_col = getattr(ctx, "state_machines", None)
+    if sm_col and sm_col.machines:
+        parts.append(
+            f"\n=== DETECTED STATE MACHINES — STAGE 4.3 "
+            f"({sm_col.total} machine(s)) ==="
+        )
+        parts.append(
+            "These entity lifecycles were reconstructed statically from DB and PHP. "
+            "Use them to define entity states in bounded_contexts and workflows."
+        )
+        for sm in sm_col.machines[:10]:   # cap at 10 to keep prompt size sane
+            states_str = " → ".join(sm.initial_states + [
+                s for s in sm.states
+                if s not in sm.initial_states and s not in sm.terminal_states
+            ] + sm.terminal_states) or ", ".join(sm.states)
+            parts.append(
+                f"  • {sm.entity}.{sm.field} [{sm.bounded_context}]: {states_str}"
+            )
+            if sm.dead_states:
+                parts.append(f"    (dead/unreachable: {', '.join(sm.dead_states)})")
+
+    # ── GraphRAG semantic context ─────────────────────────────────────────────
+    # ctx.graph_query() uses the community-graph-aware index built by stage38.
+    # Inject it so the LLM can validate entity relationships and cross-module
+    # operations that are not obvious from directory structure alone.
+    # Previously computed but never used in LLM prompts — wiring it here
+    # prevents the stage38 computation from being wasted.
+    if hasattr(ctx, "graph_query"):
+        _grag_topics = [
+            "user roles permissions authentication",
+            "business features workflows operations",
+        ]
+        _grag_hits: list[str] = []
+        for _topic in _grag_topics:
+            try:
+                _gc = ctx.graph_query(_topic)
+            except Exception:
+                _gc = None
+            if _gc and _gc.strip():
+                _grag_hits.append(_gc.strip())
+        if _grag_hits:
+            parts.append(f"\n=== GRAPH-AWARE SEMANTIC CONTEXT ===")
+            parts.append(
+                "The following was retrieved via graph-community-aware semantic search "
+                "(GraphRAG). Use it to validate entity relationships and identify "
+                "cross-module business operations not apparent from file structure alone."
+            )
+            parts.extend(_grag_hits)
+
     # ── Retrieved semantic chunks ─────────────────────────────────────────────
     parts.append(f"\n=== SEMANTIC CONTEXT ({len(chunks)} chunks) ===")
     for i, chunk in enumerate(chunks, 1):
@@ -903,22 +1425,38 @@ def _build_user_prompt(ctx: PipelineContext, chunks: list[dict]) -> str:
     return "\n".join(parts)
 
 
+
+
 # ─── LLM Call Helper ───────────────────────────────────────────────────────────
 
 def _call_part(system_prompt: str, user_prompt: str,
-               max_tokens: int, label: str) -> str:
+               max_tokens: int, label: str,
+               model_override: str | None = None) -> str:
     """Call the configured LLM and return the raw response string.
 
-    json_mode=True forces local models (Ollama etc.) to output valid JSON
-    via response_format, preventing Qwen3 / DeepSeek-R1 from writing prose.
+    json_mode=True forces local models (Ollama etc.) to output valid JSON:
+      - OpenAI-compat path:   response_format={"type":"json_object"}
+      - Ollama native path:   format="json"  (top-level payload field)
+
+    prefill="{" is a secondary safety net for thinking models (Qwen3,
+    DeepSeek-R1): the assistant turn starts with "{" so the model cannot
+    emit any preamble or markdown fence before the JSON object.
+    On Claude the prefill is sent as a partial assistant message; on local
+    models it is appended to the messages array the same way.
     """
-    from pipeline.llm_client import call_llm
+    from pipeline.llm_client import call_llm, get_provider
+    # Use prefill only for local models — Claude handles structured output
+    # differently and prefill interferes with its extended-thinking mode.
+    use_prefill = "{" if get_provider() == "local" else ""
     return call_llm(
-        system_prompt = system_prompt,
-        user_prompt   = user_prompt,
-        max_tokens    = max_tokens,
-        label         = label,
-        json_mode     = True,
+        system_prompt  = system_prompt,
+        user_prompt    = user_prompt,
+        max_tokens     = max_tokens,
+        temperature    = 0.2,   # extraction: recall > precision, keep generous default
+        label          = label,
+        json_mode      = True,
+        prefill        = use_prefill,
+        model_override = model_override,
     )
 
 
@@ -1223,6 +1761,9 @@ def _gap_fill_pass(
     attempted_modules: set[str] = set()
     # Track which non-module files have already been sent to avoid re-sending.
     attempted_flat: set[str] = set()
+    # Allow up to this many consecutive empty/failed LLM rounds before giving up.
+    MAX_CONSECUTIVE_EMPTY = 3
+    consecutive_empty = 0
 
     for gap_round in range(1, MAX_GAP_ROUNDS + 1):
         # Re-compute which pages are still uncovered after previous rounds
@@ -1322,8 +1863,17 @@ def _gap_fill_pass(
             new_features = data_d
 
         if not new_features:
-            print(f"  [stage4] Gap-fill round {gap_round} returned no new features — stopping.")
-            break
+            consecutive_empty += 1
+            print(
+                f"  [stage4] Gap-fill round {gap_round} returned no new features "
+                f"({consecutive_empty}/{MAX_CONSECUTIVE_EMPTY} consecutive empty)."
+            )
+            if consecutive_empty >= MAX_CONSECUTIVE_EMPTY:
+                print(f"  [stage4] {MAX_CONSECUTIVE_EMPTY} consecutive empty rounds — stopping.")
+                break
+            continue  # try next batch of files
+
+        consecutive_empty = 0  # reset on any successful response
 
         # Merge — skip duplicates by name (case-insensitive)
         existing_lower = {f["name"].lower() for f in domain_model.features}
@@ -1336,13 +1886,19 @@ def _gap_fill_pass(
                     added.append(feat["name"])
 
         if added:
+            consecutive_empty = 0
             suffix = f" ... +{len(added) - 5} more" if len(added) > 5 else ""
             print(f"  [stage4] Gap-fill round {gap_round} added "
                   f"{len(added)} feature(s): {added[:5]}{suffix}")
         else:
-            print(f"  [stage4] Gap-fill round {gap_round}: "
-                  f"all returned features already present — stopping.")
-            break
+            consecutive_empty += 1
+            print(
+                f"  [stage4] Gap-fill round {gap_round}: all returned features already present "
+                f"({consecutive_empty}/{MAX_CONSECUTIVE_EMPTY} consecutive empty)."
+            )
+            if consecutive_empty >= MAX_CONSECUTIVE_EMPTY:
+                print(f"  [stage4] {MAX_CONSECUTIVE_EMPTY} consecutive empty rounds — stopping.")
+                break
 
     return domain_model
 

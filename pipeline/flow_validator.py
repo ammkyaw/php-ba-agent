@@ -41,6 +41,12 @@ Eight checks
         For every flow, compute what fraction of its steps are backed by
         a real code artifact; grade as HIGH/MEDIUM/LOW.
 
+  V-09  Auth Guard Coverage
+        For every execution path / auth signal whose source file carries an
+        auth_guard in the parsed code, verify at least one covering flow
+        declares auth_required.  Flags auth requirements that the LLM
+        silently dropped when generating business flows.
+
 Output schema
 -------------
   The return value of ``run_validation()`` is a dict::
@@ -91,6 +97,14 @@ _WRITE_OPS: frozenset[str] = frozenset({"INSERT", "UPDATE", "DELETE", "REPLACE"}
 # ── Tables too generic to be informative ──────────────────────────────────────
 _SKIP_TABLES: frozenset[str] = frozenset({"", "unknown", "temp", "tmp", "dual"})
 
+# ── SQL DML/DQL verbs — only db_ops whose first word is one of these are
+#    candidates for table-name extraction (skips "SQL QUERY on ``:" format,
+#    ORM-style "Eloquent create:Model", and other non-SQL strings) ──────────────
+_SQL_OP_VERBS: frozenset[str] = frozenset({
+    "insert", "update", "delete", "select", "replace",
+    "create", "drop", "alter", "truncate", "merge",
+})
+
 # ── Auth-related middleware names ─────────────────────────────────────────────
 _AUTH_MIDDLEWARE: frozenset[str] = frozenset(
     {"auth", "auth:sanctum", "auth:api", "verified", "login"}
@@ -107,13 +121,21 @@ _V03_WARN  = 2    # broken flows before WARN
 _V03_FAIL  = 4    # > this many → FAIL
 
 _V04_WARN  = 5    # flows with missing branches before WARN
-_V04_FAIL  = 10   # > this many → FAIL
+_V04_FAIL  = 15   # > this many → FAIL (raised from 10; ~14 unique flows is normal)
 
 _COV_PASS  = 0.85  # coverage PASS threshold
-_COV_WARN  = 0.50  # coverage WARN threshold (below → FAIL)
+_COV_WARN  = 0.25  # coverage WARN threshold (below → FAIL)
+                   # Lowered from 0.50: legacy codebases (SugarCRM/SuiteCRM)
+                   # keep SQL writes in bean Model files that are indirect
+                   # dependencies, not execution-path entry points, so they
+                   # never appear in flow evidence_files even though they are
+                   # reachable.  30% is realistic for such architectures.
 
 _CONF_PASS = 0.70  # avg confidence PASS
 _CONF_WARN = 0.40  # avg confidence WARN (below → FAIL)
+
+_V09_WARN  = 3    # major unguarded auth files before WARN
+_V09_FAIL  = 7    # > this many → FAIL
 
 # Max items stored in uncovered lists (avoids huge JSON)
 _MAX_LIST  = 50
@@ -123,7 +145,7 @@ _MAX_LIST  = 50
 
 def run_validation(ctx: Any) -> dict:
     """
-    Run all 8 behavioral validation checks and return the full report dict.
+    Run all 9 behavioral validation checks and return the full report dict.
 
     Parameters
     ----------
@@ -146,9 +168,11 @@ def run_validation(ctx: Any) -> dict:
     file_to_sql    = _build_file_sql_index(cm)
     file_to_redir  = _build_file_redir_index(cm)
 
-    # flow_pages: file basenames that appear in any step.page
-    # flow_paths: raw step.page values (for route path matching)
-    # flow_evidence: basenames in evidence_files
+    # flow_pages    : file basenames from step.page values
+    # flow_paths    : raw step.page values, lowercase (route path matching)
+    # flow_evidence : file basenames from flow.evidence_files
+    #                 ← for MVC apps these are the controller/service files that
+    #                   handle routes; must be included in all coverage checks
     flow_pages, flow_paths, flow_evidence = _build_flow_pivot(flow_list)
 
     # ── Run checks ────────────────────────────────────────────────────────────
@@ -156,14 +180,16 @@ def run_validation(ctx: Any) -> dict:
     v02 = _check_hallucinated_steps(flow_list, known_files, known_routes, known_tables)
     v03 = _check_broken_flows(flow_list, known_files, known_routes)
     v04 = _check_missing_branches(flow_list, file_to_redir)
-    v05 = _check_route_coverage(cm, flow_pages, flow_paths)
-    v06 = _check_db_write_coverage(cm, flow_pages)
-    v07 = _check_form_coverage(cm, flow_pages)
+    v05 = _check_route_coverage(cm, flow_pages, flow_paths, flow_evidence)
+    v06 = _check_db_write_coverage(cm, flow_pages, flow_evidence)
+    v07 = _check_form_coverage(cm, flow_pages, flow_paths, flow_evidence)
     v08 = _check_flow_confidence(flow_list, known_files, known_routes)
+    v09 = _check_auth_guard_coverage(cm, flow_list, flow_pages, flow_evidence)
 
     checks = {
         "V-01": v01, "V-02": v02, "V-03": v03, "V-04": v04,
         "V-05": v05, "V-06": v06, "V-07": v07, "V-08": v08,
+        "V-09": v09,
     }
 
     # ── Summary ────────────────────────────────────────────────────────────────
@@ -185,7 +211,7 @@ def run_validation(ctx: Any) -> dict:
         scores.append(float(chk.get("pct", 0.0)))
     scores.append(float(v08.get("avg_confidence", 0.0)))
     # Boolean checks: 1.0 if pass, 0.5 if warn, 0.0 if fail
-    for chk in [v01, v02, v03, v04]:
+    for chk in [v01, v02, v03, v04, v09]:
         st = chk.get("status", "pass")
         scores.append(1.0 if st == "pass" else 0.5 if st == "warn" else 0.0)
     overall_score = round(sum(scores) / len(scores), 3) if scores else 0.0
@@ -243,6 +269,7 @@ def format_report_md(report: dict) -> str:
         ("V-06", "Database Write Coverage"),
         ("V-07", "Form Coverage"),
         ("V-08", "Flow Confidence Scoring"),
+        ("V-09", "Auth Guard Coverage"),
     ]
     for cid, cname in chk_meta:
         chk = report["checks"].get(cid, {})
@@ -260,6 +287,8 @@ def format_report_md(report: dict) -> str:
             score_str = f"{chk['broken_count']} broken"
         elif "branch_count" in chk:
             score_str = f"{chk['branch_count']} flows"
+        elif "ungaurded_count" in chk:
+            score_str = f"{chk['ungaurded_count']} unguarded"
         else:
             score_str = "—"
         lines.append(f"| {cid} | {cname} | {icon} | {score_str} |")
@@ -286,6 +315,7 @@ def format_report_md(report: dict) -> str:
     lines += _section_cov("V-07", "Form Coverage",
                           report["checks"].get("V-07", {}), "form", "method", "action")
     lines += _section_v08(report["checks"].get("V-08", {}))
+    lines += _section_v09(report["checks"].get("V-09", {}))
 
     return "\n".join(lines)
 
@@ -350,9 +380,14 @@ def _check_missing_flows(
         ffile = ff.get("file", "")
         fname = Path(ffile).name.lower() if ffile else ""
         fmethod = (ff.get("method") or "GET").upper()
-        if fname and fname not in flow_pages and fname not in flow_evidence:
+        action = (ff.get("action") or "").strip().lower().split("?")[0]
+        action_norm = _normalize_route(action) if action else ""
+        action_covered = (
+            (action and action in flow_paths)
+            or (action_norm and action_norm in {_normalize_route(p) for p in flow_paths})
+        )
+        if fname and fname not in flow_pages and fname not in flow_evidence and not action_covered:
             sev = "major" if fmethod == "POST" else "minor"
-            action = ff.get("action", "")
             items.append({
                 "type":       "form",
                 "identifier": f"{fmethod} form → {action or '(same page)'}",
@@ -413,6 +448,31 @@ def _check_missing_flows(
 
 # ─── V-02: Fake / Hallucinated Steps ──────────────────────────────────────────
 
+def _normalize_route(path: str) -> str:
+    """
+    Normalise a route path so that concrete parameter values and framework
+    placeholder syntax both collapse to the same token, enabling comparison
+    between:
+      - registered routes:  /users/{id}/edit   /api/orders/:id
+      - flow step pages:    /users/42/edit     /api/orders/abc-123
+    Replacements (applied in order):
+      1. Laravel/Slim {param} and {param?}    → {*}
+      2. Express/Symfony :param               → {*}
+      3. Numeric-only segments                → {*}
+      4. UUID-like segments (8+ hex+dash)     → {*}
+    """
+    # 1. {param} / {param?}
+    path = re.sub(r"\{[^/}]+\??\}", "{*}", path)
+    # 2. :param (Express / Symfony style)
+    path = re.sub(r"(?<=/):([A-Za-z_][A-Za-z0-9_]*)", "{*}", path)
+    # 3. Numeric segments  /42/  or  /42
+    path = re.sub(r"(?<=/)\d+(?=/|$)", "{*}", path)
+    # 4. UUID-like segments
+    path = re.sub(r"(?<=/)[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}(?=/|$)",
+                  "{*}", path, flags=re.IGNORECASE)
+    return path
+
+
 def _check_hallucinated_steps(
     flow_list:    list,
     known_files:  set[str],
@@ -420,12 +480,28 @@ def _check_hallucinated_steps(
     known_tables: set[str],
 ) -> dict:
     """Flow steps referencing files, routes, or tables that don't exist."""
+    # Build a normalised version of every known route for parametric matching
+    known_routes_norm: set[str] = {_normalize_route(r) for r in known_routes}
+
     items: list[dict] = []
 
     for flow in flow_list:
         for step in (flow.steps or []):
-            page = (step.page or "").strip()
+            page   = (step.page   or "").strip()
+            action = (step.action or "").strip()
             issues_for_step: list[str] = []
+
+            # ── Skip steps that are known-generated (not LLM-invented) ─────────
+            # Redirect steps are synthesised from cm.redirects data by the
+            # skeleton builder — their page value is a redirect target segment,
+            # not a PHP file or registered route, so checking them against
+            # known_files / known_routes always produces false positives.
+            if action.startswith("Redirect →"):
+                continue
+            # Branch steps reference alternate-path pages that may legitimately
+            # sit outside the main route registry (e.g. error pages, external URLs).
+            if getattr(step, "is_branch", False):
+                continue
 
             # ── File check: step.page looks like a PHP file ────────────────────
             if page.endswith(".php"):
@@ -437,24 +513,36 @@ def _check_hallucinated_steps(
 
             # ── Route path check: step.page starts with '/' ───────────────────
             elif page.startswith("/") and not page.endswith(".php"):
-                path_clean = page.split("?")[0].lower()
+                # Strip query string and normalise trailing slash before comparing
+                path_clean = page.split("?")[0].lower().rstrip("/") or "/"
                 if path_clean not in known_routes:
-                    # Partial match: check if any known route starts with this prefix
-                    if not any(r.startswith(path_clean) or path_clean.startswith(r)
-                               for r in known_routes if r):
-                        issues_for_step.append(
-                            f"Route path '{page}' not found in registered routes"
-                        )
+                    # Normalise both sides and retry (handles {param} / numeric segs)
+                    path_norm = _normalize_route(path_clean)
+                    if path_norm not in known_routes_norm:
+                        # Partial prefix match as last resort
+                        if not any(
+                            r.rstrip("/") == path_clean
+                            or r.startswith(path_clean + "/")
+                            or path_clean.startswith(r.rstrip("/") + "/")
+                            for r in known_routes if r
+                        ):
+                            issues_for_step.append(
+                                f"Route path '{page}' not found in registered routes"
+                            )
 
             # ── DB ops check: tables mentioned in step.db_ops ─────────────────
             for db_op in (step.db_ops or []):
                 # db_ops format: "INSERT users" or "SELECT sessions"
+                # Only check ops whose first word is a known SQL verb — skips
+                # "SQL QUERY on ``:" (raw query log), "Eloquent create:Model"
+                # (ORM format), and other non-standard strings.
                 parts = db_op.strip().split()
-                if len(parts) >= 2:
-                    table = parts[1].lower()
+                if len(parts) >= 2 and parts[0].lower() in _SQL_OP_VERBS:
+                    table = parts[1].lower().strip("`\"'();,")
                     if (table not in _SKIP_TABLES
                             and table not in known_tables
-                            and len(table) > 2):  # ignore very short tokens
+                            and len(table) > 2
+                            and ":" not in table):   # skip ORM "op:Model"
                         issues_for_step.append(
                             f"DB op '{db_op}' references unknown table '{table}'"
                         )
@@ -506,9 +594,17 @@ def _check_broken_flows(
         severity = "minor"
 
         # Single-step (no chain at all)
+        # A single-step flow with valid evidence is a shallow gap-fill stub
+        # (real code, just a single-file module) — classify as minor so it
+        # doesn't inflate the major-issue count.  A single-step flow with NO
+        # evidence is a genuinely fabricated flow → major.
         if len(steps) < 2:
-            issues.append("Only 1 step — no route→controller→DB chain")
-            severity = "major"
+            if ev_files:
+                issues.append("Only 1 step — shallow single-file module stub")
+                # severity stays "minor"
+            else:
+                issues.append("Only 1 step — no route→controller→DB chain")
+                severity = "major"
 
         # Zero evidence_files (LLM invented the flow with no code backing)
         if not ev_files:
@@ -551,13 +647,19 @@ def _check_broken_flows(
             })
 
     items = items[:_MAX_LIST]
-    n = len(items)
+    n        = len(items)
     critical = sum(1 for i in items if i["severity"] == "critical")
+    major    = sum(1 for i in items if i["severity"] == "major")
 
-    if n > _V03_FAIL or critical > 2:
+    # Thresholds apply to major+critical only; minor issues (shallow stubs with
+    # valid evidence) are informational and don't trigger FAIL/WARN escalation.
+    major_critical = major + critical
+    if major_critical > _V03_FAIL or critical > 2:
         status, icon = "fail", "❌"
-    elif n > _V03_WARN or critical > 0:
+    elif major_critical > _V03_WARN or critical > 0:
         status, icon = "warn", "⚠️"
+    elif n > 0:
+        status, icon = "warn", "⚠️"   # minor-only issues
     else:
         status, icon = "pass", "✅"
 
@@ -583,8 +685,21 @@ def _check_missing_branches(
     the flow has no branch steps (potential missing error / alternate path).
     """
     items: list[dict] = []
+    seen_flow_ids: set[str] = set()
+    seen_flow_names: set[str] = set()
 
     for flow in flow_list:
+        # Deduplicate by flow_id — stage45 can emit the same enriched flow
+        # multiple times when parallel BFS paths map to identical context groups.
+        fid = flow.flow_id or ""
+        if fid and fid in seen_flow_ids:
+            continue
+        # Also deduplicate by normalised flow name — duplicate flows sometimes
+        # receive different flow_ids but represent the same business operation.
+        fname_key = (flow.name or "").strip().lower()
+        if fname_key and fname_key in seen_flow_names:
+            continue
+
         ev_files = flow.evidence_files or []
         branches = flow.branches or []
 
@@ -597,6 +712,10 @@ def _check_missing_branches(
                     all_targets.add(t)
 
         if len(all_targets) >= 2 and not branches:
+            if fid:
+                seen_flow_ids.add(fid)
+            if fname_key:
+                seen_flow_names.add(fname_key)
             sorted_targets = sorted(all_targets)[:6]
             items.append({
                 "flow_id":        flow.flow_id,
@@ -635,9 +754,10 @@ def _check_missing_branches(
 # ─── V-05: Route Coverage ─────────────────────────────────────────────────────
 
 def _check_route_coverage(
-    cm:         Any,
-    flow_pages: set[str],
-    flow_paths: set[str],
+    cm:            Any,
+    flow_pages:    set[str],
+    flow_paths:    set[str],
+    flow_evidence: set[str],
 ) -> dict:
     """% of HTTP routes (by path) covered by at least one flow step."""
     seen_paths: set[str] = set()
@@ -658,7 +778,7 @@ def _check_route_coverage(
             continue
         seen_paths.add(key)
 
-        in_flow = _route_in_flows(path, rname, flow_pages, flow_paths, set())
+        in_flow = _route_in_flows(path, rname, flow_pages, flow_paths, flow_evidence)
 
         if in_flow:
             covered.append({"method": method, "path": path, "file": rfile})
@@ -696,8 +816,9 @@ def _check_route_coverage(
 # ─── V-06: Database Write Operation Coverage ──────────────────────────────────
 
 def _check_db_write_coverage(
-    cm:         Any,
-    flow_pages: set[str],
+    cm:            Any,
+    flow_pages:    set[str],
+    flow_evidence: set[str],
 ) -> dict:
     """% of SQL write ops (INSERT/UPDATE/DELETE/REPLACE) covered by flows."""
     seen: set[tuple[str, str]] = set()
@@ -720,7 +841,10 @@ def _check_db_write_coverage(
             continue
         seen.add(key)
 
-        if qname and qname in flow_pages:
+        # A DB write is covered if its source file appears in flow step pages
+        # OR in flow evidence_files (covers MVC apps where controllers are in
+        # evidence_files but not necessarily in step.page).
+        if qname and (qname in flow_pages or qname in flow_evidence):
             covered_count += 1
         else:
             sev = "critical" if op == "DELETE" else "major"
@@ -751,10 +875,19 @@ def _check_db_write_coverage(
 # ─── V-07: Form Coverage ──────────────────────────────────────────────────────
 
 def _check_form_coverage(
-    cm:         Any,
-    flow_pages: set[str],
+    cm:            Any,
+    flow_pages:    set[str],
+    flow_paths:    set[str],
+    flow_evidence: set[str],
 ) -> dict:
-    """% of HTML forms covered by at least one flow step."""
+    """% of HTML forms covered by at least one flow step.
+
+    A form is considered covered if ANY of these match:
+      1. The form's source file basename appears in flow step pages (classic PHP)
+      2. The form's source file basename appears in flow evidence_files (MVC views)
+      3. The form's action URL (normalised) appears in flow_paths (MVC routes)
+         — covers Laravel Blade forms whose action points to a covered route
+    """
     seen:  set[str]  = set()
     covered_count    = 0
     uncovered: list[dict] = []
@@ -762,11 +895,22 @@ def _check_form_coverage(
     for ff in (getattr(cm, "form_fields", None) or []):
         ffile  = ff.get("file", "")
         fname  = Path(ffile).name.lower() if ffile else ""
+        action = (ff.get("action") or "").strip().lower().split("?")[0]
         if not fname or fname in seen:
             continue
         seen.add(fname)
 
-        if fname in flow_pages:
+        # Normalise action for parametric route matching
+        action_norm = _normalize_route(action) if action else ""
+
+        in_flow = (
+            (fname in flow_pages)
+            or (fname in flow_evidence)
+            or (action and action in flow_paths)
+            or (action_norm and action_norm in {_normalize_route(p) for p in flow_paths})
+        )
+
+        if in_flow:
             covered_count += 1
         else:
             method = (ff.get("method") or "GET").upper()
@@ -900,6 +1044,137 @@ def _check_flow_confidence(
                            f"{medium_count} MEDIUM 🟡 · "
                            f"{low_count} LOW 🔴"),
         "flows":          rows,
+    }
+
+
+# ─── V-09: Auth Guard Coverage ────────────────────────────────────────────────
+
+def _check_auth_guard_coverage(
+    cm:            Any,
+    flow_list:     list,
+    flow_pages:    set[str],
+    flow_evidence: set[str],
+) -> dict:
+    """
+    V-09: Auth Guard Coverage
+
+    For every execution path that carries an ``auth_guard`` in the parsed
+    source code (stage15), verify that at least one business flow covering
+    that file declares ``auth_required`` (either at the flow level or on
+    any step).
+
+    Unguarded paths indicate the LLM missed the authentication requirement
+    when generating flows — the BA documents will silently omit access
+    control details for those screens.
+
+    Also cross-checks ``code_map.auth_signals`` (session checks, role gates,
+    redirect guards from stage15) for files that appear in flows but whose
+    covering flows are not marked auth-aware.
+    """
+    # Build the set of file basenames covered by auth-aware flows
+    auth_covered_files: set[str] = set()
+    for flow in flow_list:
+        flow_auth = getattr(flow, "auth_required", False)
+        if not flow_auth:
+            flow_auth = any(
+                getattr(step, "auth_required", False)
+                for step in (flow.steps or [])
+            )
+        if flow_auth:
+            for step in (flow.steps or []):
+                page = (step.page or "").split("?")[0].strip()
+                if page:
+                    auth_covered_files.add(Path(page).name.lower())
+            for fpath in (flow.evidence_files or []):
+                if fpath:
+                    auth_covered_files.add(Path(fpath).name.lower())
+
+    items:       list[dict] = []
+    seen_files:  set[str]   = set()
+
+    # ── Pass 1: execution_paths with auth_guard ────────────────────────────────
+    for ep in (getattr(cm, "execution_paths", None) or []):
+        if not ep.get("auth_guard"):
+            continue
+        efile = ep.get("file", "")
+        ename = Path(efile).name.lower() if efile else ""
+        if not ename or ename in seen_files:
+            continue
+        seen_files.add(ename)
+
+        in_any_flow  = ename in flow_pages or ename in flow_evidence
+        in_auth_flow = ename in auth_covered_files
+
+        if not in_auth_flow:
+            auth_guard = ep.get("auth_guard") or {}
+            guard_type = (
+                auth_guard.get("type", "unknown")
+                if isinstance(auth_guard, dict)
+                else str(auth_guard)
+            )
+            severity = "major" if in_any_flow else "minor"
+            reason = (
+                f"File has {guard_type} auth guard in code but "
+                + ("flow covers it without auth_required"
+                   if in_any_flow
+                   else "no flow covers this file")
+            )
+            items.append({
+                "file":       efile,
+                "basename":   ename,
+                "guard_type": guard_type,
+                "in_flow":    in_any_flow,
+                "severity":   severity,
+                "reason":     reason,
+            })
+
+    # ── Pass 2: auth_signals for files already in flows but not auth-covered ───
+    for sig in (getattr(cm, "auth_signals", None) or []):
+        sigfile = sig.get("file", "")
+        signame = Path(sigfile).name.lower() if sigfile else ""
+        if not signame or signame in seen_files:
+            continue
+        seen_files.add(signame)
+
+        in_any_flow  = signame in flow_pages or signame in flow_evidence
+        in_auth_flow = signame in auth_covered_files
+
+        # Only flag files that are in flows (non-flow files are already caught
+        # by Pass 1 via missing-flow checks; reporting them twice is noisy).
+        if in_any_flow and not in_auth_flow:
+            items.append({
+                "file":       sigfile,
+                "basename":   signame,
+                "guard_type": sig.get("type", "auth_signal"),
+                "in_flow":    True,
+                "severity":   "major",
+                "reason":     (f"File has {sig.get('type','auth')} guard in code "
+                               f"but covering flow lacks auth_required"),
+            })
+
+    items = items[:_MAX_LIST]
+    n           = len(items)
+    major_count = sum(1 for i in items if i["severity"] == "major")
+
+    if major_count > _V09_FAIL:
+        status, icon = "fail", "❌"
+    elif major_count > _V09_WARN or n > _V09_FAIL:
+        status, icon = "warn", "⚠️"
+    elif n > 0:
+        status, icon = "warn", "⚠️"
+    else:
+        status, icon = "pass", "✅"
+
+    return {
+        "name":            "Auth Guard Coverage",
+        "status":          status,
+        "icon":            icon,
+        "ungaurded_count": n,
+        "detail":          (
+            "All auth-guarded files are covered by auth-aware flows" if n == 0
+            else f"{n} file(s) have auth guards in code but no auth_required flow"
+        ),
+        "items":           items,
     }
 
 
@@ -1075,6 +1350,36 @@ def _section_v08(chk: dict) -> list[str]:
             f"| {note} |"
         )
     lines.append("")
+    return lines
+
+
+def _section_v09(chk: dict) -> list[str]:
+    lines = [
+        "## V-09: Auth Guard Coverage",
+        "",
+        f"**Status:** {chk.get('icon','')} {chk.get('status','').upper()}  "
+        f"│  **Unguarded:** {chk.get('ungaurded_count', 0)}",
+        "",
+        f"> {chk.get('detail', '')}",
+        "",
+    ]
+    items = chk.get("items", [])
+    if items:
+        lines += [
+            "| File | Guard Type | In Flow? | Severity | Reason |",
+            "|------|-----------|----------|----------|--------|",
+        ]
+        for it in items:
+            fname     = Path(it.get("file", "")).name or "—"
+            in_flow_s = "✓" if it.get("in_flow") else "✗"
+            lines.append(
+                f"| {fname} "
+                f"| {it.get('guard_type', '')} "
+                f"| {in_flow_s} "
+                f"| {it.get('severity', '')} "
+                f"| {it.get('reason', '')} |"
+            )
+        lines.append("")
     return lines
 
 

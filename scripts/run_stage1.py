@@ -22,7 +22,7 @@ def main() -> None:
         sys.exit(1)
 
     from context import PipelineContext
-    from pipeline.stage1_parse import run, summarise_code_map
+    from pipeline.stage10_parse import run, summarise_code_map
 
     ctx = _load_or_create(sys.argv[1])
 

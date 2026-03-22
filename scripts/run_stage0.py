@@ -34,7 +34,7 @@ def main() -> None:
         sys.exit(1)
 
     from context import PipelineContext
-    from pipeline.stage0_validate import run as stage0_run, PipelineError
+    from pipeline.stage00_validate import run as stage0_run, PipelineError
 
     ctx = PipelineContext.create(
         php_project_path=str(project_path),

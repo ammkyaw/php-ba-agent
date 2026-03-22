@@ -1,5 +1,5 @@
 """
-pipeline/stage15_paths.py — Execution Path Simulator (Conditional Branch Extractor)
+pipeline/stage15_paths.py — Execution Path Simulator (Multi-Language Dispatcher)
 
 Performs a focused static analysis pass over each PHP entry-point file to extract:
 
@@ -54,7 +54,7 @@ import traceback
 from pathlib import Path
 from typing import Any
 
-from context import CodeMap, Framework, PipelineContext
+from context import CodeMap, Framework, Language, PipelineContext
 
 OUTPUT_FILE = "execution_paths.json"
 ERROR_FILE  = "execution_paths_errors.json"
@@ -92,13 +92,52 @@ def run(ctx: PipelineContext) -> None:
     if ctx.code_map is None:
         raise RuntimeError("[stage15] ctx.code_map is None — run Stage 1 first.")
 
+    language  = ctx.code_map.language
     framework = ctx.code_map.framework
     print(f"  [stage15] Analysing execution paths in "
-          f"{ctx.code_map.total_files} file(s) ... (framework={framework.value})")
+          f"{ctx.code_map.total_files} file(s) "
+          f"(language={language.value}, framework={framework.value})")
+
+    # ── Language dispatch ─────────────────────────────────────────────────────
+    if language in (Language.TYPESCRIPT, Language.JAVASCRIPT):
+        from pipeline.paths.typescript_paths import enrich as ts_enrich  # noqa: PLC0415
+        all_paths = ts_enrich(ctx)
+        ctx.stage("stage15_paths").mark_completed(output_path)
+        ctx.save()
+        return
+
+    if language in (Language.JAVA, Language.KOTLIN):
+        from pipeline.paths.java_paths import enrich as java_enrich  # noqa: PLC0415
+        all_paths = java_enrich(ctx)
+        ctx.stage("stage15_paths").mark_completed(output_path)
+        ctx.save()
+        return
+
+    # ── PHP path (original logic below) ──────────────────────────────────────
 
     # ── Collect PHP entry-point files ─────────────────────────────────────────
     php_files = _collect_php_files(ctx.php_project_path)
     print(f"  [stage15] Found {len(php_files)} PHP file(s) to analyse.")
+
+    # ── Augment with Stage 1.3 entry-point catalog ────────────────────────────
+    # Include handler files from the entry-point catalog that weren't picked up
+    # by _collect_php_files (e.g. CLI-only queue workers, cron scripts deep in
+    # subdirectories that the HTTP-focused collector skips).
+    _ep_type_by_abs: dict[str, str] = {}   # abs_path → ep_type
+    if ctx.entry_point_catalog and ctx.entry_point_catalog.entry_points:
+        root = Path(ctx.php_project_path)
+        php_files_set = set(php_files)
+        added = 0
+        for ep in ctx.entry_point_catalog.entry_points:
+            abs_path = str((root / ep.handler_file).resolve())
+            _ep_type_by_abs[abs_path] = ep.ep_type
+            if abs_path not in php_files_set and Path(abs_path).exists():
+                php_files.append(abs_path)
+                php_files_set.add(abs_path)
+                added += 1
+        if added:
+            print(f"  [stage15] Entry-point catalog: added {added} "
+                  f"additional handler file(s) for analysis.")
 
     # ── Analyse each file ─────────────────────────────────────────────────────
     all_paths: list[dict[str, Any]] = []
@@ -108,6 +147,10 @@ def run(ctx: PipelineContext) -> None:
         try:
             result = analyse_file(php_file, ctx.php_project_path, framework)
             if result:
+                # Tag ep_type from Stage 1.3 catalog when available
+                ep_type = _ep_type_by_abs.get(str(Path(php_file).resolve()))
+                if ep_type and ep_type != "http":
+                    result["ep_type"] = ep_type
                 all_paths.append(result)
         except Exception as exc:                              # noqa: BLE001
             # Capture full traceback — the old code swallowed these silently
@@ -215,6 +258,12 @@ def analyse_file(
             if result:
                 return result
 
+    # ── SuiteCRM / SugarCRM bean files ────────────────────────────────────────
+    if _is_sugarcrm_bean(php_file, source):
+        result = _SugarCRMBeanAnalyser(source, rel).analyse()
+        if result:
+            return result
+
     # ── Raw PHP / legacy fallback ─────────────────────────────────────────────
     return _FileAnalyser(source, rel).analyse()
 
@@ -235,6 +284,138 @@ def _is_laravel_controller(php_file: str, source: str) -> bool:
         or "Controllers" in str(p)
         or re.search(r'extends\s+\w*Controller', source) is not None
     )
+
+
+# ─── SuiteCRM / SugarCRM Bean Detection Helpers ───────────────────────────────
+
+def _is_sugarcrm_bean(php_file: str, source: str) -> bool:
+    """Return True if this file is a SuiteCRM/SugarCRM bean/model file.
+
+    Detection heuristics (any one is sufficient):
+    - File path matches modules/<ModuleName>/<ClassName>.php
+    - Source contains 'extends SugarBean' / 'extends Basic' / etc.
+    - Source contains '$this->db->query(' — characteristic SugarCRM DB call
+    """
+    p = Path(php_file)
+    # Path heuristic: modules/<Module>/<File>.php
+    parts = p.parts
+    try:
+        mod_idx = next(i for i, pt in enumerate(parts) if pt == "modules")
+        if len(parts) - mod_idx >= 3:  # modules/<Mod>/<File>.php
+            return True
+    except StopIteration:
+        pass
+    # Source heuristics
+    if re.search(
+        r'\bextends\s+(?:SugarBean|Basic|Person|Company|SugarObject|'
+        r'VardefManager|SugarLogger|SugarView)\b',
+        source, re.IGNORECASE,
+    ):
+        return True
+    if re.search(r'\$this\s*->\s*db\s*->\s*(?:query|insertRecord|updateRecord'
+                 r'|deleteRecord|insert|update|delete)\s*\(', source, re.IGNORECASE):
+        return True
+    return False
+
+
+class _SugarCRMBeanAnalyser:
+    """
+    Analyses SuiteCRM/SugarCRM bean files for SQL operations.
+
+    Bean files (e.g. modules/Accounts/Account.php) extend SugarBean and
+    interact with the database via ``$this->db->query()``,
+    ``$this->db->insertRecord()``, ``DBManager::getInstance()->query()``,
+    ``$this->save()``, etc.
+
+    These files are never web entry points (no ``$_POST``, ``header()`` calls)
+    so ``_FileAnalyser`` returns ``None`` for them.  This analyser emits a
+    minimal path record so bean files appear in ``execution_paths`` and V-06
+    can count their SQL write ops as covered by flows that reference the module.
+    """
+
+    _DB_CALL_PAT = re.compile(
+        r'(?:'
+        r'\$this\s*->\s*db\s*->\s*(?:query|limitQuery|prepare|'
+        r'insertRecord|updateRecord|deleteRecord|insert|update|delete|fetchByAssoc)'
+        r'|DBManager\s*::\s*getInstance\s*\(\s*\)\s*->\s*(?:query|insert|update|delete)'
+        r'|\$(?:db|conn|pdo)\s*->\s*(?:query|insertRecord|updateRecord|deleteRecord|'
+        r'insert|update|delete|prepare)'
+        r')\s*\(',
+        re.IGNORECASE,
+    )
+    _INLINE_SQL_PAT = re.compile(
+        r'''['"]([ \t]*(?:SELECT|INSERT|UPDATE|DELETE|REPLACE|CREATE|DROP|ALTER|TRUNCATE)\b[^'"]{4,})['"]''',
+        re.IGNORECASE,
+    )
+    _SAVE_PAT = re.compile(r'\$this\s*->\s*save\s*\(\s*\)', re.IGNORECASE)
+
+    def __init__(self, source: str, filename: str) -> None:
+        self.source   = source
+        self.filename = filename
+
+    def analyse(self) -> dict[str, Any] | None:
+        data_flows: list[dict[str, Any]] = []
+        seen_keys: set[tuple[str, str]] = set()
+
+        for m in self._DB_CALL_PAT.finditer(self.source):
+            # Scan ahead up to 300 chars for an inline SQL string
+            region = self.source[m.start(): m.start() + 300]
+            sql_m  = self._INLINE_SQL_PAT.search(region)
+            if sql_m:
+                sql_frag = sql_m.group(1).strip()[:120]
+                op       = _classify_sql_op(sql_frag)
+                tbl      = _extract_table_name(sql_frag)
+                key      = (op, tbl)
+                if key not in seen_keys:
+                    seen_keys.add(key)
+                    data_flows.append({
+                        "source":    "sugarcrm_db",
+                        "sql":       sql_frag[:80],
+                        "operation": op.upper(),
+                        "table":     tbl,
+                    })
+            else:
+                # No inline string — record the call site without a table name
+                call_snippet = self.source[m.start(): m.end() + 30].strip()[:60]
+                op_key = ("query", "")
+                if op_key not in seen_keys:
+                    seen_keys.add(op_key)
+                    data_flows.append({
+                        "source":    "sugarcrm_db",
+                        "sql":       call_snippet,
+                        "operation": "QUERY",
+                        "table":     "",
+                    })
+
+        # $this->save() → SugarBean ORM INSERT/UPDATE
+        save_count = len(self._SAVE_PAT.findall(self.source))
+        if save_count:
+            bean_table = Path(self.filename).stem.lower()
+            data_flows.append({
+                "source":    "sugarcrm_save",
+                "sql":       f"$this->save() ×{save_count}",
+                "operation": "INSERT/UPDATE",
+                "table":     bean_table,
+            })
+
+        if not data_flows:
+            return None
+
+        happy_path = [
+            (f"DB {df['operation']} on `{df['table']}`" if df["table"]
+             else f"DB {df['operation']}")
+            for df in data_flows[:6]
+        ]
+
+        return {
+            "file":             self.filename,
+            "type":             "sugarcrm_bean",
+            "entry_conditions": [],
+            "branches":         [],
+            "data_flows":       data_flows,
+            "auth_guard":       None,
+            "happy_path":       happy_path,
+        }
 
 
 # ─── Laravel Route File Analyser ──────────────────────────────────────────────
@@ -790,10 +971,28 @@ class _FileAnalyser:
         source = self.source
 
         var_map: dict[str, str] = {}
+        # Direct assignment: $var = $_POST['key']
         for m in re.finditer(
             r'\$(\w+)\s*=\s*\$_(POST|GET|REQUEST)\s*\[\s*[\'"](\w+)[\'"]\s*\]', source
         ):
             var_map[m.group(1)] = f"$_{m.group(2)}['{m.group(3)}']"
+
+        # Wrapped/sanitized assignment: $var = anyFn($_POST['key'])
+        # e.g. $var = intval($_POST['id']), $var = htmlspecialchars($_GET['q'])
+        for m in re.finditer(
+            r'\$(\w+)\s*=\s*\w+\s*\(\s*\$_(POST|GET|REQUEST)\s*\[\s*[\'"](\w+)[\'"]\s*\]',
+            source,
+        ):
+            if m.group(1) not in var_map:   # don't overwrite direct assignments
+                var_map[m.group(1)] = f"$_{m.group(2)}['{m.group(3)}']"
+
+        # filter_input(INPUT_POST/GET/REQUEST, 'key') — standard PHP input filter
+        for m in re.finditer(
+            r'\$(\w+)\s*=\s*filter_input\s*\(\s*INPUT_(POST|GET|REQUEST)\s*,\s*[\'"](\w+)[\'"]',
+            source, re.IGNORECASE,
+        ):
+            if m.group(1) not in var_map:
+                var_map[m.group(1)] = f"$_{m.group(2)}['{m.group(3)}']"
 
         sql_var_map: dict[str, str] = {}
         for m in re.finditer(r'\$(\w+)\s*=\s*["\']([^"\']{10,})["\']', source):
@@ -833,7 +1032,7 @@ class _FileAnalyser:
             op    = _classify_sql_op(sql)
 
             field_mapping: dict[str, str] = {}
-            for im in re.finditer(r'\$_(POST|GET)\[\'(\w+)\'\]', sql):
+            for im in re.finditer(r'\$_(POST|GET|REQUEST)\[\'(\w+)\'\]', sql):
                 field_mapping[im.group(2)] = f"$_{im.group(1)}['{im.group(2)}']"
 
             for var, origin in var_map.items():
@@ -866,6 +1065,7 @@ class _FileAnalyser:
     def _extract_auth_guard(self) -> dict[str, Any] | None:
         top = "\n".join(self.lines[:50])
 
+        # Pattern 1: if (!isset($_SESSION['key'])) { header("Location: ...") }
         m = re.search(
             r'if\s*\(\s*(!?)isset\s*\(\s*\$_SESSION\[([\'"])(\w+)\2\]\s*\)\s*\)'
             r'[^{]*\{[^}]*header\s*\(\s*[\'"]Location:\s*([^\'\"]+)[\'"]',
@@ -878,12 +1078,42 @@ class _FileAnalyser:
                 "redirect": m.group(4).strip(),
             }
 
+        # Pattern 2: $_SESSION['key'] == 'value' comparison
         m = re.search(
             r'\$_SESSION\[([\'"])(\w+)\1\]\s*(==|!=|===)\s*[\'"](\w+)[\'"]',
             top,
         )
         if m:
             return {"key": m.group(2), "check": f"{m.group(3)} '{m.group(4)}'", "redirect": None}
+
+        # Pattern 3: isset($_SESSION['key']) or die/exit  (short-circuit auth)
+        # e.g.  isset($_SESSION['user']) or die('Not authorized');
+        m = re.search(
+            r'isset\s*\(\s*\$_SESSION\[([\'"])(\w+)\1\]\s*\)\s*or\s*(?:die|exit)\s*\(',
+            top, re.IGNORECASE,
+        )
+        if m:
+            return {"key": m.group(2), "check": "isset_or_die", "redirect": None}
+
+        # Pattern 4: if (!defined('CONSTANT')) die/exit  (direct-access guard)
+        # Generic pattern used by WordPress, Joomla, and many raw PHP apps.
+        m = re.search(
+            r'if\s*\(\s*!defined\s*\(\s*[\'"](\w+)[\'"]\s*\)\s*\)\s*(?:die|exit)\s*[(\s;]',
+            top, re.IGNORECASE,
+        )
+        if m:
+            return {"key": m.group(1), "check": "defined_guard", "redirect": None}
+
+        # Pattern 5: require/include of a file with auth-related name
+        # e.g. require_once('includes/auth.php'), include('session_check.php')
+        # Generic — many PHP apps gate pages via an included auth file.
+        m = re.search(
+            r'(?:require|include)(?:_once)?\s*\(?\s*[\'"][^\'"]*'
+            r'(?:auth|login|session_check|access_check|check_login|guard|security)[^\'"]*\.php[\'"]',
+            top, re.IGNORECASE,
+        )
+        if m:
+            return {"key": "auth_include", "check": "require_auth_file", "redirect": None}
 
         return None
 

@@ -45,6 +45,7 @@ Pass I  Replace domain_model.workflows with flow summaries
 from __future__ import annotations
 
 import json
+import os
 import pickle
 import re
 from collections import defaultdict, deque
@@ -63,13 +64,40 @@ CLAUDE_MODEL   = "claude-sonnet-4-20250514"
 MAX_TOKENS     = 8192
 FLOWS_FILE     = "business_flows.json"
 
+# JSON schema for constrained decoding (Ollama ≥0.4.6 structured outputs)
+_FLOW_JSON_SCHEMA: dict = {
+    "type": "array",
+    "items": {
+        "type": "object",
+        "properties": {
+            "name":             {"type": "string"},
+            "actor":            {"type": "string"},
+            "trigger":          {"type": "string"},
+            "termination":      {"type": "string"},
+            "branches": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "condition": {"type": "string"},
+                        "outcome":   {"type": "string"},
+                    },
+                    "required": ["condition", "outcome"],
+                },
+            },
+            "replaces_workflow": {"type": ["string", "null"]},
+        },
+        "required": ["name", "actor", "trigger", "termination", "branches"],
+    },
+}
+
 # Graph traversal limits
 MAX_DEPTH      = 8    # max hops from an entry-point node
-MAX_PATHS      = 500  # cap on candidate paths before dedup (was 40 — too low for large apps)
+MAX_PATHS      = 1500  # cap on candidate paths before dedup (was 500 — raised for large apps)
 MAX_PATH_LEN   = 12   # max steps in a single flow
 
 # Gap-fill: modules per synthetic-skeleton call
-GAP_FILL_MAX_MODULES_45 = 20
+GAP_FILL_MAX_MODULES_45 = 50
 # Gap-fill: max rounds of coverage-driven flow generation
 MAX_GAP_ROUNDS_45 = 10
 
@@ -404,10 +432,46 @@ def _get_uncovered_modules(
     return uncovered_modules
 
 
+def _get_uncovered_flat_dirs(
+    flows: list["BusinessFlow"],
+    exec_paths: list[dict],
+) -> dict[str, list[str]]:
+    """
+    Return {parent_dir: [full_file_paths]} for non-module exec-path files
+    whose parent directory has no file covered by any existing flow.
+    Used as a flat-file fallback after module gap-fill is exhausted.
+    """
+    from collections import defaultdict
+
+    covered_basenames: set[str] = set()
+    for flow in flows:
+        for ef in (flow.evidence_files or []):
+            covered_basenames.add(Path(ef).name.lower())
+        for step in (flow.steps or []):
+            covered_basenames.add(step.page.lower())
+
+    dir_files: dict[str, list[str]] = defaultdict(list)
+    for ep in exec_paths:
+        f = ep.get("file", "")
+        if not f or _extract_module_name_45(f):
+            continue   # skip module files — handled by _get_uncovered_modules
+        parent = str(Path(f).parent)
+        dir_files[parent].append(f)
+
+    uncovered_dirs: dict[str, list[str]] = {}
+    for parent, files in dir_files.items():
+        basenames = [Path(f).name.lower() for f in files]
+        if not any(b in covered_basenames for b in basenames):
+            uncovered_dirs[parent] = files
+
+    return uncovered_dirs
+
+
 def _build_gap_fill_skeletons(
     uncovered_modules: dict[str, list[str]],
     exec_paths: list[dict],
     max_modules: int = GAP_FILL_MAX_MODULES_45,
+    call_graph: list[dict] | None = None,
 ) -> list[dict]:
     """
     Build synthetic flow skeletons directly from execution_paths data for
@@ -416,10 +480,27 @@ def _build_gap_fill_skeletons(
     Each skeleton represents the files in one module and carries whatever
     db_ops / auth / inputs data stage1.5 extracted — enough for LLM enrichment
     (Pass G-H) to produce a named BusinessFlow.
+
+    If call_graph is supplied (ctx.code_map.call_graph), the step action
+    descriptions are enriched with the first few callee function names from
+    that file, giving the LLM richer context for accurate flow naming.
     """
     ep_by_file: dict[str, dict] = {
         ep["file"]: ep for ep in exec_paths if ep.get("file")
     }
+
+    # Build call_graph index: file path → list of callee function names.
+    # Used to produce more descriptive step actions ("Process X via fn1, fn2")
+    # instead of generic "Process X" stubs.
+    _callees_by_file: dict[str, list[str]] = {}
+    if call_graph:
+        for _edge in call_graph:
+            _fpath  = _edge.get("file", "")
+            _callee = _edge.get("callee", "")
+            if _fpath and _callee:
+                if _fpath not in _callees_by_file:
+                    _callees_by_file[_fpath] = []
+                _callees_by_file[_fpath].append(_callee)
 
     skeletons: list[dict] = []
 
@@ -438,6 +519,8 @@ def _build_gap_fill_skeletons(
             db_ops: list[str] = []
             inputs: list[str] = []
             for hp_step in ep.get("happy_path", []):
+                if not isinstance(hp_step, dict):
+                    continue
                 db_ops.extend(hp_step.get("db_ops", []))
                 inputs.extend(hp_step.get("inputs", []))
 
@@ -447,10 +530,20 @@ def _build_gap_fill_skeletons(
                 if ec.get("type") == "method_check":
                     http_method = ec.get("method")
 
+            # Enrich action description with callee function hints when available
+            _base_action = Path(fpath).stem.replace('_', ' ').title()
+            _callees = _callees_by_file.get(fpath, [])
+            if _callees:
+                # Deduplicate and take first 3 unique callee names as hints
+                _unique_callees = list(dict.fromkeys(_callees))[:3]
+                _action = f"Process {_base_action} via {', '.join(_unique_callees)}"
+            else:
+                _action = f"Process {_base_action}"
+
             steps.append(FlowStep(
                 step_num     = step_num,
                 page         = page,
-                action       = f"Process {Path(fpath).stem.replace('_', ' ').title()}",
+                action       = _action,
                 http_method  = http_method,
                 auth_required= auth_req,
                 db_ops       = db_ops[:3],
@@ -459,7 +552,10 @@ def _build_gap_fill_skeletons(
             ))
             step_num += 1
 
-        if not steps:
+        if len(steps) < 2:
+            # Single-file modules produce 1-step flows that V-03 flags as
+            # "broken" (no route→controller→DB chain).  Skip them — they add
+            # noise without providing analytical value.
             continue
 
         skeletons.append({
@@ -473,6 +569,156 @@ def _build_gap_fill_skeletons(
         })
 
     return skeletons
+
+
+# ─── Route Gap Stub Generator (Lite Dynamic Analysis) ─────────────────────────
+
+def _generate_missing_route_stubs(
+    skeletons: list[dict],
+    ctx: Any,
+) -> list[dict]:
+    """
+    Generate minimal skeleton flows for Laravel routes that have no matching
+    flow skeleton yet.  This is the 'lite dynamic analysis' layer: instead of
+    running PHP with Xdebug, we statically derive the execution context from
+    the route→controller→action mapping.
+
+    Only non-GET routes and non-trivial GET routes (with controller methods that
+    are not just 'index' or 'show') generate stubs, to avoid flooding the output
+    with trivial page-display flows.
+
+    The stubs are flagged ``source="route_stub"`` and ``is_draft=True`` so the
+    review report can highlight them.  They go through LLM enrichment just like
+    regular skeletons, so the final output is a properly named BusinessFlow.
+    """
+    routes = getattr(ctx, "routes", None) or []
+    if not routes:
+        return []
+
+    # Build a set of URIs already covered by existing skeletons
+    covered: set[str] = set()
+    for sk in skeletons:
+        for step in sk.get("steps", []):
+            page = getattr(step, "page", "") or (step.get("page", "") if isinstance(step, dict) else "")
+            if page:
+                covered.add(page.split("?")[0].lower().rstrip("/") or "/")
+        # Also check files
+        for f in sk.get("files", []):
+            covered.add(Path(f).name.lower().replace(".php", ""))
+
+    stubs: list[dict] = []
+    for route in routes:
+        if not isinstance(route, dict):
+            continue
+        uri        = route.get("uri") or route.get("path", "")
+        verb       = (route.get("method") or route.get("verb", "GET")).upper()
+        controller = route.get("controller", "")
+        action     = route.get("action") or route.get("method_name", "")
+
+        if not uri:
+            continue
+        uri_clean = uri.lower().rstrip("/") or "/"
+
+        # Skip already-covered routes
+        if uri_clean in covered:
+            continue
+
+        # Skip trivial read-only routes — index/show are usually simple list/detail pages
+        if verb == "GET" and action.lower() in ("index", "show", ""):
+            continue
+
+        # Build a minimal one-step skeleton
+        step = FlowStep(
+            step_num     = 1,
+            page         = uri,
+            action       = f"{verb} request handled by {controller}::{action}" if controller else f"{verb} {uri}",
+            auth_required= False,
+            db_ops       = [],
+            inputs       = [],
+            outputs      = [],
+            is_branch    = False,
+        )
+        stub: dict[str, Any] = {
+            "files":        [controller.replace("::", "/").replace("\\", "/") + ".php"] if controller else [],
+            "steps":        [step],
+            "branches":     [],
+            "source":       "route_stub",
+            "is_draft":     True,
+            "evidence_files": [],
+            "_structured_meta": {
+                "http_verb":  verb,
+                "uri":        uri,
+                "controller": controller,
+                "method":     action,
+                "sql_tables": [],
+                "redirect":   "",
+            },
+        }
+        stubs.append(stub)
+        covered.add(uri_clean)  # avoid duplicate stubs for same URI
+
+    if stubs:
+        print(f"  [stage45]   Generated {len(stubs)} route stub(s) for uncovered routes")
+    return stubs
+
+
+# ─── Branch Enrichment ─────────────────────────────────────────────────────────
+
+def _fill_branches_from_redirects(skeletons: list[dict], cm: Any) -> None:
+    """
+    Back-fill the ``branches`` list for skeletons that have none.
+
+    Tier-0 (Laravel) and Tier-1 (Structured-route) skeletons always start
+    with ``branches: []`` because the per-route builders only capture one
+    redirect target.  When the evidence files contain ≥2 distinct redirect
+    targets the flow likely has error / alternate paths that were missed.
+
+    This pass scans cm.redirects for each skeleton's evidence files and
+    creates a basic branch entry per additional redirect target so that
+    stage47 V-04 (Missing Branches) stops flagging them as uncovered.
+
+    Branch dicts follow the same schema used by the BFS graph builder:
+        {"at_page": str, "condition": str, "alternate": list[str]}
+    """
+    if not (cm and getattr(cm, "redirects", None)):
+        return
+
+    # Build file → [redirect-dict, …] index once
+    from collections import defaultdict as _dd
+    f2r: dict[str, list[dict]] = _dd(list)
+    for r in cm.redirects:
+        if r.get("file"):
+            f2r[r["file"]].append(r)
+
+    for sk in skeletons:
+        if sk.get("branches"):
+            continue  # already populated by graph BFS builder
+
+        ev_files = sk.get("evidence_files") or sk.get("files") or []
+
+        # Collect distinct redirect targets across evidence files
+        seen_targets: dict[str, str] = {}   # target → condition
+        for fpath in ev_files:
+            for r in f2r.get(fpath, []):
+                tgt  = (r.get("target")    or "").strip()
+                cond = (r.get("condition") or "").strip()
+                if tgt and tgt not in seen_targets:
+                    seen_targets[tgt] = cond
+
+        if len(seen_targets) < 2:
+            continue  # single redirect — no alternate path evidence
+
+        anchor_page = (ev_files[0] if ev_files else "unknown")
+        targets     = list(seen_targets.items())   # [(target, condition), …]
+
+        # First target is assumed to be the happy-path redirect already
+        # represented in the step list.  Add the rest as branches.
+        for tgt, cond in targets[1:6]:            # cap at 5 extra branches
+            sk["branches"].append({
+                "at_page":   anchor_page,
+                "condition": cond or "alternate path",
+                "alternate": [f"Redirect → {tgt[:80]}"],
+            })
 
 
 # ─── Public Entry Point ────────────────────────────────────────────────────────
@@ -546,11 +792,22 @@ def run(ctx: PipelineContext) -> None:
     flow_skeletons = _stitch_execution_paths(all_raw, ctx, G)
     print(f"  [stage45]   {len(flow_skeletons)} flow skeleton(s) built")
 
+    # Back-fill branches AFTER stitching — _stitch_execution_paths creates
+    # entirely new skeleton dicts so any branches filled in all_raw would be
+    # discarded.  Running here ensures the filled branches land in the dicts
+    # that _enrich_with_llm reads via sk["branches"].
+    _fill_branches_from_redirects(flow_skeletons, ctx.code_map)
+
+    # Lite dynamic analysis: generate stub skeletons for routes with no flow
+    route_stubs = _generate_missing_route_stubs(flow_skeletons, ctx)
+    if route_stubs:
+        flow_skeletons.extend(route_stubs)
+
     print("  [stage45] Pass F: Grouping by bounded context ...")
     context_groups = _group_by_context(flow_skeletons, ctx)
 
     print(f"  [stage45] Pass F.5: Flow pattern mining ...")
-    patterns_found = _classify_patterns(flow_skeletons)
+    patterns_found = _classify_patterns(flow_skeletons, behavior_graph=ctx.behavior_graph)
     pattern_counts: dict[str, int] = {}
     for p in patterns_found:
         if p:
@@ -566,6 +823,23 @@ def run(ctx: PipelineContext) -> None:
     flows = _enrich_with_llm(flow_skeletons, context_groups, ctx)
     print(f"  [stage45]   {len(flows)} named flow(s) produced")
 
+    # Deduplicate by name — parallel BFS paths through the same bounded context
+    # can produce identically-named flows (e.g., "System Installation and Setup"
+    # from 11 different install entry points).  Keep the first occurrence which
+    # has the highest raw_confidence (skeletons are sorted by confidence before
+    # enrichment) and discard the rest.
+    _seen_names: set[str] = set()
+    _deduped: list = []
+    for _f in flows:
+        _key = (_f.name or "").strip().lower()
+        if _key and _key not in _seen_names:
+            _seen_names.add(_key)
+            _deduped.append(_f)
+    if len(_deduped) < len(flows):
+        print(f"  [stage45]   Deduped {len(flows) - len(_deduped)} duplicate flow name(s) "
+              f"→ {len(_deduped)} unique flow(s)")
+    flows = _deduped
+
     # ── Gap-fill: coverage-driven synthetic skeletons ─────────────────────────
     # After BFS+stitching, many modules may not have been reached (MAX_PATHS cap
     # limits BFS to the first N paths from the first few entry points). Build
@@ -573,6 +847,8 @@ def run(ctx: PipelineContext) -> None:
     # enrich with LLM to produce proper BusinessFlow objects.
     exec_paths_list = getattr(ctx.code_map, "execution_paths", None) or []
     attempted_gap_modules: set[str] = set()
+    _mod_empty_rounds = 0        # consecutive rounds with 0 new flows
+    _MOD_MAX_EMPTY    = 2        # stop only after this many in a row
 
     for gap_round in range(1, MAX_GAP_ROUNDS_45 + 1):
         uncovered_modules = _get_uncovered_modules(flows, exec_paths_list)
@@ -586,7 +862,8 @@ def run(ctx: PipelineContext) -> None:
             break
 
         gap_skeletons = _build_gap_fill_skeletons(
-            fresh_uncovered, exec_paths_list, max_modules=GAP_FILL_MAX_MODULES_45
+            fresh_uncovered, exec_paths_list, max_modules=GAP_FILL_MAX_MODULES_45,
+            call_graph=getattr(ctx.code_map, "call_graph", None),
         )
         if not gap_skeletons:
             break
@@ -602,7 +879,7 @@ def run(ctx: PipelineContext) -> None:
         )
 
         gap_context_groups = _group_by_context(gap_skeletons, ctx)
-        _classify_patterns(gap_skeletons)
+        _classify_patterns(gap_skeletons, behavior_graph=ctx.behavior_graph)
         gap_flows = _enrich_with_llm(gap_skeletons, gap_context_groups, ctx)
 
         # Merge new flows in (deduplicate by name)
@@ -616,8 +893,72 @@ def run(ctx: PipelineContext) -> None:
         print(f"  [stage45] Gap-fill round {gap_round}: added {added} new flow(s)")
 
         if added == 0:
-            print(f"  [stage45] Gap-fill: no new flows added — stopping early.")
+            _mod_empty_rounds += 1
+            if _mod_empty_rounds >= _MOD_MAX_EMPTY:
+                print(f"  [stage45] Gap-fill: {_mod_empty_rounds} consecutive empty round(s) — stopping.")
+                break
+        else:
+            _mod_empty_rounds = 0
+
+    # ── Flat-dir gap-fill: non-module files (include/, lib/, etc.) ───────────
+    # Module gap-fill above only covers files under modules/<Name>/.
+    # Files in include/, lib/, src/ etc. are grouped by parent directory and
+    # sent as synthetic skeletons so directory expansion in flow_coverage.py
+    # can credit all siblings once any file from the directory is in a flow.
+    attempted_gap_dirs: set[str] = set()
+    _dir_empty_rounds = 0        # consecutive rounds with 0 new flows
+    _DIR_MAX_EMPTY    = 2        # stop only after this many in a row
+
+    for gap_round in range(1, MAX_GAP_ROUNDS_45 + 1):
+        uncovered_dirs = _get_uncovered_flat_dirs(flows, exec_paths_list)
+        fresh_dirs = {
+            d: files for d, files in uncovered_dirs.items()
+            if d not in attempted_gap_dirs
+        }
+
+        if not fresh_dirs:
+            print(f"  [stage45] Flat gap-fill: all directories covered after "
+                  f"{gap_round - 1} round(s).")
             break
+
+        batch_dirs = dict(list(fresh_dirs.items())[:GAP_FILL_MAX_MODULES_45])
+        attempted_gap_dirs.update(batch_dirs.keys())
+
+        # Re-use module skeleton builder — each "module" key is a dir path here
+        gap_skeletons = _build_gap_fill_skeletons(
+            batch_dirs, exec_paths_list, max_modules=GAP_FILL_MAX_MODULES_45,
+            call_graph=getattr(ctx.code_map, "call_graph", None),
+        )
+        if not gap_skeletons:
+            break
+
+        print(
+            f"  [stage45] Flat gap-fill round {gap_round}: "
+            f"{len(gap_skeletons)} skeleton(s) for {len(fresh_dirs)} uncovered dir(s)"
+        )
+        gap_context_groups = _group_by_context(gap_skeletons, ctx)
+        _classify_patterns(gap_skeletons, behavior_graph=ctx.behavior_graph)
+        gap_flows = _enrich_with_llm(gap_skeletons, gap_context_groups, ctx)
+
+        existing_names_lower = {f.name.lower() for f in flows}
+        added = 0
+        for gf in gap_flows:
+            if gf.name.lower() not in existing_names_lower:
+                flows.append(gf)
+                existing_names_lower.add(gf.name.lower())
+                added += 1
+        print(f"  [stage45] Flat gap-fill round {gap_round}: added {added} new flow(s)")
+
+        if added == 0:
+            _dir_empty_rounds += 1
+            if _dir_empty_rounds >= _DIR_MAX_EMPTY:
+                print(f"  [stage45] Flat gap-fill: {_dir_empty_rounds} consecutive empty round(s) — stopping.")
+                break
+        else:
+            _dir_empty_rounds = 0
+
+    # ── Tag flow_type from Stage 1.3 entry-point catalog ─────────────────────
+    _tag_flow_types(flows, ctx)
 
     print("  [stage45] Pass I: Updating domain_model.workflows ...")
     collection = _build_collection(flows)
@@ -638,8 +979,56 @@ def run(ctx: PipelineContext) -> None:
     from pipeline.flow_coverage import compute_and_save as _flow_coverage
     _flow_coverage(ctx)
 
+    # ── Static Gherkin stubs (zero-LLM) ───────────────────────────────────────
+    _write_gherkin_stubs(flows, ctx)
+
 
 # ─── Prerequisites ─────────────────────────────────────────────────────────────
+
+def _tag_flow_types(flows: list[BusinessFlow], ctx: PipelineContext) -> None:
+    """
+    Assign flow_type to each BusinessFlow based on the Stage 1.3 entry-point catalog.
+
+    For each flow, inspect its evidence_files.  If any evidence file matches an
+    entry point in the catalog with a non-http ep_type, tag the flow with that
+    type.  When multiple types are found, prefer the most specific:
+      queue_worker > scheduled > cli > webhook > http
+
+    No-op if ctx.entry_point_catalog is not populated (Stage 1.3 not run).
+    """
+    if not ctx.entry_point_catalog or not ctx.entry_point_catalog.entry_points:
+        return
+
+    _PRIORITY = {"queue_worker": 4, "scheduled": 3, "cli": 2, "webhook": 1, "http": 0}
+
+    # Build a set of {basename → ep_type} for fast lookup
+    ep_by_name: dict[str, str] = {}
+    ep_by_rel:  dict[str, str] = {}
+    for ep in ctx.entry_point_catalog.entry_points:
+        ep_by_name[Path(ep.handler_file).name] = ep.ep_type
+        ep_by_rel[ep.handler_file] = ep.ep_type
+
+    tagged = 0
+    for flow in flows:
+        best_type = "http"
+        best_pri  = 0
+        for ev_file in flow.evidence_files:
+            rel  = Path(ev_file).as_posix()
+            name = Path(ev_file).name
+            ep_type = ep_by_rel.get(rel) or ep_by_name.get(name)
+            if ep_type:
+                pri = _PRIORITY.get(ep_type, 0)
+                if pri > best_pri:
+                    best_type = ep_type
+                    best_pri  = pri
+        if best_type != "http":
+            flow.flow_type = best_type
+            tagged += 1
+
+    if tagged:
+        print(f"  [stage45] Tagged {tagged} flow(s) with non-HTTP flow_type "
+              f"from Stage 1.3 entry-point catalog.")
+
 
 def _assert_prerequisites(ctx: PipelineContext) -> None:
     """Raise RuntimeError if required upstream outputs are missing."""
@@ -656,6 +1045,135 @@ def _assert_prerequisites(ctx: PipelineContext) -> None:
         raise RuntimeError(
             f"[stage45] Graph file not found: {gpickle} — run Stage 2 first."
         )
+
+
+# ─── Static Gherkin Stub Generation ────────────────────────────────────────────
+
+def _write_gherkin_stubs(flows: list[BusinessFlow], ctx: PipelineContext) -> None:
+    """
+    Zero-LLM static Gherkin feature stub generation.
+
+    Converts each BusinessFlow into one Gherkin Scenario (happy path) plus one
+    @<type> Scenario per branch, grouped under a Feature block per bounded context.
+    The stubs are intentionally minimal — they provide the skeleton that Stage 8
+    acceptance tests will be built from.
+
+    Output: feature_stubs.feature in the stage 4.5 output directory.
+    """
+    from collections import defaultdict
+
+    if not flows:
+        return
+
+    # Group flows by bounded context (one Gherkin Feature per context)
+    by_context: dict[str, list[BusinessFlow]] = defaultdict(list)
+    for flow in flows:
+        context = (flow.bounded_context or "General").strip()
+        by_context[context].append(flow)
+
+    lines: list[str] = [
+        "# feature_stubs.feature — Auto-generated by Stage 4.5 (zero-LLM)",
+        "# Skeleton stubs for Stage 8 acceptance tests.",
+        "#",
+        f"# Generated: {len(flows)} flow(s) across "
+        f"{len(by_context)} bounded context(s)",
+        "",
+    ]
+
+    total_scenarios = 0
+
+    for context_name in sorted(by_context):
+        context_flows = by_context[context_name]
+        lines += [
+            f"Feature: {context_name}",
+            "",
+        ]
+
+        for flow in context_flows:
+            trigger   = (flow.trigger   or "the user starts").strip().rstrip(".")
+            term      = (flow.termination or "the operation completes").strip().rstrip(".")
+            actor     = (flow.actor or "the user").strip()
+            flow_type = getattr(flow, "flow_type", "http")
+
+            # flow_type → Gherkin tag + Given phrasing
+            _TYPE_TAG: dict[str, str] = {
+                "scheduled":    "@scheduled",
+                "cli":          "@cli",
+                "webhook":      "@webhook",
+                "queue_worker": "@queue",
+            }
+            _TYPE_GIVEN: dict[str, str] = {
+                "scheduled":    f"the system clock reaches the scheduled trigger for",
+                "cli":          f"an operator runs the CLI command for",
+                "webhook":      f"an external system posts a webhook to",
+                "queue_worker": f"a queue message is dispatched for",
+            }
+            flow_tag   = _TYPE_TAG.get(flow_type, "")
+            given_pfx  = _TYPE_GIVEN.get(flow_type, f"{actor} initiates")
+
+            # Build Given line
+            if flow_type in _TYPE_GIVEN:
+                given_line = f"    Given {given_pfx} {flow.name.lower()}"
+            else:
+                given_line = f"    Given {actor} initiates {trigger.lower()}"
+
+            # Happy-path scenario (with optional type tag)
+            scenario_lines = [f"  # {flow.flow_id}: {flow.name}"]
+            if flow_tag:
+                scenario_lines.append(f"  {flow_tag}")
+            scenario_lines.append(f"  Scenario: {flow.name}")
+            scenario_lines.append(given_line)
+
+            lines += scenario_lines
+            for step in flow.steps:
+                if not step.is_branch:
+                    action = (step.action or "").strip().rstrip(".")
+                    if action:
+                        lines.append(f"    When {action}")
+            lines += [
+                f"    Then {term}",
+                "",
+            ]
+            total_scenarios += 1
+
+            # One scenario per branch (alternate / error paths)
+            for idx, branch in enumerate(flow.branches, 1):
+                branch_desc  = (
+                    branch.get("description") or branch.get("name") or f"Branch {idx}"
+                ).strip().rstrip(".")
+                branch_type  = branch.get("type", "alternative")
+                branch_steps = branch.get("steps", [])
+
+                branch_lines = []
+                if flow_tag:
+                    branch_lines.append(f"  {flow_tag}")
+                branch_lines += [
+                    f"  @{branch_type}",
+                    f"  Scenario: {flow.name} — {branch_desc}",
+                    given_line,
+                ]
+                lines += branch_lines
+                if branch_steps:
+                    for bs in branch_steps[:4]:
+                        bs_action = (bs.get("action") or bs.get("page") or "").strip().rstrip(".")
+                        if bs_action:
+                            lines.append(f"    When {bs_action}")
+                else:
+                    lines.append(f"    When {branch_desc}")
+                lines += [
+                    f"    Then the system handles the {branch_type} outcome",
+                    "",
+                ]
+                total_scenarios += 1
+
+        lines.append("")  # blank line between Feature blocks
+
+    feature_path = ctx.output_path("feature_stubs.feature")
+    Path(feature_path).write_text("\n".join(lines), encoding="utf-8")
+    print(
+        f"  [stage45] Gherkin stubs → {feature_path} "
+        f"({len(by_context)} feature(s), {total_scenarios} scenario(s))"
+    )
 
 
 
@@ -805,7 +1323,7 @@ def _traverse_laravel_routes(G, ctx) -> list:
                 "files":          [ctrl_ep.get("file", f"{ctrl_name}.php")],
                 "steps":          steps,
                 "branches":       [],
-                "evidence_files": [ctrl_ep.get("file", "")] if ctrl_ep else [],
+                "evidence_files": [ctrl_ep.get("file", f"{ctrl_name}.php")],
                 "raw_confidence": confidence,
                 "_laravel_meta": {
                     "http_verb": http_verb, "uri": uri,
@@ -1460,9 +1978,14 @@ def _group_by_context(
     """
     Assign each skeleton to a bounded context.
 
-    Strategy (two-phase with fallback):
+    Strategy (three-phase with fallback):
 
-    Phase 1 — Graph module_id lookup (preferred):
+    Phase 0 — Action Cluster lookup (Stage 2.8, preferred when available):
+        Build a file→cluster_name mapping from ctx.action_clusters.  For each
+        skeleton, assign it to the plurality cluster of its evidence files.
+        Falls through to Phase 1 if action_clusters is missing or empty.
+
+    Phase 1 — Graph module_id lookup (preferred without Phase 0):
         If the graph was built with Stage 2 Pass 15, every code node carries a
         module_id attribute.  For each skeleton, collect the module_ids of all
         files in its evidence set by querying graph nodes, then assign the
@@ -1478,6 +2001,43 @@ def _group_by_context(
     """
     import pickle
     from collections import Counter as _Counter
+
+    # ── Phase 0: action_clusters lookup (Stage 2.8) ───────────────────────────
+    ac = getattr(ctx, "action_clusters", None)
+    if ac and ac.clusters:
+        # Build file → cluster name (by basename for robustness)
+        ac_file_to_name: dict[str, str] = {}
+        ac_base_to_name: dict[str, str] = {}
+        for cluster in ac.clusters:
+            for fpath in cluster.files:
+                ac_file_to_name[fpath] = cluster.name
+                ac_base_to_name[Path(fpath).name.lower()] = cluster.name
+
+        groups_ac: dict[str, list[int]] = defaultdict(list)
+        unmatched_ac: list[int] = []
+
+        for i, sk in enumerate(skeletons):
+            counts: _Counter = _Counter()
+            for fpath in sk.get("files", []):
+                name = (
+                    ac_file_to_name.get(fpath)
+                    or ac_base_to_name.get(Path(fpath).name.lower())
+                )
+                if name:
+                    counts[name] += 1
+            if counts:
+                groups_ac[counts.most_common(1)[0][0]].append(i)
+            else:
+                unmatched_ac.append(i)
+
+        # Route unmatched skeletons to a "General" bucket
+        if unmatched_ac:
+            fallback = (ctx.domain_model.bounded_contexts or ["General"])[0]
+            ctx_name = (fallback["name"] if isinstance(fallback, dict)
+                        else fallback)
+            groups_ac[ctx_name].extend(unmatched_ac)
+
+        return dict(groups_ac)
 
     # ── Phase 1: graph module_id lookup ──────────────────────────────────────
     G = None
@@ -1576,6 +2136,7 @@ def _group_by_context(
 
 def _classify_patterns(
     skeletons: list[dict[str, Any]],
+    behavior_graph: dict | None = None,
 ) -> list[str | None]:
     """
     Pass F.5 — Algorithmic pattern mining.  No LLM required.
@@ -1586,6 +2147,12 @@ def _classify_patterns(
 
     The result is attached to each skeleton as skeleton["pattern"] and is
     passed to the LLM in Pass G so it can use the pattern as a naming hint.
+
+    If behavior_graph is supplied (ctx.behavior_graph from stage25), each
+    skeleton's signals are boosted with HTTP method, auth flags, and SQL
+    operations discovered by the route→controller→SQL tracing pass.  This
+    improves pattern hit rate for skeletons whose exec_paths lack HTTP/auth
+    metadata (e.g. raw-PHP flat files with no explicit method checks).
 
     Signal dict schema
     ------------------
@@ -1598,10 +2165,39 @@ def _classify_patterns(
     outputs           : list[str]   — all output strings across all steps
     steps_with_inputs : int         — number of steps that have at least one input
     """
+    # Build file-name → behavior_graph paths index for signal boosting.
+    # Paths from ctx.behavior_graph carry HTTP method, auth flags, and SQL
+    # operations discovered by stage25's route→controller→SQL tracing —
+    # these complement skeleton signals derived from static exec_paths.
+    _bg_by_fname: dict[str, list[dict]] = {}
+    if behavior_graph:
+        for _bp in (behavior_graph.get("paths") or []):
+            for _rf in (_bp.get("reachable_files") or []):
+                _bg_fname = Path(_rf).name.lower()
+                if _bg_fname not in _bg_by_fname:
+                    _bg_by_fname[_bg_fname] = []
+                _bg_by_fname[_bg_fname].append(_bp)
+
     results: list[str | None] = []
 
     for sk in skeletons:
         signals = _extract_signals(sk)
+
+        # Boost signals from behavior_graph paths that share files with
+        # this skeleton.  Only adds information not already in signals.
+        if _bg_by_fname:
+            _sk_fnames = {Path(f).name.lower() for f in sk.get("files", [])}
+            for _fname in _sk_fnames:
+                for _bp in _bg_by_fname.get(_fname, []):
+                    if _bp.get("route_method"):
+                        signals["http_methods"].add(_bp["route_method"].upper())
+                    if _bp.get("has_auth") and signals["auth_steps"] == 0:
+                        signals["auth_steps"] = 1
+                    for _sql in (_bp.get("sql_ops") or []):
+                        _op = _sql.get("op", "")
+                        if _op and _op not in signals["db_ops"]:
+                            signals["db_ops"].append(_op)
+
         best_name:  str | None = None
         best_score: int        = 0
 
@@ -1674,8 +2270,10 @@ def _enrich_with_llm(
             skeletons to produce final BusinessFlow objects.
 
     One API call per bounded context keeps token usage bounded.
+    Context groups are processed concurrently when vLLM backend is active.
     """
-    from pipeline.llm_client import call_llm
+    from concurrent.futures import ThreadPoolExecutor as _TPE
+    from pipeline.llm_client import call_llm, get_max_workers as _max_w
 
     flows: list[BusinessFlow] = []
     flow_counter = 1
@@ -1685,25 +2283,68 @@ def _enrich_with_llm(
     # max_tokens truncation on large context groups (e.g. Routes with 80+).
     MAX_LLM_BATCH = 20
 
-    for context_name, indices in context_groups.items():
-        group_skeletons = [skeletons[i] for i in indices]
+    # Multi-model ensemble: LLM_ENSEMBLE_MODELS=model1,model2 runs each batch
+    # with multiple models and merges by taking the most-populated result.
+    _raw_ens = os.environ.get("LLM_ENSEMBLE_MODELS", "").strip()
+    _ens_models: list[str | None] = (
+        [m.strip() for m in _raw_ens.split(",") if m.strip()]
+        if _raw_ens else [None]
+    )
 
-        # Split into sub-batches if needed
+    _system = _build_llm_system_prompt(domain, ctx=ctx)
+    _workers = _max_w()
+
+    def _enrich_context_group(args: tuple) -> tuple[str, list[dict], list[dict]]:
+        """Run all LLM sub-batches for one context group; return enrichments."""
+        context_name, group_skeletons = args
         enrichments: list[dict] = []
-        system = _build_llm_system_prompt(domain)
         for batch_start in range(0, len(group_skeletons), MAX_LLM_BATCH):
             batch = group_skeletons[batch_start:batch_start + MAX_LLM_BATCH]
             batch_label = f"stage45_{context_name[:15]}_{batch_start//MAX_LLM_BATCH+1}"
             user = _build_llm_user_prompt(context_name, batch, domain)
-            try:
-                raw = call_llm(system, user, max_tokens=MAX_TOKENS,
-                               label=batch_label)
-                batch_enr = _parse_llm_response(raw, len(batch))
-            except Exception as e:
-                print(f"  [stage45] Warning: LLM call failed for '{context_name}' "
-                      f"batch {batch_start//MAX_LLM_BATCH+1}: {e}")
-                batch_enr = [{}] * len(batch)
+            # Collect per-model results; merge by picking the most-complete entry
+            all_model_enrs: list[list[dict]] = []
+            for _mdl in _ens_models:
+                _lbl = batch_label + (f"_{_ens_models.index(_mdl)+1}" if len(_ens_models) > 1 else "")
+                try:
+                    raw = call_llm(_system, user, max_tokens=MAX_TOKENS,
+                                   temperature=0.1,   # flow analysis: structural JSON
+                                   label=_lbl,
+                                   json_schema=_FLOW_JSON_SCHEMA,
+                                   model_override=_mdl)
+                    all_model_enrs.append(_parse_llm_response(raw, len(batch)))
+                except Exception as e:
+                    print(f"  [stage45] Warning: LLM call failed for '{context_name}' "
+                          f"batch {batch_start//MAX_LLM_BATCH+1}: {e}")
+                    all_model_enrs.append([{}] * len(batch))
+            # Merge: for each position, pick the enrichment with most non-empty fields
+            if len(all_model_enrs) == 1:
+                batch_enr = all_model_enrs[0]
+            else:
+                batch_enr = []
+                for i in range(len(batch)):
+                    candidates = [m[i] for m in all_model_enrs if i < len(m)]
+                    best = max(candidates, key=lambda e: sum(1 for v in e.values() if v))
+                    batch_enr.append(best)
             enrichments.extend(batch_enr)
+        return context_name, group_skeletons, enrichments
+
+    # Build ordered task list (preserve context_groups insertion order)
+    _cg_tasks = [
+        (context_name, [skeletons[i] for i in indices])
+        for context_name, indices in context_groups.items()
+    ]
+
+    if _workers > 1 and len(_cg_tasks) > 1:
+        print(f"  [stage45] Running {len(_cg_tasks)} context groups in parallel (workers={_workers}) ...")
+        with _TPE(max_workers=min(len(_cg_tasks), _workers)) as _pool:
+            _futures = [_pool.submit(_enrich_context_group, t) for t in _cg_tasks]
+            # Preserve original order (dict insertion order)
+            _cg_results = [f.result() for f in _futures]
+    else:
+        _cg_results = [_enrich_context_group(t) for t in _cg_tasks]
+
+    for context_name, group_skeletons, enrichments in _cg_results:
 
         # Merge enrichments onto skeletons
         for sk, enr in zip(group_skeletons, enrichments):
@@ -1730,6 +2371,23 @@ def _enrich_with_llm(
             # rewarded by LLM success via _final_confidence)
             pattern_bonus = 0.05 if (pattern and not enr) else 0.0
 
+            # Merge skeleton branches (from redirect/execution-path evidence)
+            # with any branches the LLM generated from its understanding of the flow.
+            # Normalise LLM branches to the standard dict schema first.
+            llm_branches: list[dict] = []
+            for b in (enr.get("branches") or []):
+                if isinstance(b, dict) and b.get("condition"):
+                    llm_branches.append({
+                        "at_page":   "inferred",
+                        "condition": str(b.get("condition", ""))[:100],
+                        "alternate": [str(b.get("outcome", ""))[:80]],
+                    })
+            existing_conds = {x.get("condition", "") for x in sk["branches"]}
+            merged_branches = sk["branches"] + [
+                b for b in llm_branches
+                if b["condition"] not in existing_conds
+            ]
+
             flows.append(BusinessFlow(
                 flow_id          = flow_id,
                 name             = enr.get("name") or _fallback_name(sk),
@@ -1737,7 +2395,7 @@ def _enrich_with_llm(
                 bounded_context  = context_name,
                 trigger          = enr.get("trigger") or _infer_trigger(sk),
                 steps            = sk["steps"],
-                branches         = sk["branches"],
+                branches         = merged_branches,
                 termination      = termination,
                 evidence_files   = sk["evidence_files"],
                 confidence       = _final_confidence(
@@ -1750,10 +2408,24 @@ def _enrich_with_llm(
     return flows
 
 
-def _build_llm_system_prompt(domain) -> str:
-    return f"""You are a senior Business Analyst extracting business flows from PHP codebase evidence.
-You will receive skeletons of user journeys (sequences of PHP pages with actions).
-Your job is to assign each skeleton a meaningful business name, actor, trigger, and termination.
+def _build_llm_system_prompt(domain, ctx=None) -> str:
+    # Language-aware description
+    lang_desc = "codebase"
+    if ctx and ctx.code_map:
+        from context import Language  # noqa: PLC0415
+        _desc_map = {
+            Language.PHP:        "PHP codebase",
+            Language.TYPESCRIPT: "TypeScript/JavaScript codebase",
+            Language.JAVASCRIPT: "JavaScript codebase",
+            Language.JAVA:       "Java codebase",
+            Language.KOTLIN:     "Kotlin codebase",
+        }
+        lang_desc = _desc_map.get(ctx.code_map.language, "codebase")
+
+    return f"""You are a senior Business Analyst extracting business flows from {lang_desc} evidence.
+You will receive skeletons of user journeys (sequences of routes/handlers with actions).
+Your job is to assign each skeleton a meaningful business name, actor, trigger, termination,
+and any alternate/error branches evident from the redirect targets shown.
 
 Domain: {domain.domain_name}
 Known actors: {", ".join(r["role"] for r in domain.user_roles) or "Unknown"}
@@ -1761,13 +2433,43 @@ Bounded contexts: {", ".join(domain.bounded_contexts) or "General"}
 
 Rules:
 - Output ONLY valid JSON — no markdown fences, no explanation
-- Use business language, not technical PHP file names
+- Use business language, not technical file or class names
 - name: short verb-noun phrase e.g. "Customer Login", "Booking Submission"
 - actor: the user role performing the flow
 - trigger: one sentence — what causes the flow to begin
-- termination: one sentence — the successful end state
+- termination: one sentence — the SUCCESSFUL end state only
+- branches: alternate or error paths — one entry per distinct redirect target that
+  represents a failure, validation error, or alternate outcome (not the happy path).
+  Each entry: {{"condition": "what triggers this path", "outcome": "what happens"}}
+  Use [] if the flow has only one outcome.
 - replaces_workflow: name of an existing workflow this replaces, or null
-- Respond with a JSON array of objects, one per skeleton, in the same order"""
+- Respond with a JSON array of objects, one per skeleton, in the same order
+
+EXAMPLE INPUT (skeleton):
+  Route chain: POST /login → AuthController::login
+  SQL tables: users, sessions
+  Files visited: login.php → AuthController.php
+  Step 1: /login — Display login form [GET]
+  Step 2: /login — Submit credentials [POST] [DB: SELECT users, INSERT sessions] inputs=['email','password']
+  Step 3: Redirect → /dashboard
+  Alternate paths (2):
+    • if !$validated → Redirect → /login?error=1
+    • if $account->suspended → Redirect → /suspended
+
+EXAMPLE OUTPUT:
+[
+  {{
+    "name": "Customer Login",
+    "actor": "Guest",
+    "trigger": "User submits login credentials on the login form",
+    "termination": "User is authenticated and redirected to the dashboard",
+    "branches": [
+      {{"condition": "Validation fails (invalid credentials)", "outcome": "User is redirected back to login with error message"}},
+      {{"condition": "Account is suspended", "outcome": "User is redirected to suspended account notice"}}
+    ],
+    "replaces_workflow": null
+  }}
+]"""
 
 
 def _build_llm_user_prompt(
@@ -1811,7 +2513,11 @@ def _build_llm_user_prompt(
                 f"{auth_tag}{db_tag}{inputs_tag}"
             )
         if sk["branches"]:
-            parts.append(f"  Branches: {len(sk['branches'])} alternate path(s)")
+            parts.append(f"  Alternate paths ({len(sk['branches'])}):")
+            for b in sk["branches"][:5]:
+                cond = b.get("condition", "alternate path")[:80]
+                alt  = ", ".join(b.get("alternate", []))[:60]
+                parts.append(f"    • if {cond} → {alt}")
 
     parts.append(f"""
 Return a JSON array with exactly {len(skeletons)} objects:
@@ -1820,10 +2526,15 @@ Return a JSON array with exactly {len(skeletons)} objects:
     "name": "Business Flow Name",
     "actor": "Role Name",
     "trigger": "What initiates this flow",
-    "termination": "Successful end state",
+    "termination": "Successful end state (happy path only)",
+    "branches": [
+      {{"condition": "Validation fails / user not authenticated / etc.", "outcome": "Error shown or redirect to login"}}
+    ],
     "replaces_workflow": "existing workflow name or null"
   }}
-]""")
+]
+If a skeleton shows alternate paths above, generate a branch entry for each one.
+If there are no alternate paths, set branches to [].""")
 
     return "\n".join(parts)
 

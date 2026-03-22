@@ -291,6 +291,7 @@ def _call_llm(system_prompt: str, user_prompt: str) -> str:
         system_prompt = system_prompt,
         user_prompt   = user_prompt,
         max_tokens    = MAX_TOKENS,
+        temperature   = 0.1,   # architecture: deterministic JSON structure
         label         = STAGE_NAME,
     )
 
@@ -623,6 +624,16 @@ _SYSTEM_PROMPT = textwrap.dedent("""\
     - Component types must be one of: "Frontend", "Backend", "Database", "Service",
       "Middleware", "External", "Configuration".
     - Return ONLY a valid JSON object — no preamble, no explanation, no markdown fences.
+
+    PHP legacy risk patterns to watch for and include in risks/recommendations:
+    - Mixed concerns: business logic embedded in view files (PHP + HTML in same file)
+    - Global state: use of $_SESSION, $_GLOBALS, global variables across request lifecycle
+    - Direct SQL: raw mysql_query / mysqli calls instead of ORM or prepared statements
+    - No input sanitisation: missing htmlspecialchars, strip_tags, or parameterised queries
+    - God files: single PHP files handling routing, auth, business logic, and DB access
+    - Missing CSRF protection: POST forms without token validation
+    - Hardcoded credentials or config values in PHP files
+    - Lack of autoloading: manual require/include chains instead of Composer PSR-4
 """)
 
 _USER_PROMPT_TEMPLATE = textwrap.dedent("""\

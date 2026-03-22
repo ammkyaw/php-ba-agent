@@ -1,9 +1,9 @@
 """
-run_stage35.py — Standalone runner for Stage 3.5 (Preflight)
+run_stage39.py — Standalone runner for Stage 3.9 (Preflight)
 
 Usage:
-    python run_stage35.py outputs/run_<timestamp>/context.json
-    python run_stage35.py /path/to/php-project
+    python run_stage39.py outputs/run_<timestamp>/context.json
+    python run_stage39.py /path/to/php-project
 """
 
 from __future__ import annotations
@@ -15,11 +15,11 @@ sys.path.insert(0, str(Path(__file__).parent.parent))  # locate project root
 
 def main() -> None:
     if len(sys.argv) < 2:
-        print("Usage: python run_stage35.py <context.json | project-path>")
+        print("Usage: python run_stage39.py <context.json | project-path>")
         sys.exit(1)
 
     from context import PipelineContext
-    from pipeline.stage35_preflight import run as stage35_run, PreflightBlocker
+    from pipeline.stage39_preflight import run as stage39_run, PreflightBlocker
 
     path = Path(sys.argv[1])
     if path.suffix == ".json" and path.exists():
@@ -33,14 +33,14 @@ def main() -> None:
         sys.exit(1)
 
     try:
-        stage35_run(ctx)
+        stage39_run(ctx)
         print(f"Preflight passed — ready for Stage 4.")
         print(f"\nRun Stage 4 next:")
         print(f"  python run_stage4.py {ctx.context_file}")
     except PreflightBlocker as e:
         print(f"\n{e}")
         print(f"\nFix the issues above then re-run:")
-        print(f"  python run_stage35.py {ctx.context_file}")
+        print(f"  python run_stage39.py {ctx.context_file}")
         sys.exit(1)
 
 

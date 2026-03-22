@@ -1,5 +1,5 @@
 """
-pipeline/stage6_qa.py — QA Review Agent
+pipeline/stage60_qa.py — QA Review Agent
 
 Reviews all four BA artefacts (BRD, SRS, AC, User Stories) for quality,
 consistency, and coverage against the domain model and codebase evidence.
@@ -40,7 +40,7 @@ Output
 
 Resume behaviour
 ----------------
-If stage6_qa is COMPLETED and qa_report.md exists, stage is skipped.
+If stage60_qa is COMPLETED and qa_report.md exists, stage is skipped.
 """
 
 from __future__ import annotations
@@ -83,7 +83,7 @@ def run(ctx: PipelineContext) -> None:
     report_path = ctx.output_path(QA_REPORT_FILE)
 
     # ── Resume check ─────────────────────────────────────────────────────────
-    if ctx.is_stage_done("stage6_qa") and Path(report_path).exists():
+    if ctx.is_stage_done("stage60_qa") and Path(report_path).exists():
         ctx.qa_result = _load_qa_result(ctx.output_path(QA_JSON_FILE))
         print(f"  [stage6] Already completed — "
               f"coverage={ctx.qa_result.coverage_score:.0%}, "
@@ -101,6 +101,8 @@ def run(ctx: PipelineContext) -> None:
     from pipeline.llm_client import call_llm
     from pipeline.consistency_check import run_checks as _run_consistency_checks
     from pipeline.consistency_check import format_summary as _consistency_summary
+    from pipeline.cross_doc_check   import run_checks as _run_cross_doc_checks
+    from pipeline.cross_doc_check   import format_summary as _cross_doc_summary
     from pipeline.evidence_index import build_evidence_index, build_confidence_report
     from pipeline.qa_checklist import (
         build_checklist as _build_checklist,
@@ -130,9 +132,19 @@ def run(ctx: PipelineContext) -> None:
     pass_d_issues = _run_consistency_checks(ctx, artefacts, conf_report)
     print(f"  [stage6] Pass D — {_consistency_summary(pass_d_issues)}")
 
+    # ── Pass E: Cross-Document Consistency (no LLM) ───────────────────────────
+    # Checks traceability between document pairs: orphan epics/AC sections,
+    # undefined actors, and SRS→AC requirement gaps.  Issues are merged into
+    # pass_d_issues so they flow through the same report path.
+    print("  [stage6] Pass E — cross-document consistency checks ...")
+    pass_e_issues = _run_cross_doc_checks(ctx, artefacts)
+    print(f"  [stage6] Pass E — {_cross_doc_summary(pass_e_issues)}")
+    pass_d_issues = pass_d_issues + pass_e_issues  # merge; D issues stay first
+
     # ── Automated QA Checklist (no LLM) ───────────────────────────────────────
     fc_data    = _load_flow_coverage(ctx)
-    qa_checks  = _build_checklist(fc_data, pass_d_issues, ev_idx)
+    dc_data    = _load_doc_coverage(ctx)          # Stage 5.9 document coverage
+    qa_checks  = _build_checklist(fc_data, pass_d_issues, ev_idx, dc_data=dc_data)
     cl_status  = _checklist_status(qa_checks)
     n_cl_pass  = sum(1 for c in qa_checks if c["status"] == "pass")
     n_cl_warn  = sum(1 for c in qa_checks if c["status"] == "warn")
@@ -146,14 +158,15 @@ def run(ctx: PipelineContext) -> None:
     pass_a_prompt = _build_coverage_prompt(ctx, artefacts)
     print(f"  [stage6] Pass A — coverage ({len(pass_a_prompt):,} chars) ...")
     raw_a     = call_llm(system_prompt, pass_a_prompt,
-                         max_tokens=MAX_TOKENS, label="stage6_passA")
+                         max_tokens=MAX_TOKENS, label="stage60_passA")
     pass_a_data = _parse_response(raw_a, pass_label="A")
 
     # ── Pass B: Consistency & Issues ─────────────────────────────────────────
+    # pass_d_issues now includes Pass E cross-doc findings — injected here.
     pass_b_prompt = _build_consistency_prompt(ctx, artefacts, pass_d_issues)
     print(f"  [stage6] Pass B — consistency + issues ({len(pass_b_prompt):,} chars) ...")
     raw_b     = call_llm(system_prompt, pass_b_prompt,
-                         max_tokens=MAX_TOKENS, label="stage6_passB")
+                         max_tokens=MAX_TOKENS, label="stage60_passB")
     pass_b_data = _parse_response(raw_b, pass_label="B")
 
     # ── Pass C: Reverse Audit ─────────────────────────────────────────────────
@@ -162,7 +175,9 @@ def run(ctx: PipelineContext) -> None:
     if pass_c_prompt:
         print(f"  [stage6] Pass C — reverse audit ({len(pass_c_prompt):,} chars) ...")
         raw_c       = call_llm(system_prompt, pass_c_prompt,
-                               max_tokens=MAX_TOKENS_AUDIT, label="stage6_passC")
+                               max_tokens=MAX_TOKENS_AUDIT,
+                               temperature=0.1,  # reverse audit: strict file-by-file check
+                               label="stage60_passC")
         pass_c_data = _parse_response(raw_c, pass_label="C")
         n_missing   = sum(
             1 for e in pass_c_data.get("audit", [])
@@ -200,7 +215,7 @@ def run(ctx: PipelineContext) -> None:
     with open(ctx.output_path(QA_JSON_FILE), "w", encoding="utf-8") as fh:
         json.dump(qa_data, fh, indent=2, ensure_ascii=False)
 
-    ctx.stage("stage6_qa").mark_completed(report_path)
+    ctx.stage("stage60_qa").mark_completed(report_path)
     ctx.save()
 
     _print_summary(ctx.qa_result)
@@ -253,10 +268,44 @@ def _build_coverage_prompt(ctx: PipelineContext, artefacts: dict[str, str]) -> s
         parts.append(f"\n{name} ({len(headings)} headings):")
         parts.append("\n".join(f"  • {h}" for h in headings[:30]))
 
+    # ── Stage 5.0 Critic summary injection ───────────────────────────────────
+    # Let the LLM coverage auditor know what the inline critic already fixed so
+    # it can focus on residual gaps rather than re-flagging resolved issues.
+    try:
+        from pipeline.stage50_critic       import critic_summary_block   as _critic_blk
+        from pipeline.stage55_traceability import coverage_summary_block as _cov_blk
+        _cb = _critic_blk(ctx)
+        _tb = _cov_blk(ctx)
+        if _cb:
+            parts.append("\n" + _cb)
+        if _tb:
+            parts.append("\n=== TRACEABILITY COVERAGE (Stage 5.5) ===")
+            parts.append(_tb)
+    except ImportError:
+        pass  # Stages not yet run — skip gracefully
+
+    # ── Stage 5.9 gap injection ───────────────────────────────────────────────
+    dc = getattr(ctx, "doc_coverage", None)
+    if dc and dc.gap_summary:
+        parts.append("\n=== STATIC COVERAGE GAPS — Stage 5.9 ===")
+        parts.append(
+            "These gaps were detected by deterministic analysis comparing "
+            "pipeline signals (entities, flows, rules, states) to document text. "
+            "Address each gap in your coverage assessment."
+        )
+        for gap in dc.gap_summary:
+            parts.append(f"  • {gap}")
+        parts.append(
+            f"\nStatic coverage overall: {dc.overall_pct:.0%} "
+            f"[{dc.overall_status.upper()}]"
+        )
+
     parts.append("""
 === TASK ===
 Check whether each feature/entity/bounded context from the domain model
 appears as a heading or sub-heading in the artefacts.
+Also explicitly reference any gaps from the STATIC COVERAGE GAPS section above
+in your summary if they are significant.
 
 Return ONLY this JSON (no other text):
 
@@ -435,7 +484,7 @@ def _parse_response(raw: str, pass_label: str = "") -> dict[str, Any]:
     try:
         return json.loads(text)
     except json.JSONDecodeError:
-        from pipeline.stage4_domain import _attempt_json_recovery
+        from pipeline.stage40_domain import _attempt_json_recovery
         recovered = _attempt_json_recovery(text)
         if recovered:
             print(f"  [stage6] Pass {pass_label}: truncated JSON — partial recovery OK.")
@@ -713,6 +762,23 @@ def _build_report_md(
             )
         lines.append("")
 
+    # ── Traceability Summary (Stage 5.5 + Stage 5.0 Critic) ─────────────────
+    try:
+        from pipeline.stage50_critic       import critic_summary_block   as _critic_blk
+        from pipeline.stage55_traceability import coverage_summary_block as _cov_blk
+        _cov_md    = _cov_blk(ctx)
+        _critic_md = _critic_blk(ctx)
+        if _cov_md or _critic_md:
+            lines += ["## Traceability Summary", ""]
+            if _cov_md:
+                lines.append(_cov_md)
+                lines.append("")
+            if _critic_md:
+                lines.append(_critic_md)
+                lines.append("")
+    except ImportError:
+        pass  # Stages not yet run — skip gracefully
+
     if ctx.ba_artifacts:
         lines += ["## Reviewed Artefacts", ""]
         for label, path in [
@@ -747,6 +813,35 @@ def _load_flow_coverage(ctx: PipelineContext) -> dict:
     return {}
 
 
+def _load_doc_coverage(ctx: PipelineContext) -> dict:
+    """
+    Return Stage 5.9 doc coverage data from ctx.doc_coverage (preferred)
+    or by loading doc_coverage.json from disk if the field is not hydrated.
+    Returns empty dict when Stage 5.9 has not run.
+    """
+    import os
+    dc = getattr(ctx, "doc_coverage", None)
+    if dc is not None:
+        # dc.dimensions may contain DimCoverage dataclass objects (stage58 stores
+        # them as dataclasses, not dicts).  Normalise to dicts before building
+        # the keyed lookup so downstream code can use d["dimension"] safely.
+        from dataclasses import asdict as _asdict, fields as _fields
+        def _to_dict(d: object) -> dict:
+            if isinstance(d, dict):
+                return d
+            try:
+                return _asdict(d)
+            except TypeError:
+                return {f.name: getattr(d, f.name) for f in _fields(d)}
+        return {d["dimension"]: d for d in (_to_dict(x) for x in (dc.dimensions or []))}
+    path = ctx.output_path("doc_coverage.json")
+    if os.path.exists(path):
+        with open(path, encoding="utf-8") as fh:
+            data = json.load(fh)
+        return {d["dimension"]: d for d in data.get("dimensions", [])}
+    return {}
+
+
 def _save_checklist_json(ctx: PipelineContext, qa_checks: list[dict]) -> None:
     """Save the QA checklist as qa_checklist.json in the stage6 output dir."""
     path = ctx.output_path("qa_checklist.json")
@@ -756,11 +851,46 @@ def _save_checklist_json(ctx: PipelineContext, qa_checks: list[dict]) -> None:
 
 
 def _save_confidence_json(ctx: PipelineContext, conf_report: list[dict]) -> None:
-    """Save the confidence report as confidence_scores.json in the stage6 output dir."""
+    """
+    Save the confidence report as confidence_scores.json.
+
+    Each entry is enriched with traceability data when Stage 5.5 has run:
+      tr_ids          — list of TR-XXX requirement IDs that map to this feature
+      doc_covered     — {brd, srs, ac, us} boolean flags
+      code_link_count — total code links across all matched requirements
+    """
     import json as _json
+
+    tm = ctx.traceability_meta
+    enriched: list[dict] = []
+
+    for row in conf_report:
+        entry = dict(row)
+        if tm and hasattr(tm, "requirements") and tm.requirements:
+            feature_name = (row.get("feature") or "").lower()
+            matched = [
+                req for req in tm.requirements
+                if feature_name and (
+                    feature_name in (req.title or "").lower()
+                    or feature_name in (req.source_section or "").lower()
+                )
+            ]
+            if matched:
+                entry["tr_ids"] = [r.tr_id for r in matched[:10]]
+                entry["doc_covered"] = {
+                    "brd": any(r.covered_in_brd for r in matched),
+                    "srs": any(r.covered_in_srs for r in matched),
+                    "ac":  any(r.covered_in_ac  for r in matched),
+                    "us":  any(r.covered_in_us  for r in matched),
+                }
+                entry["code_link_count"] = sum(
+                    len(getattr(r, "code_links", None) or []) for r in matched
+                )
+        enriched.append(entry)
+
     path = ctx.output_path("confidence_scores.json")
     with open(path, "w", encoding="utf-8") as fh:
-        _json.dump(conf_report, fh, indent=2, ensure_ascii=False)
+        _json.dump(enriched, fh, indent=2, ensure_ascii=False)
     print(f"  [stage6] Confidence report saved → {path}")
 
 
