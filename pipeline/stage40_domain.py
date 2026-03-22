@@ -85,8 +85,23 @@ RETRIEVAL_QUERIES = [
     ("core functions business logic processing validation",           "logic"),
 ]
 TOP_K_PER_QUERY  = 5
-MAX_TOTAL_CHUNKS = 15     # hard cap on chunks sent to Claude
+MAX_TOTAL_CHUNKS = 15     # hard cap on chunks sent to the LLM
 MAX_CONTEXT_CHARS = 5000  # soft cap on total context character length
+
+# ── Context-window budget ─────────────────────────────────────────────────────
+# LLM_CONTEXT_WINDOW: total token capacity of the model (input + output).
+# When set, stage40 auto-trims the user prompt so that
+#   prompt_tokens + max_output_tokens ≤ LLM_CONTEXT_WINDOW
+# Works for any backend (Ollama, vLLM, LM Studio).
+# Examples:
+#   export LLM_CONTEXT_WINDOW=16384   # 16K model (e.g. qwen3.5-27b default)
+#   export LLM_CONTEXT_WINDOW=32768   # 32K (Ollama with NUM_CTX=32768)
+#   export LLM_CONTEXT_WINDOW=131072  # 128K (large-context models)
+# Default 0 means "no trimming" (original behaviour).
+_CTX_WINDOW = int(os.environ.get("LLM_CONTEXT_WINDOW", "0") or "0")
+
+# Safety headroom reserved for the system prompt and misc overhead (tokens).
+_SYSTEM_OVERHEAD = int(os.environ.get("LLM_SYSTEM_OVERHEAD", "1500") or "1500")
 
 
 # ─── Public Entry Point ────────────────────────────────────────────────────────
@@ -127,8 +142,12 @@ def run(ctx: PipelineContext) -> None:
           f"{len(RETRIEVAL_QUERIES)} query angles")
 
     # ── Build shared user prompt (same evidence for all 3 calls) ─────────────
+    # Auto-trim to fit LLM_CONTEXT_WINDOW when set; uses the largest per-call
+    # output budget (Call B: features) as the trim target so the prompt fits
+    # for all calls (A/B/C share the same user_prompt).
     quality_score = _get_quality_score(ctx)
-    user_prompt   = _build_user_prompt(ctx, chunks)
+    _max_out_any  = max(MAX_TOKENS_META, MAX_TOKENS_FEATURES, MAX_TOKENS_ROLES_WF)
+    user_prompt   = _trim_user_prompt(ctx, chunks, _max_out_any)
 
     # ── RAG augmentation ──────────────────────────────────────────────────────
     # When RAG_ENABLED=1, build an FTS5 code chunk index and append the most
@@ -1334,6 +1353,103 @@ def _build_user_prompt(ctx: PipelineContext, chunks: list[dict]) -> str:
     parts.append("\n=== END OF CODEBASE EVIDENCE ===")
 
     return "\n".join(parts)
+
+
+def _estimate_tokens(text: str) -> int:
+    """Rough token estimate: 1 token ≈ 4 chars (works well for English + code)."""
+    return max(1, len(text) // 4)
+
+
+def _budget_chars(max_output_tokens: int) -> int:
+    """
+    Return the maximum character length allowed for the user prompt given the
+    configured context window.  Returns a very large number (no cap) when
+    LLM_CONTEXT_WINDOW is not set.
+    """
+    if _CTX_WINDOW <= 0:
+        return 10_000_000   # effectively unlimited
+    available_tokens = _CTX_WINDOW - max_output_tokens - _SYSTEM_OVERHEAD
+    if available_tokens < 256:
+        available_tokens = 256   # always leave at least something
+    return available_tokens * 4  # tokens → chars
+
+
+def _trim_user_prompt(
+    ctx:               "PipelineContext",
+    chunks:            list[dict],
+    max_output_tokens: int,
+) -> str:
+    """
+    Build the user prompt, then trim it in stages until it fits the
+    context-window budget:
+
+      Pass 1 — reduce semantic chunks (fewest quality impact)
+      Pass 2 — collapse per-table reader/writer lists to table names only
+      Pass 3 — drop the form-inputs section entirely
+      Pass 4 — hard-truncate (last resort, keeps beginning of prompt)
+
+    If LLM_CONTEXT_WINDOW is not set, builds normally with all chunks.
+    """
+    budget = _budget_chars(max_output_tokens)
+
+    # ── Pass 0: build with all chunks ─────────────────────────────────────────
+    prompt = _build_user_prompt(ctx, chunks)
+    if len(prompt) <= budget:
+        return prompt
+
+    # ── Pass 1: binary-search on chunk count ──────────────────────────────────
+    lo, hi = 0, len(chunks)
+    while lo < hi:
+        mid = (lo + hi + 1) // 2
+        candidate = _build_user_prompt(ctx, chunks[:mid])
+        if len(candidate) <= budget:
+            lo = mid
+        else:
+            hi = mid - 1
+    prompt = _build_user_prompt(ctx, chunks[:lo])
+    if len(prompt) <= budget:
+        if lo < len(chunks):
+            print(f"  [stage4] Context budget: trimmed chunks {len(chunks)} → {lo} "
+                  f"to fit {budget // 4:,} token budget")
+        return prompt
+
+    # ── Pass 2: collapse per-table detail to just table names ─────────────────
+    import re as _re
+    # Replace multi-line "Table 'x': ..." blocks with a single name list
+    prompt_compact = _re.sub(
+        r"Table '[^']+':.*?(?=Table '|\Z)",
+        "",
+        prompt,
+        flags=_re.DOTALL,
+    )
+    # Also collapse the DB TABLES section to just the comma-separated list
+    prompt_compact = _re.sub(
+        r"(=== DATABASE TABLES ===\n)([^\n]+\n)([\s\S]*?)(\n=== )",
+        r"\1\2\4",
+        prompt_compact,
+    )
+    if len(prompt_compact) <= budget:
+        print(f"  [stage4] Context budget: collapsed table detail "
+              f"({len(prompt):,} → {len(prompt_compact):,} chars)")
+        return prompt_compact
+    prompt = prompt_compact
+
+    # ── Pass 3: drop form-inputs section ──────────────────────────────────────
+    prompt_no_forms = _re.sub(
+        r"\n=== FORM INPUTS.*?(?=\n=== |\Z)",
+        "",
+        prompt,
+        flags=_re.DOTALL,
+    )
+    if len(prompt_no_forms) <= budget:
+        print(f"  [stage4] Context budget: dropped form-inputs section")
+        return prompt_no_forms
+    prompt = prompt_no_forms
+
+    # ── Pass 4: hard truncate (keep beginning — metadata is most useful) ───────
+    print(f"  [stage4] Context budget: hard-truncating prompt "
+          f"{len(prompt):,} → {budget:,} chars (budget exhausted)")
+    return prompt[:budget]
 
 
 # ─── LLM Call Helper ───────────────────────────────────────────────────────────
