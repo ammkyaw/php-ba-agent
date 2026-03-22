@@ -93,15 +93,15 @@ MAX_CONTEXT_CHARS = 20_000  # soft cap on total context character length
 # These caps keep the prompt within a manageable token budget while still
 # giving the LLM enough signal to identify patterns.
 # Override any cap with env vars (set to 0 to disable a section entirely).
-_CAP_EXEC_PATHS    = int(os.environ.get("STAGE4_CAP_EXEC_PATHS",    "10")  or "10")   # very verbose — RAG-sorted
-_CAP_HTTP_EPS      = int(os.environ.get("STAGE4_CAP_HTTP_EPS",      "40")  or "40")
-_CAP_TABLE_COLS    = int(os.environ.get("STAGE4_CAP_TABLE_COLS",     "15")  or "15")   # verbose — columns per table
-_CAP_DB_TABLES     = int(os.environ.get("STAGE4_CAP_DB_TABLES",      "40")  or "40")
-_CAP_FUNCTIONS     = int(os.environ.get("STAGE4_CAP_FUNCTIONS",      "40")  or "40")
-_CAP_CALL_GRAPH    = int(os.environ.get("STAGE4_CAP_CALL_GRAPH",     "20")  or "20")   # files — RAG-sorted
-_CAP_FORM_FILES    = int(os.environ.get("STAGE4_CAP_FORM_FILES",     "20")  or "20")   # RAG-sorted
-_CAP_REDIRECTS     = int(os.environ.get("STAGE4_CAP_REDIRECTS",      "30")  or "30")
-_CAP_AUTH_SIGNALS  = int(os.environ.get("STAGE4_CAP_AUTH_SIGNALS",   "20")  or "20")
+_CAP_EXEC_PATHS    = int(os.environ.get("STAGE4_CAP_EXEC_PATHS",    "40")  or "40")
+_CAP_HTTP_EPS      = int(os.environ.get("STAGE4_CAP_HTTP_EPS",      "80")  or "80")
+_CAP_TABLE_COLS    = int(os.environ.get("STAGE4_CAP_TABLE_COLS",     "60")  or "60")
+_CAP_DB_TABLES     = int(os.environ.get("STAGE4_CAP_DB_TABLES",      "60")  or "60")
+_CAP_FUNCTIONS     = int(os.environ.get("STAGE4_CAP_FUNCTIONS",      "80")  or "80")
+_CAP_CALL_GRAPH    = int(os.environ.get("STAGE4_CAP_CALL_GRAPH",     "40")  or "40")
+_CAP_FORM_FILES    = int(os.environ.get("STAGE4_CAP_FORM_FILES",     "60")  or "60")
+_CAP_REDIRECTS     = int(os.environ.get("STAGE4_CAP_REDIRECTS",      "60")  or "60")
+_CAP_AUTH_SIGNALS  = int(os.environ.get("STAGE4_CAP_AUTH_SIGNALS",   "40")  or "40")
 
 
 
