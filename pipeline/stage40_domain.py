@@ -103,19 +103,6 @@ _CAP_FORM_FILES    = int(os.environ.get("STAGE4_CAP_FORM_FILES",     "20")  or "
 _CAP_REDIRECTS     = int(os.environ.get("STAGE4_CAP_REDIRECTS",      "30")  or "30")
 _CAP_AUTH_SIGNALS  = int(os.environ.get("STAGE4_CAP_AUTH_SIGNALS",   "20")  or "20")
 
-# ── Context-window budget ─────────────────────────────────────────────────────
-# LLM_MAX_INPUT_TOKENS: maximum input tokens to send in a single LLM call.
-# When set, stage40 auto-trims the user prompt to stay within this budget.
-# Works for any backend (Ollama, vLLM, LM Studio).
-# Examples:
-#   export LLM_MAX_INPUT_TOKENS=12000   # 16K model, leaving room for output
-#   export LLM_MAX_INPUT_TOKENS=28000   # 32K model
-#   export LLM_MAX_INPUT_TOKENS=120000  # 128K model
-# Default 0 means "no trimming" (original behaviour).
-_CTX_WINDOW = int(os.environ.get("LLM_MAX_INPUT_TOKENS", "0") or "0")
-
-# Safety headroom reserved for the system prompt and misc overhead (tokens).
-_SYSTEM_OVERHEAD = int(os.environ.get("LLM_SYSTEM_OVERHEAD", "1500") or "1500")
 
 
 # ─── Public Entry Point ────────────────────────────────────────────────────────
@@ -156,18 +143,10 @@ def run(ctx: PipelineContext) -> None:
           f"{len(RETRIEVAL_QUERIES)} query angles")
 
     # ── Build shared user prompt (same evidence for all 3 calls) ─────────────
-    # Auto-trim to fit LLM_MAX_INPUT_TOKENS when set; uses the largest per-call
-    # output budget (Call B: features) as the trim target so the prompt fits
-    # for all calls (A/B/C share the same user_prompt).
     quality_score = _get_quality_score(ctx)
-    _max_out_any  = max(MAX_TOKENS_META, MAX_TOKENS_FEATURES, MAX_TOKENS_ROLES_WF)
-    user_prompt   = _trim_user_prompt(ctx, chunks, _max_out_any)
-    _prompt_est   = len(user_prompt) // 4
+    user_prompt   = _build_user_prompt(ctx, chunks)
     print(f"  [stage4] User prompt assembled: {len(user_prompt):,} chars "
-          f"(~{_prompt_est:,} tokens).  "
-          + (f"Input cap: {_CTX_WINDOW:,} tok (LLM_MAX_INPUT_TOKENS), trimmed to ~{(_CTX_WINDOW - _SYSTEM_OVERHEAD):,} tok."
-             if _CTX_WINDOW > 0 else
-             "Set LLM_MAX_INPUT_TOKENS=<max_input_tokens> to enable auto-trim."))
+          f"(~{len(user_prompt) // 4:,} tokens)")
 
     # ── RAG augmentation ──────────────────────────────────────────────────────
     # When RAG_ENABLED=1, build an FTS5 code chunk index and append the most
@@ -250,15 +229,7 @@ def run(ctx: PipelineContext) -> None:
     if len(_ensemble_models) > 1:
         print(f"  [stage4] Ensemble mode: {len(_ensemble_models)} models")
 
-    # ── Calls A + B + C: submit concurrently when LLM_MAX_WORKERS > 1 ─────────
-    # A (entities/contexts), B (features), C (roles/workflows) are fully
-    # independent — they share the same user_prompt but have different system
-    # prompts and write different JSON fields.  Running them in parallel with
-    # vLLM's continuous batching cuts the stage40 wall-clock time by ~60%.
-    from concurrent.futures import ThreadPoolExecutor as _TPE
-    from pipeline.llm_client import get_max_workers as _max_w
-    _workers = _max_w()
-
+    # ── Calls A + B + C (sequential — Ollama processes one request at a time) ───
     _sys_b = _system_features(quality_score,
                                known_tables=known_tables,
                                known_pages=known_pages,
@@ -266,7 +237,6 @@ def run(ctx: PipelineContext) -> None:
                                table_columns=getattr(cm, "table_columns", None) or [])
     _user_prompt_b = (user_prompt + "\n\n" + _rag_ctx_b) if _rag_ctx_b else user_prompt
 
-    # Build flat task list: (call_type, suffix, model_override, system, user, max_tok)
     def _make_suffix(mdl_idx: int, run: int, total: int, letter: str) -> str:
         if total == 1:
             return letter
@@ -274,47 +244,23 @@ def run(ctx: PipelineContext) -> None:
             return f"{letter}{mdl_idx+1}.{run+1}"
         return f"{letter}{run+1}"
 
-    _tasks: list[tuple] = []   # (letter, suffix, mdl, sys, usr, max_tok)
+    _a_results: list[dict] = []
+    _b_results: list[dict] = []
     _total_a = _consistency_runs * len(_ensemble_models)
     _total_b = _consistency_runs * len(_ensemble_models)
     for _mi, _mdl in enumerate(_ensemble_models):
         for _run in range(_consistency_runs):
-            _tasks.append(("A", _make_suffix(_mi, _run, _total_a, "A"), _mdl,
-                           _system_meta(quality_score), user_prompt, MAX_TOKENS_META))
-            _tasks.append(("B", _make_suffix(_mi, _run, _total_b, "B"), _mdl,
-                           _sys_b, _user_prompt_b, MAX_TOKENS_FEATURES))
-    _tasks.append(("C", "C", None,
-                   _system_roles_workflows(quality_score), user_prompt, MAX_TOKENS_ROLES_WF))
+            raw_a = _call_part(_system_meta(quality_score), user_prompt,
+                               MAX_TOKENS_META, f"stage4-{_make_suffix(_mi, _run, _total_a, 'A')}",
+                               model_override=_mdl)
+            _a_results.append(_parse_partial(raw_a, _make_suffix(_mi, _run, _total_a, "A"), debug_dir))
+            raw_b = _call_part(_sys_b, _user_prompt_b,
+                               MAX_TOKENS_FEATURES, f"stage4-{_make_suffix(_mi, _run, _total_b, 'B')}",
+                               model_override=_mdl)
+            _b_results.append(_parse_partial(raw_b, _make_suffix(_mi, _run, _total_b, "B"), debug_dir))
 
-    _total_tasks = len(_tasks)
-    print(f"  [stage4] Calls A+B+C — {_total_tasks} tasks "
-          f"({'parallel' if _workers > 1 else 'sequential'}, workers={_workers}) ...")
-
-    def _run_task(t: tuple) -> tuple[str, str, str]:
-        """Returns (letter, suffix, raw_response)."""
-        letter, suffix, mdl, sys_p, usr_p, max_tok = t
-        raw = _call_part(sys_p, usr_p, max_tok, f"stage4-{suffix}",
-                         model_override=mdl)
-        return letter, suffix, raw
-
-    if _workers > 1:
-        with _TPE(max_workers=min(_total_tasks, _workers)) as _pool:
-            _futures = [_pool.submit(_run_task, t) for t in _tasks]
-            _task_results = [f.result() for f in _futures]
-    else:
-        _task_results = [_run_task(t) for t in _tasks]
-
-    # Collect and parse results by call type
-    _a_results: list[dict] = []
-    _b_results: list[dict] = []
-    raw_c: str = ""
-    for _letter, _suffix, _raw in _task_results:
-        if _letter == "A":
-            _a_results.append(_parse_partial(_raw, _suffix, debug_dir))
-        elif _letter == "B":
-            _b_results.append(_parse_partial(_raw, _suffix, debug_dir))
-        else:
-            raw_c = _raw
+    raw_c = _call_part(_system_roles_workflows(quality_score), user_prompt,
+                       MAX_TOKENS_ROLES_WF, "stage4-C")
 
     data_a = _merge_consistency_a(_a_results)
     data_b = _merge_consistency_b(_b_results)
@@ -1479,99 +1425,6 @@ def _build_user_prompt(ctx: PipelineContext, chunks: list[dict]) -> str:
     return "\n".join(parts)
 
 
-def _estimate_tokens(text: str) -> int:
-    """Rough token estimate: 1 token ≈ 4 chars (works well for English + code)."""
-    return max(1, len(text) // 4)
-
-
-def _budget_chars(max_output_tokens: int) -> int:
-    """
-    Return the maximum character length allowed for the user prompt.
-    LLM_MAX_INPUT_TOKENS is the direct input token cap (excluding system
-    overhead).  Returns a very large number (no cap) when unset.
-    """
-    if _CTX_WINDOW <= 0:
-        return 10_000_000   # effectively unlimited
-    available_tokens = max(256, _CTX_WINDOW - _SYSTEM_OVERHEAD)
-    return available_tokens * 4  # tokens → chars
-
-
-def _trim_user_prompt(
-    ctx:               "PipelineContext",
-    chunks:            list[dict],
-    max_output_tokens: int,
-) -> str:
-    """
-    Build the user prompt, then trim it in stages until it fits the
-    context-window budget:
-
-      Pass 1 — reduce semantic chunks (fewest quality impact)
-      Pass 2 — collapse per-table reader/writer lists to table names only
-      Pass 3 — drop the form-inputs section entirely
-      Pass 4 — hard-truncate (last resort, keeps beginning of prompt)
-
-    If LLM_MAX_INPUT_TOKENS is not set, builds normally with all chunks.
-    """
-    budget = _budget_chars(max_output_tokens)
-
-    # ── Pass 0: build with all chunks ─────────────────────────────────────────
-    prompt = _build_user_prompt(ctx, chunks)
-    if len(prompt) <= budget:
-        return prompt
-
-    # ── Pass 1: binary-search on chunk count ──────────────────────────────────
-    lo, hi = 0, len(chunks)
-    while lo < hi:
-        mid = (lo + hi + 1) // 2
-        candidate = _build_user_prompt(ctx, chunks[:mid])
-        if len(candidate) <= budget:
-            lo = mid
-        else:
-            hi = mid - 1
-    prompt = _build_user_prompt(ctx, chunks[:lo])
-    if len(prompt) <= budget:
-        if lo < len(chunks):
-            print(f"  [stage4] Context budget: trimmed chunks {len(chunks)} → {lo} "
-                  f"to fit {budget // 4:,} token budget")
-        return prompt
-
-    # ── Pass 2: collapse per-table detail to just table names ─────────────────
-    import re as _re
-    # Replace multi-line "Table 'x': ..." blocks with a single name list
-    prompt_compact = _re.sub(
-        r"Table '[^']+':.*?(?=Table '|\Z)",
-        "",
-        prompt,
-        flags=_re.DOTALL,
-    )
-    # Also collapse the DB TABLES section to just the comma-separated list
-    prompt_compact = _re.sub(
-        r"(=== DATABASE TABLES ===\n)([^\n]+\n)([\s\S]*?)(\n=== )",
-        r"\1\2\4",
-        prompt_compact,
-    )
-    if len(prompt_compact) <= budget:
-        print(f"  [stage4] Context budget: collapsed table detail "
-              f"({len(prompt):,} → {len(prompt_compact):,} chars)")
-        return prompt_compact
-    prompt = prompt_compact
-
-    # ── Pass 3: drop form-inputs section ──────────────────────────────────────
-    prompt_no_forms = _re.sub(
-        r"\n=== FORM INPUTS.*?(?=\n=== |\Z)",
-        "",
-        prompt,
-        flags=_re.DOTALL,
-    )
-    if len(prompt_no_forms) <= budget:
-        print(f"  [stage4] Context budget: dropped form-inputs section")
-        return prompt_no_forms
-    prompt = prompt_no_forms
-
-    # ── Pass 4: hard truncate (keep beginning — metadata is most useful) ───────
-    print(f"  [stage4] Context budget: hard-truncating prompt "
-          f"{len(prompt):,} → {budget:,} chars (budget exhausted)")
-    return prompt[:budget]
 
 
 # ─── LLM Call Helper ───────────────────────────────────────────────────────────
