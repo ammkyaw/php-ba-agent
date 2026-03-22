@@ -63,8 +63,12 @@ MAX_TOKENS = 8192  # kept for critic loop compatibility
 # Each doc is split into: front matter | requirement batches | tail sections.
 # STAGE5_SECTION_BATCH  : features per LLM call (default 20)
 # STAGE5_SECTION_TOKENS : max output tokens per section call (default 2500)
-_SECTION_BATCH  = max(1,  int(os.environ.get("STAGE5_SECTION_BATCH",  "20") or "20"))
+# STAGE5_CAP_FLOWS      : max business flows included in AC/US prompts (default 30)
+# STAGE5_CAP_EXEC_PATHS : max execution paths included in AC/US prompts (default 20)
+_SECTION_BATCH  = max(1,   int(os.environ.get("STAGE5_SECTION_BATCH",  "20") or "20"))
 _SECTION_TOKENS = max(500, int(os.environ.get("STAGE5_SECTION_TOKENS", "2500") or "2500"))
+_CAP_FLOWS      = max(1,   int(os.environ.get("STAGE5_CAP_FLOWS",      "30") or "30"))
+_CAP_EXEC_PATHS = max(1,   int(os.environ.get("STAGE5_CAP_EXEC_PATHS", "20") or "20"))
 
 # ── Critic loop feature flag ───────────────────────────────────────────────────
 # Set STAGE5_SKIP_CRITIC=1 to disable the critic loop (e.g. for fast local runs)
@@ -479,18 +483,17 @@ Technical and business constraints on the implementation."""
 # ─── AC Agent ─────────────────────────────────────────────────────────────────
 
 def _run_ac_agent(domain: DomainModel, ctx: PipelineContext) -> str:
-    """Generate Acceptance Criteria section-by-section."""
+    """Generate Acceptance Criteria — features, flows, and exec-paths each as
+    separate parallel LLM calls so no flow or path is ever dropped."""
     from pipeline.evidence_index import build_evidence_index, format_evidence_block
     from pipeline.framework_hints import get_hints
 
     hints  = get_hints(ctx.code_map.framework if ctx.code_map else "unknown")
     ev_idx = build_evidence_index(ctx, domain)
+    spec_block = _format_spec_rules_for_prompt(ctx)
+    domain_hdr = _compact_domain_header(domain)
 
-    ep_section    = _format_execution_paths_for_prompt(ctx)
-    flows_section = _format_business_flows_for_prompt(ctx)
-    spec_block    = _format_spec_rules_for_prompt(ctx)
-    domain_hdr    = _compact_domain_header(domain)
-
+    # Lean system prompt — no flows/exec_paths (those go in individual user prompts)
     system = _append_traceability_hints(f"""You are a QA lead writing Acceptance Criteria.
 Use Given/When/Then (Gherkin) for interactive scenarios; plain pass/fail for display rules.
 Derive Given/When/Then from Evidence blocks:
@@ -508,11 +511,10 @@ Quality rules:
 {hints.ac_template}
 
 {domain_hdr}
-{flows_section}
-{ep_section}
 {spec_block}""")
 
     parts: list[str] = []
+    all_parallel_args: list[tuple] = []
 
     # ── Section A: header + overview ─────────────────────────────────────────
     hdr_user = f"""Write ONLY the title and Overview section. Do NOT write any AC-XX sections yet.
@@ -526,7 +528,7 @@ Brief description of how acceptance testing should be approached for this system
 
     parts.append(_call_section(system, hdr_user, "stage50_ac_header", 0.35, 400))
 
-    # ── Section B: AC entries batched ────────────────────────────────────────
+    # ── Section B: feature-batch calls (parallel) ─────────────────────────────
     def _ac_entry(i: int, f: dict) -> str:
         ev_block = format_evidence_block(ev_idx.get(f["name"], {}))
         ev_str   = f"\n{ev_block}\n" if ev_block else ""
@@ -547,34 +549,68 @@ Brief description of how acceptance testing should be approached for this system
             f"- Then: [expected error/rejection]"
         )
 
-    _ac_batch_args: list[tuple] = []
     for batch_start, batch in _feature_batches(domain.features, _SECTION_BATCH):
-        ac_from = batch_start + 1
-        ac_to   = batch_start + len(batch)
+        ac_from  = batch_start + 1
+        ac_to    = batch_start + len(batch)
         scaffold = "\n\n---\n\n".join(_ac_entry(i, f) for i, f in enumerate(batch, ac_from))
+        ac_user  = (
+            f"Write ONLY AC-{ac_from:02d} through AC-{ac_to:02d}.\n"
+            f"CRITICAL: Use the EXACT headings \"## AC-XX: [Feature Name]\" as written — "
+            f"do NOT rename them.\n"
+            f"Do NOT write any other section or repeat previous ACs.\n\n---\n\n{scaffold}"
+        )
+        all_parallel_args.append((
+            system, ac_user,
+            f"stage50_ac_batch_{batch_start // _SECTION_BATCH + 1}",
+            0.35, _SECTION_TOKENS,
+        ))
 
-        ac_user = f"""Write ONLY AC-{ac_from:02d} through AC-{ac_to:02d}.
-CRITICAL: Use the EXACT headings "## AC-XX: [Feature Name]" as written — do NOT rename them.
-Do NOT write any other section or repeat previous ACs.
+    # ── Section C: one call per business flow (parallel) ──────────────────────
+    bfc    = getattr(ctx, "business_flows", None)
+    flows  = bfc.flows if bfc and bfc.flows else []
+    for i, flow in enumerate(flows, 1):
+        flow_block = _format_single_flow(flow)
+        flow_user  = (
+            f"Write AC for this single business flow ONLY. "
+            f"Do NOT write ACs for any other flow or feature.\n\n"
+            f"=== BUSINESS FLOW ===\n{flow_block}\n\n"
+            f"Output format:\n"
+            f"## AC-FLOW-{i:02d}: {flow.name}\n"
+            f"Write Given/When/Then covering the happy path and each listed branch."
+        )
+        all_parallel_args.append((
+            system, flow_user,
+            f"stage50_ac_flow_{i:02d}",
+            0.35, _SECTION_TOKENS,
+        ))
 
----
+    # ── Section D: one call per execution path (parallel) ────────────────────
+    cm         = ctx.code_map
+    exec_paths = list(getattr(cm, "execution_paths", None) or []) if cm else []
+    for i, ep in enumerate(exec_paths, 1):
+        ep_block  = _format_single_exec_path(ep)
+        ep_user   = (
+            f"Write AC for this single execution path ONLY. "
+            f"Do NOT write ACs for any other path or feature.\n\n"
+            f"=== EXECUTION PATH ===\n{ep_block}\n\n"
+            f"Output format:\n"
+            f"## AC-PATH-{i:02d}: {ep.get('file', '?')}\n"
+            f"Write Given/When/Then derived from the auth guard and branch conditions above."
+        )
+        all_parallel_args.append((
+            system, ep_user,
+            f"stage50_ac_path_{i:02d}",
+            0.35, _SECTION_TOKENS,
+        ))
 
-{scaffold}"""
-        _ac_batch_args.append((system, ac_user,
-                                f"stage50_ac_batch_{batch_start // _SECTION_BATCH + 1}",
-                                0.35, _SECTION_TOKENS))
-    parts.extend(_parallel_call_sections(_ac_batch_args))
+    parts.extend(_parallel_call_sections(all_parallel_args))
 
-    # ── Section C: test data requirements ────────────────────────────────────
-    tail_user = f"""Write ONLY the Test Data Requirements section. Do NOT repeat any AC sections.
-
-Output EXACTLY:
-
----
-
-## Test Data Requirements
-What test data is needed to execute these criteria (users, records, files, etc.)."""
-
+    # ── Section E: test data requirements ─────────────────────────────────────
+    tail_user = (
+        "Write ONLY the Test Data Requirements section. Do NOT repeat any AC sections.\n\n"
+        "Output EXACTLY:\n\n---\n\n## Test Data Requirements\n"
+        "What test data is needed to execute these criteria (users, records, files, etc.)."
+    )
     parts.append(_call_section(system, tail_user, "stage50_ac_tail", 0.35, 500))
     return "\n\n".join(parts)
 
@@ -589,11 +625,10 @@ def _run_userstories_agent(domain: DomainModel, ctx: PipelineContext) -> str:
     hints  = get_hints(ctx.code_map.framework if ctx.code_map else "unknown")
     ev_idx = build_evidence_index(ctx, domain)
 
-    ep_section    = _format_execution_paths_for_prompt(ctx)
-    flows_section = _format_business_flows_for_prompt(ctx)
-    spec_block    = _format_spec_rules_for_prompt(ctx, categories=["WORKFLOW", "AUTHORIZATION"])
-    domain_hdr    = _compact_domain_header(domain)
+    spec_block = _format_spec_rules_for_prompt(ctx, categories=["WORKFLOW", "AUTHORIZATION"])
+    domain_hdr = _compact_domain_header(domain)
 
+    # Lean system prompt — flows/exec_paths go in individual user prompts
     system = _append_traceability_hints(f"""You are an Agile product owner writing User Stories.
 Format: 'As a [role], I want to [action], so that [benefit]'.
 Include story points (Fibonacci: 1,2,3,5,8,13) and priority (Must/Should/Could/Won't).
@@ -610,8 +645,6 @@ Quality rules:
 {hints.story_note}
 
 {domain_hdr}
-{flows_section}
-{ep_section}
 {spec_block}""")
 
     parts: list[str] = []
@@ -663,22 +696,65 @@ Output EXACTLY:
             f"**Notes:** {desc}"
         )
 
-    _us_epic_args: list[tuple] = []
+    all_us_parallel_args: list[tuple] = []
+
+    # ── epic batch calls ───────────────────────────────────────────────────────
     for batch_start, batch in _feature_batches(domain.features, _SECTION_BATCH):
-        scaffold = "\n\n---\n\n".join(_epic_block(f) for f in batch)
+        scaffold   = "\n\n---\n\n".join(_epic_block(f) for f in batch)
         epic_names = ", ".join(f["name"] for f in batch)
+        epic_user  = (
+            f"Write ONLY the epic detail for: {epic_names}.\n"
+            f"CRITICAL: Use EXACT headings \"## Epic: [Feature Name]\" as written — "
+            f"do NOT rename them.\n"
+            f"Do NOT write any other section or repeat previous epics.\n\n---\n\n{scaffold}"
+        )
+        all_us_parallel_args.append((
+            system, epic_user,
+            f"stage50_us_epics_{batch_start // _SECTION_BATCH + 1}",
+            0.5, _SECTION_TOKENS,
+        ))
 
-        epic_user = f"""Write ONLY the epic detail for: {epic_names}.
-CRITICAL: Use EXACT headings "## Epic: [Feature Name]" as written — do NOT rename them.
-Do NOT write any other section or repeat previous epics.
+    # ── one call per business flow ─────────────────────────────────────────────
+    bfc   = getattr(ctx, "business_flows", None)
+    flows = bfc.flows if bfc and bfc.flows else []
+    for i, flow in enumerate(flows, 1):
+        flow_block = _format_single_flow(flow)
+        flow_user  = (
+            f"Write a User Story for this single business flow ONLY. "
+            f"Do NOT write stories for any other flow or feature.\n\n"
+            f"=== BUSINESS FLOW ===\n{flow_block}\n\n"
+            f"Output format:\n"
+            f"## Epic: {flow.name} (Flow)\n"
+            f"Write As a/I want to/So that derived from the flow steps above, "
+            f"with AC covering the happy path and each branch."
+        )
+        all_us_parallel_args.append((
+            system, flow_user,
+            f"stage50_us_flow_{i:02d}",
+            0.5, _SECTION_TOKENS,
+        ))
 
----
+    # ── one call per execution path ────────────────────────────────────────────
+    cm         = ctx.code_map
+    exec_paths = list(getattr(cm, "execution_paths", None) or []) if cm else []
+    for i, ep in enumerate(exec_paths, 1):
+        ep_block = _format_single_exec_path(ep)
+        ep_user  = (
+            f"Write a User Story for this single execution path ONLY. "
+            f"Do NOT write stories for any other path or feature.\n\n"
+            f"=== EXECUTION PATH ===\n{ep_block}\n\n"
+            f"Output format:\n"
+            f"## Epic: {ep.get('file', '?')} (Path)\n"
+            f"Write As a/I want to/So that derived from the branch conditions above, "
+            f"with AC covering the auth guard and each branch outcome."
+        )
+        all_us_parallel_args.append((
+            system, ep_user,
+            f"stage50_us_path_{i:02d}",
+            0.5, _SECTION_TOKENS,
+        ))
 
-{scaffold}"""
-        _us_epic_args.append((system, epic_user,
-                               f"stage50_us_epics_{batch_start // _SECTION_BATCH + 1}",
-                               0.5, _SECTION_TOKENS))
-    parts.extend(_parallel_call_sections(_us_epic_args))
+    parts.extend(_parallel_call_sections(all_us_parallel_args))
 
     # ── Section C: summary table + totals ─────────────────────────────────────
     # Collect US IDs for the table hint
@@ -843,13 +919,17 @@ def _format_business_flows_for_prompt(ctx: PipelineContext) -> str:
     if not bfc or not bfc.flows:
         return ""
 
+    flows = bfc.flows[:_CAP_FLOWS]
+    total = len(bfc.flows)
+    cap_note = f" (showing {len(flows)} of {total})" if total > _CAP_FLOWS else ""
+
     lines = [
-        "\n=== BUSINESS FLOWS (from graph traversal + static analysis) ===",
+        f"\n=== BUSINESS FLOWS (from graph traversal + static analysis){cap_note} ===",
         "Use these to write one AC/Story section per flow, "
         "covering the happy path and each listed branch.",
     ]
 
-    for f in bfc.flows:
+    for f in flows:
         lines.append(
             f"\n[{f.flow_id}] {f.name}  "
             f"| Actor: {f.actor}  "
@@ -892,8 +972,12 @@ def _format_execution_paths_for_prompt(ctx: PipelineContext) -> str:
     if not exec_paths:
         return ""
 
+    total = len(exec_paths)
+    exec_paths = exec_paths[:_CAP_EXEC_PATHS]
+    cap_note = f" (showing {len(exec_paths)} of {total})" if total > _CAP_EXEC_PATHS else ""
+
     lines = [
-        "\n=== REAL BRANCH CONDITIONS (from static code analysis) ===",
+        f"\n=== REAL BRANCH CONDITIONS (from static code analysis){cap_note} ===",
         "Use these to write precise Given/When/Then AC derived from actual code logic.",
     ]
     for ep in exec_paths:
@@ -937,6 +1021,70 @@ def _format_execution_paths_for_prompt(ctx: PipelineContext) -> str:
                 for e in else_acts:
                     lines.append(f"      ✗ {e}")
 
+    return "\n".join(lines)
+
+
+def _format_single_flow(f) -> str:
+    """Render one BusinessFlow object as a compact prompt block."""
+    lines = [
+        f"[{f.flow_id}] {f.name}",
+        f"  Actor      : {f.actor}",
+        f"  Context    : {f.bounded_context}",
+        f"  Confidence : {f.confidence:.0%}",
+        f"  Trigger    : {f.trigger}",
+        f"  Terminates : {f.termination}",
+        "  Steps:",
+    ]
+    for s in f.steps:
+        auth = " [AUTH REQUIRED]" if s.auth_required else ""
+        meth = f" ({s.http_method})" if s.http_method else ""
+        db   = f" → DB: {'; '.join(s.db_ops[:2])}" if s.db_ops else ""
+        inp  = f" inputs=[{', '.join(s.inputs)}]" if s.inputs else ""
+        out  = f" outputs=[{', '.join(s.outputs[:2])}]" if s.outputs else ""
+        lines.append(f"    {s.step_num}. {s.page}{meth}{auth}{db}{inp}{out}")
+        lines.append(f"       {s.action}")
+    if f.branches:
+        lines.append(f"  Branches ({len(f.branches)}):")
+        for b in f.branches:
+            lines.append(
+                f"    • At {b['at_page']}: if ({b['condition']}) "
+                f"→ {', '.join(b['alternate'])}"
+            )
+    return "\n".join(lines)
+
+
+def _format_single_exec_path(ep: dict) -> str:
+    """Render one execution-path dict as a compact prompt block."""
+    fname = ep.get("file", "?")
+    lines = [f"{fname}:"]
+    ag = ep.get("auth_guard")
+    if ag:
+        lines.append(
+            f"  • Auth required: session['{ag.get('key','?')}'] "
+            f"(else → {ag.get('redirect','redirect')})"
+        )
+    for flow in ep.get("data_flows", []):
+        fields = list(flow.get("field_mapping", {}).keys())
+        table  = flow.get("table", "?")
+        op     = flow.get("sink", "sql")
+        if fields:
+            lines.append(f"  • Input: [{', '.join(fields)}] → {op} on `{table}`")
+    for b in ep.get("branches", [])[:2]:
+        cond      = b.get("condition", "")[:80]
+        then_acts = [
+            f"{a.get('action','')} {a.get('target') or a.get('key') or a.get('table','')}".strip()
+            for a in b.get("then", [])
+        ]
+        else_acts = [
+            f"{a.get('action','')} {a.get('target') or a.get('key') or a.get('table','')}".strip()
+            for a in b.get("else", [])
+        ]
+        if cond and (then_acts or else_acts):
+            lines.append(f"  • Branch: if ({cond})")
+            for t in then_acts:
+                lines.append(f"      ✓ {t}")
+            for e in else_acts:
+                lines.append(f"      ✗ {e}")
     return "\n".join(lines)
 
 
