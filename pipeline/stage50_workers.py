@@ -61,9 +61,9 @@ MAX_TOKENS = 8192  # kept for critic loop compatibility
 
 # ── Section-by-section generation ──────────────────────────────────────────────
 # Each doc is split into: front matter | requirement batches | tail sections.
-# STAGE5_SECTION_BATCH  : features per LLM call (default 10)
+# STAGE5_SECTION_BATCH  : features per LLM call (default 20)
 # STAGE5_SECTION_TOKENS : max output tokens per section call (default 2500)
-_SECTION_BATCH  = max(1,  int(os.environ.get("STAGE5_SECTION_BATCH",  "10") or "10"))
+_SECTION_BATCH  = max(1,  int(os.environ.get("STAGE5_SECTION_BATCH",  "20") or "20"))
 _SECTION_TOKENS = max(500, int(os.environ.get("STAGE5_SECTION_TOKENS", "2500") or "2500"))
 
 # ── Critic loop feature flag ───────────────────────────────────────────────────

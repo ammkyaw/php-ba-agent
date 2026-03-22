@@ -69,8 +69,11 @@ COVERAGE_FILE    = "coverage_report.json"
 GAP_FILL_MAX_MODULES = 30
 # Gap-fill: max individual files per call (fallback when no module structure)
 GAP_FILL_MAX_PAGES = 100
-# Gap-fill: maximum number of loop rounds
-MAX_GAP_ROUNDS = 20
+# Gap-fill: maximum number of loop rounds.
+# Override with STAGE4_MAX_GAP_ROUNDS=N (e.g. 5 for speed, 20 for thoroughness).
+# Set STAGE4_SKIP_GAP_FILL=1 to bypass all D-calls (fastest, lower page coverage).
+MAX_GAP_ROUNDS = int(os.environ.get("STAGE4_MAX_GAP_ROUNDS", "20") or "20")
+_SKIP_GAP_FILL = os.environ.get("STAGE4_SKIP_GAP_FILL", "0").strip() == "1"
 
 # Retrieval: queries × top-k chunks each
 RETRIEVAL_QUERIES = [
@@ -271,11 +274,18 @@ def run(ctx: PipelineContext) -> None:
     # ── Gap-fill pass ─────────────────────────────────────────────────────────
     # Use the wide filter set for gap-fill too so new features can reference
     # any real file (not only html_pages).
-    domain_model = _gap_fill_pass(
-        ctx, domain_model, coverage_report, user_prompt, quality_score, debug_dir,
-        known_tables=known_tables, known_pages_lower=known_files_all,
-        known_fields=known_fields,
-    )
+    # Skip entirely when STAGE4_SKIP_GAP_FILL=1 (saves 15-30 min on large repos).
+    if _SKIP_GAP_FILL:
+        print(f"  [stage4] Gap-fill skipped (STAGE4_SKIP_GAP_FILL=1)")
+    else:
+        if MAX_GAP_ROUNDS < 20:
+            print(f"  [stage4] Gap-fill capped at {MAX_GAP_ROUNDS} rounds "
+                  f"(STAGE4_MAX_GAP_ROUNDS={MAX_GAP_ROUNDS})")
+        domain_model = _gap_fill_pass(
+            ctx, domain_model, coverage_report, user_prompt, quality_score, debug_dir,
+            known_tables=known_tables, known_pages_lower=known_files_all,
+            known_fields=known_fields,
+        )
 
     # ── Post-gap-fill coverage (shows improvement vs initial report) ───────────
     # Store result on ctx so stage58/stage59 can reference final coverage data

@@ -286,6 +286,8 @@ def call_llm(
 
     for attempt in range(MAX_RETRIES + 1):   # attempt 0 = first try
         try:
+            _set_tok(-1, -1)                  # reset before each attempt
+            _t0 = time.monotonic()
             if provider == "local":
                 result = _call_local(system_prompt, user_prompt, max_tokens,
                                      temperature, model, json_mode=json_mode,
@@ -296,6 +298,13 @@ def call_llm(
             else:
                 result = call_fn(system_prompt, user_prompt, max_tokens,
                                  temperature, model)
+            _elapsed = time.monotonic() - _t0
+            _in, _out = _get_tok()
+            if _in >= 0 and _out >= 0:
+                _tok_str = f"in={_in:,} out={_out:,} tok"
+            else:
+                _tok_str = f"~{len(result.split()):,} words"  # fallback if provider didn't report
+            print(f"  {tag}done in {_elapsed:.1f}s  ({_tok_str})")
             # ── JSON validation + single correction retry ──────────────────
             if json_mode:
                 ok, err = _validate_json(result)
@@ -546,6 +555,13 @@ def _call_local(
             f"  Warning: local LLM hit max_tokens limit ({max_tokens}). "
             f"Response length: {len(content)} chars."
         )
+
+    # Report real token counts from OpenAI usage field
+    usage = data.get("usage", {})
+    _set_tok(
+        in_tok  = usage.get("prompt_tokens",     -1),
+        out_tok = usage.get("completion_tokens",  -1),
+    )
 
     # Restore prefill so the caller sees the complete value
     return (prefill + content) if prefill else content
