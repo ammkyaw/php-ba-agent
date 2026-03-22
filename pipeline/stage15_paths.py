@@ -1,5 +1,5 @@
 """
-pipeline/stage15_paths.py — Execution Path Simulator (Conditional Branch Extractor)
+pipeline/stage15_paths.py — Execution Path Simulator (Multi-Language Dispatcher)
 
 Performs a focused static analysis pass over each PHP entry-point file to extract:
 
@@ -54,7 +54,7 @@ import traceback
 from pathlib import Path
 from typing import Any
 
-from context import CodeMap, Framework, PipelineContext
+from context import CodeMap, Framework, Language, PipelineContext
 
 OUTPUT_FILE = "execution_paths.json"
 ERROR_FILE  = "execution_paths_errors.json"
@@ -92,9 +92,28 @@ def run(ctx: PipelineContext) -> None:
     if ctx.code_map is None:
         raise RuntimeError("[stage15] ctx.code_map is None — run Stage 1 first.")
 
+    language  = ctx.code_map.language
     framework = ctx.code_map.framework
     print(f"  [stage15] Analysing execution paths in "
-          f"{ctx.code_map.total_files} file(s) ... (framework={framework.value})")
+          f"{ctx.code_map.total_files} file(s) "
+          f"(language={language.value}, framework={framework.value})")
+
+    # ── Language dispatch ─────────────────────────────────────────────────────
+    if language in (Language.TYPESCRIPT, Language.JAVASCRIPT):
+        from pipeline.paths.typescript_paths import enrich as ts_enrich  # noqa: PLC0415
+        all_paths = ts_enrich(ctx)
+        ctx.stage("stage15_paths").mark_completed(output_path)
+        ctx.save()
+        return
+
+    if language in (Language.JAVA, Language.KOTLIN):
+        from pipeline.paths.java_paths import enrich as java_enrich  # noqa: PLC0415
+        all_paths = java_enrich(ctx)
+        ctx.stage("stage15_paths").mark_completed(output_path)
+        ctx.save()
+        return
+
+    # ── PHP path (original logic below) ──────────────────────────────────────
 
     # ── Collect PHP entry-point files ─────────────────────────────────────────
     php_files = _collect_php_files(ctx.php_project_path)

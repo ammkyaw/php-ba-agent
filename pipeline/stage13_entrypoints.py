@@ -1,31 +1,34 @@
 """
 pipeline/stage13_entrypoints.py — System Entry-Point Catalog (Stage 1.3)
+                                   Multi-Language Dispatcher
 
-Runs between Stage 1 (PHP parsing) and Stage 1.5 (execution paths).
+Runs between Stage 1 (code parsing) and Stage 1.5 (execution paths).
 Detects ALL system entry points — not just browser-facing HTTP pages — using
 purely static analysis (zero LLM calls).
 
 Entry-point types detected
 --------------------------
-  http         — Standard browser-facing PHP pages (already in code_map;
-                 listed here only when they are also webhooks)
-  scheduled    — Cron jobs and scheduled console commands
-  cli          — Admin / maintenance CLI scripts (artisan, bin/*.php, etc.)
+  http         — Standard browser-facing pages / API handlers
+  scheduled    — Cron jobs and scheduled tasks
+  cli          — Admin / maintenance CLI scripts
   webhook      — Incoming HTTP callbacks from external systems
   queue_worker — Async queue / message-queue job handlers
 
-Framework-specific detection
------------------------------
-  Laravel  : app/Console/Commands/ (cli), app/Jobs/ (queue_worker),
-             app/Listeners/ (queue_worker if ShouldQueue),
-             app/Console/Kernel.php + routes/console.php (scheduled)
-  Symfony  : src/Command/ (cli), src/MessageHandler/ + src/Handler/ (queue_worker)
-  Generic  : shebang scripts, cli-guard patterns, cron/ dirs, crontab configs,
-             webhook signature-header patterns, raw queue client patterns
+Language dispatch
+-----------------
+  PHP        → pipeline/entrypoints/php_entrypoints  (original Laravel/Symfony logic)
+  TypeScript → pipeline/entrypoints/typescript_entrypoints
+  Java       → pipeline/entrypoints/java_entrypoints
+
+Framework-specific detection (PHP)
+------------------------------------
+  Laravel  : app/Console/Commands/, app/Jobs/, app/Listeners/, Kernel.php schedule
+  Symfony  : src/Command/, src/MessageHandler/, src/Handler/
+  Generic  : shebang scripts, cron dirs, crontab configs, webhook signature patterns
 
 Downstream consumers
 --------------------
-  Stage 1.5  — augments php_files set with non-HTTP handler files
+  Stage 1.5  — augments source-file set with non-HTTP handler files
   Stage 4.5  — tags BusinessFlow.flow_type from evidence_files → ep_type
   Stage 5    — injects background operation descriptions into BRD prompt
 
@@ -42,7 +45,7 @@ import re
 from pathlib import Path
 from typing import Optional
 
-from context import EntryPoint, EntryPointCatalog, Framework, PipelineContext
+from context import EntryPoint, EntryPointCatalog, Framework, Language, PipelineContext
 
 OUTPUT_FILE = "entry_point_catalog.json"
 
@@ -88,14 +91,15 @@ def run(ctx: PipelineContext) -> None:
         raise RuntimeError("[stage13] ctx.code_map is None — run Stage 1 first.")
 
     framework = ctx.code_map.framework
-    root      = Path(ctx.php_project_path)
+    language  = ctx.code_map.language
+    root      = Path(ctx.project_path)
 
     print(
         f"  [stage13] Scanning entry points "
-        f"(framework={framework.value}, root={root.name}) ..."
+        f"(language={language.value}, framework={framework.value}, root={root.name}) ..."
     )
 
-    eps = _detect_all(root, framework)
+    eps = _dispatch_detect(root, language, framework)
 
     # Assign sequential IDs
     for i, ep in enumerate(eps, 1):
@@ -117,7 +121,21 @@ def run(ctx: PipelineContext) -> None:
             print(f"  [stage13]   [{ep_type}]  … and {len(eps_of_type)-5} more")
 
 
-# ─── Detection Orchestrator ────────────────────────────────────────────────────
+# ─── Language Dispatcher ────────────────────────────────────────────────────────
+
+def _dispatch_detect(root: Path, language: Language, framework: Framework) -> list[EntryPoint]:
+    """Route to the correct language-specific entry-point detector."""
+    if language in (Language.TYPESCRIPT, Language.JAVASCRIPT):
+        from pipeline.entrypoints.typescript_entrypoints import detect as ts_detect  # noqa: PLC0415
+        return ts_detect(root, framework)
+    if language in (Language.JAVA, Language.KOTLIN):
+        from pipeline.entrypoints.java_entrypoints import detect as java_detect  # noqa: PLC0415
+        return java_detect(root, framework)
+    # PHP (or UNKNOWN — fall back to PHP for backward compat)
+    return _detect_all(root, framework)
+
+
+# ─── PHP Detection Orchestrator ────────────────────────────────────────────────
 
 def _detect_all(root: Path, framework: Framework) -> list[EntryPoint]:
     """Run all detectors, deduplicate by handler_file."""

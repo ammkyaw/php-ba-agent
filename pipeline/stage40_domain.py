@@ -109,6 +109,10 @@ def run(ctx: PipelineContext) -> None:
               f"{len(ctx.domain_model.features)} feature(s).")
         return
 
+    # ── Language-aware preamble ───────────────────────────────────────────────
+    global _ACTIVE_PREAMBLE
+    _ACTIVE_PREAMBLE = _build_system_preamble(ctx)
+
     # ── Pre-flight ────────────────────────────────────────────────────────────
     _assert_prerequisites(ctx)
 
@@ -527,6 +531,35 @@ def _evidence_instruction(quality_score: int) -> str:
     )
 
 
+def _build_system_preamble(ctx) -> str:
+    """Return a language-aware system preamble for the domain analyst LLM."""
+    from context import Language  # avoid circular at module level  # noqa: PLC0415
+    lang = Language.PHP
+    fw   = "unknown"
+    if ctx.code_map:
+        lang = ctx.code_map.language
+        fw   = ctx.code_map.framework.value
+
+    _lang_desc = {
+        Language.PHP:        f"legacy PHP ({fw}) applications",
+        Language.TYPESCRIPT: f"TypeScript ({fw}) applications",
+        Language.JAVASCRIPT: f"JavaScript ({fw}) applications",
+        Language.JAVA:       f"Java ({fw}) applications",
+        Language.KOTLIN:     f"Kotlin ({fw}) applications",
+        Language.UNKNOWN:    "software applications",
+    }
+    desc = _lang_desc.get(lang, "software applications")
+    return (
+        f"You are a senior Business Analyst and software architect specialising in\n"
+        f"reverse-engineering {desc} into structured business domain models.\n\n"
+        f"Your task is to analyse the provided codebase evidence and extract specific\n"
+        f"parts of the domain model in JSON format."
+    )
+
+
+# Set by run() to inject a language-aware preamble before calling prompt builders.
+_ACTIVE_PREAMBLE: str = ""
+
 _SYSTEM_PREAMBLE = """\
 You are a senior Business Analyst and software architect specialising in
 reverse-engineering legacy PHP applications into structured business domain models.
@@ -542,9 +575,14 @@ CRITICAL OUTPUT RULES — you MUST follow these exactly:
 """
 
 
+def _get_preamble() -> str:
+    """Return language-aware preamble if set, else the PHP default."""
+    return _ACTIVE_PREAMBLE if _ACTIVE_PREAMBLE else _SYSTEM_PREAMBLE
+
+
 def _system_meta(quality_score: int) -> str:
     """Call A — domain name, description, key entities, bounded contexts."""
-    return f"""{_SYSTEM_PREAMBLE}
+    return f"""{_get_preamble()}
 {_evidence_instruction(quality_score)}
 
 Output ONLY this JSON (no other fields):
@@ -643,7 +681,7 @@ def _system_features(
         )
     grounding = ("\n\n" + "\n\n".join(grounding_parts)) if grounding_parts else ""
 
-    return f"""{_SYSTEM_PREAMBLE}
+    return f"""{_get_preamble()}
 {_evidence_instruction(quality_score)}{grounding}
 
 Output ONLY this JSON (no other fields):
@@ -668,7 +706,7 @@ Now produce the JSON for features only:"""
 
 def _system_roles_workflows(quality_score: int) -> str:
     """Call C — user roles and workflows."""
-    return f"""{_SYSTEM_PREAMBLE}
+    return f"""{_get_preamble()}
 {_evidence_instruction(quality_score)}
 
 Output ONLY this JSON (no other fields):
@@ -790,7 +828,7 @@ Existing features already extracted (do NOT duplicate): {existing_str}
 For each uncovered page, determine what business feature it represents.
 Group multiple uncovered pages under one feature if they implement the same business function."""
 
-    return f"""{_SYSTEM_PREAMBLE}
+    return f"""{_get_preamble()}
 {_evidence_instruction(quality_score)}{tables_grounding}
 
 {coverage_instruction}

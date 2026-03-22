@@ -41,12 +41,36 @@ class StageStatus(str, Enum):
     FAILED    = "failed"
 
 
+class Language(str, Enum):
+    """Primary programming language of the analysed project."""
+    PHP        = "php"
+    TYPESCRIPT = "typescript"
+    JAVASCRIPT = "javascript"
+    JAVA       = "java"
+    KOTLIN     = "kotlin"
+    UNKNOWN    = "unknown"
+
+
 class Framework(str, Enum):
+    # ── PHP frameworks ────────────────────────────────────────────────────────
     LARAVEL     = "laravel"
     SYMFONY     = "symfony"
     CODEIGNITER = "codeigniter"
     WORDPRESS   = "wordpress"
     RAW_PHP     = "raw_php"
+    # ── TypeScript / JavaScript frameworks ───────────────────────────────────
+    NEXTJS      = "nextjs"
+    NUXTJS      = "nuxtjs"
+    VUE         = "vue"
+    REACT       = "react"
+    EXPRESS     = "express"
+    FASTIFY     = "fastify"
+    NESTJS      = "nestjs"
+    # ── Java / Kotlin frameworks ──────────────────────────────────────────────
+    SPRING_BOOT = "spring_boot"
+    QUARKUS     = "quarkus"
+    MICRONAUT   = "micronaut"
+    # ── Fallback ──────────────────────────────────────────────────────────────
     UNKNOWN     = "unknown"
 
 
@@ -81,43 +105,51 @@ class StageResult:
 @dataclass
 class CodeMap:
     """
-    Full extracted representation of a PHP codebase produced by Stage 1.
+    Full extracted representation of a codebase produced by Stage 1.
 
-    Original fields (OOP structure)
-    --------------------------------
-    framework       — detected framework enum
-    php_version     — e.g. "8.1"
-    classes         — all class definitions (raw, non-categorised)
-    routes          — HTTP route registrations (Laravel/Symfony/raw)
-    models          — OOP model / entity classes
-    controllers     — OOP controller classes
-    services        — service, repository, and other OOP classes
-    db_schema       — migration / CREATE TABLE definitions with column info
+    Language-neutral fields (all parsers must populate these)
+    ----------------------------------------------------------
+    language        — primary language enum  (NEW)
+    language_version — e.g. "8.1" / "20" / "17"  (NEW, replaces php_version)
+    framework       — detected framework enum (extended for TS + Java)
+    classes         — all class / interface / type definitions
+    routes          — HTTP route registrations
+    models          — ORM model / entity classes
+    controllers     — controller classes / handler functions
+    services        — service, repository, and other backend classes
+    db_schema       — migration / CREATE TABLE / schema definitions
     config_files    — list of config file paths found
-    total_files     — total PHP files scanned
-    total_lines     — total lines of PHP code
-
-    Extended fields (added by Stage 1 enhancements)
-    ------------------------------------------------
-    html_pages      — PHP files that mix HTML output (entry points)
-    functions       — standalone / global function definitions
-    includes        — include/require relationships between files
+    total_files     — total source files scanned
+    total_lines     — total lines of source code
+    functions       — standalone / exported function definitions
+    imports         — import/require/include relationships (NEW, language-neutral)
     sql_queries     — raw SQL operations with caller, table, operation
-    redirects       — header("Location:...") calls with source + target
-    superglobals    — $_POST/$_GET/$_SESSION/$_COOKIE key accesses
-    call_graph      — function-to-function call edges
-    form_fields     — HTML <form> elements with action, method, fields
-    service_deps    — constructor DI / Facade usage (class -> dep_class)
-    env_vars        — getenv() / $_ENV / config() references
-    auth_signals    — session checks, middleware, role guards detected
+    call_graph      — function/method call edges
+    form_fields     — form elements / API request bodies with fields
+    service_deps    — constructor DI / injection edges (class → dep_class)
+    env_vars        — environment variable references
+    auth_signals    — auth checks, middleware, role guards detected
     http_endpoints  — inferred HTTP entry points with method + handler
-    table_columns   — per-table column definitions from migrations
-    globals         — global variable declarations
+    table_columns   — per-table column definitions
+    globals         — global / module-level variable declarations
     execution_paths — static-analysis execution paths (from Stage 1.5)
+    components      — frontend UI components (Vue/React) — NEW
+    input_params    — request parameters / form inputs / superglobals — NEW
+
+    PHP-specific fields (kept for backward compat, deprecated for new langs)
+    -------------------------------------------------------------------------
+    php_version     — DEPRECATED: use language_version
+    html_pages      — PHP files mixing HTML output (PHP-only)
+    includes        — DEPRECATED: use imports
+    superglobals    — DEPRECATED: use input_params
+    redirects       — PHP header("Location:…") calls
     """
-    # -- Original fields ------------------------------------------------------
+    # -- Language identity (NEW) -----------------------------------------------
+    language:         Language             = Language.UNKNOWN
+    language_version: Optional[str]        = None
+
+    # -- Core fields (all parsers populate) -----------------------------------
     framework:    Framework            = Framework.UNKNOWN
-    php_version:  Optional[str]        = None
     classes:      list[dict[str, Any]] = field(default_factory=list)
     routes:       list[dict[str, Any]] = field(default_factory=list)
     models:       list[dict[str, Any]] = field(default_factory=list)
@@ -128,13 +160,10 @@ class CodeMap:
     total_files:  int = 0
     total_lines:  int = 0
 
-    # -- Extended fields -------------------------------------------------------
-    html_pages:      list[str]            = field(default_factory=list)
+    # -- Language-neutral extended fields -------------------------------------
     functions:       list[dict[str, Any]] = field(default_factory=list)
-    includes:        list[dict[str, Any]] = field(default_factory=list)
+    imports:         list[dict[str, Any]] = field(default_factory=list)   # NEW (replaces includes)
     sql_queries:     list[dict[str, Any]] = field(default_factory=list)
-    redirects:       list[dict[str, Any]] = field(default_factory=list)
-    superglobals:    list[dict[str, Any]] = field(default_factory=list)
     call_graph:      list[dict[str, Any]] = field(default_factory=list)
     form_fields:     list[dict[str, Any]] = field(default_factory=list)
     service_deps:    list[dict[str, Any]] = field(default_factory=list)
@@ -144,6 +173,20 @@ class CodeMap:
     table_columns:   list[dict[str, Any]] = field(default_factory=list)
     globals:         list[dict[str, Any]] = field(default_factory=list)
     execution_paths: list[dict[str, Any]] = field(default_factory=list)
+    components:      list[dict[str, Any]] = field(default_factory=list)   # NEW (Vue/React/Angular)
+    input_params:    list[dict[str, Any]] = field(default_factory=list)   # NEW (replaces superglobals)
+
+    # -- PHP-specific fields (backward compat, avoid in new parsers) ----------
+    php_version:  Optional[str]        = None   # DEPRECATED → language_version
+    html_pages:      list[str]            = field(default_factory=list)
+    includes:        list[dict[str, Any]] = field(default_factory=list)   # DEPRECATED → imports
+    redirects:       list[dict[str, Any]] = field(default_factory=list)
+    superglobals:    list[dict[str, Any]] = field(default_factory=list)   # DEPRECATED → input_params
+
+    @property
+    def effective_language_version(self) -> Optional[str]:
+        """Return language_version, falling back to php_version for old runs."""
+        return self.language_version or self.php_version
 
 
 @dataclass
@@ -726,6 +769,8 @@ class ArchitectureMeta:
 _STAGE_SUBDIRS: dict[str, str] = {
     # Stage 0 — Validation
     "validation_report.json":      "0_validation",
+    # Stage 0.5 — Language Detection (NEW)
+    "language_detect.json":        "0.5_detect",
     # Stage 1 — PHP Parsing
     "code_map.json":               "1_parse",
     # Stage 1.3 — Entry-Point Catalog
@@ -734,6 +779,7 @@ _STAGE_SUBDIRS: dict[str, str] = {
     "execution_paths.json":        "1.5_paths",
     "execution_paths_errors.json": "1.5_paths",
     # Stage 2 — Knowledge Graph
+    "component_graph.json":        "2.2_components",   # Stage 2.2 (NEW)
     "code_graph.gpickle":          "2_graph",
     "code_graph.json":             "2_graph",
     "code_graph.png":              "2_graph",
@@ -832,10 +878,12 @@ class PipelineContext:
 
     stages: dict[str, StageResult] = field(default_factory=lambda: {
         "stage00_validate":       StageResult(),
+        "stage05_detect":         StageResult(),  # language + framework auto-detection (NEW)
         "stage10_parse":          StageResult(),
         "stage13_entrypoints":    StageResult(),  # system entry-point catalog (static)
         "stage15_paths":          StageResult(),
         "stage20_graph":          StageResult(),
+        "stage22_components":     StageResult(),  # frontend component graph (Vue/React) — NEW
         "stage25_behavior":       StageResult(),  # behavior graph extraction
         "stage27_semanticroles":  StageResult(),  # semantic role tagging (static)
         "stage28_clusters":       StageResult(),  # action clustering (similarity)
@@ -906,6 +954,11 @@ class PipelineContext:
         )
         ctx.save()
         return ctx
+
+    @property
+    def project_path(self) -> str:
+        """Language-neutral alias for php_project_path."""
+        return self.php_project_path
 
     @property
     def context_file(self) -> str:
@@ -995,9 +1048,22 @@ class PipelineContext:
         # ── optional rich objects ─────────────────────────────────────────────
         if data.get("code_map") is not None:
             d = data["code_map"]
+            # Resolve Language enum (new field; default UNKNOWN for old runs)
+            _lang_raw = d.get("language", Language.UNKNOWN.value)
+            try:
+                _lang = Language(_lang_raw)
+            except ValueError:
+                _lang = Language.UNKNOWN
+            # If old run had no language but had php_version, treat as PHP
+            if _lang == Language.UNKNOWN and (d.get("php_version") or d.get("includes")):
+                _lang = Language.PHP
+
             ctx.code_map = CodeMap(
+                # Language identity (new)
+                language         = _lang,
+                language_version = d.get("language_version") or d.get("php_version"),
+                # Core fields
                 framework       = Framework(d.get("framework", Framework.UNKNOWN.value)),
-                php_version     = d.get("php_version"),
                 classes         = d.get("classes", []),
                 routes          = d.get("routes", []),
                 models          = d.get("models", []),
@@ -1007,12 +1073,10 @@ class PipelineContext:
                 config_files    = d.get("config_files", []),
                 total_files     = d.get("total_files", 0),
                 total_lines     = d.get("total_lines", 0),
-                html_pages      = d.get("html_pages", []),
+                # Language-neutral extended fields
                 functions       = d.get("functions", []),
-                includes        = d.get("includes", []),
+                imports         = d.get("imports", d.get("includes", [])),  # new name, fallback old
                 sql_queries     = d.get("sql_queries", []),
-                redirects       = d.get("redirects", []),
-                superglobals    = d.get("superglobals", []),
                 call_graph      = d.get("call_graph", []),
                 form_fields     = d.get("form_fields", []),
                 service_deps    = d.get("service_deps", []),
@@ -1022,6 +1086,14 @@ class PipelineContext:
                 table_columns   = d.get("table_columns", []),
                 globals         = d.get("globals", []),
                 execution_paths = d.get("execution_paths", []),
+                components      = d.get("components", []),   # new
+                input_params    = d.get("input_params", d.get("superglobals", [])),  # new name, fallback old
+                # PHP-specific compat fields
+                php_version     = d.get("php_version"),
+                html_pages      = d.get("html_pages", []),
+                includes        = d.get("includes", []),
+                redirects       = d.get("redirects", []),
+                superglobals    = d.get("superglobals", []),
             )
 
         if data.get("graph_meta") is not None:
