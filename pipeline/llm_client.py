@@ -19,41 +19,54 @@ Environment variables:
     GEMINI_API_KEY     required for gemini
     LLM_MODEL          override default model for any provider
 
-    Local LLM (Ollama / LM Studio / llama.cpp):
-    LOCAL_LLM_URL      base URL of the OpenAI-compatible server
-                       default: http://localhost:11434  (Ollama default)
+    Local LLM (Ollama / vLLM / LM Studio / llama.cpp):
+    LOCAL_LLM_BACKEND  Backend type — controls routing and payload format.
+                       "ollama"   (default) Ollama via /api/chat or /v1/chat/completions
+                       "vllm"               vLLM  via /v1/chat/completions only
+                       "lmstudio"           LM Studio via /v1/chat/completions
+                       "llamacpp"           llama.cpp server via /v1/chat/completions
+                         export LOCAL_LLM_BACKEND=vllm
+    LOCAL_LLM_URL      base URL of the server
+                       Ollama:    http://localhost:11434  (default)
+                       vLLM:      http://localhost:8000
                        LM Studio: http://localhost:1234
                        llama.cpp: http://localhost:8080
     LOCAL_LLM_MODEL    model name to request (required for local)
-                       Ollama:    "llama3.2", "mistral", "qwen2.5-coder:14b", ...
+                       Ollama:    "llama3.2", "qwen2.5-coder:14b", ...
+                       vLLM:      HuggingFace model ID used at server launch
                        LM Studio: exact model filename shown in the UI
-    LOCAL_LLM_API_KEY  optional bearer token (LM Studio supports this)
-                       Ollama does not require an API key
+    LOCAL_LLM_API_KEY  optional bearer token
+                       vLLM:      set via --api-key at server launch
+                       LM Studio: configured in the UI
+                       Ollama:    not required
     LOCAL_LLM_NUM_CTX  Ollama-only: total context window size (input + output
-                       tokens).  When set, the request is sent to Ollama's
-                       native /api/chat endpoint (not /v1/chat/completions)
-                       which is the only path that accepts num_ctx at runtime.
-                       Ollama's default num_ctx is model-dependent and often
-                       small (2048–4096); set this to 16384 or 32768 when you
-                       see truncated output with large batches:
-                         export LOCAL_LLM_NUM_CTX=16384
+                       tokens).  When set, the request is routed to Ollama's
+                       native /api/chat endpoint which is the only path that
+                       accepts num_ctx at request time.  Ignored for vLLM
+                       (set --max-model-len at server launch instead).
+                       Recommended: 16384 or 32768 for large batches:
+                         export LOCAL_LLM_NUM_CTX=32768
     LOCAL_LLM_NUM_PREDICT
                        Ollama-only (native /api/chat path): maximum tokens the
                        model may generate per response (num_predict).  Defaults
-                       to the per-call max_tokens value (8192 for stage45).
-                       Thinking models (qwen3, deepseek-r1) consume most of
-                       that budget on reasoning before writing the final answer,
-                       so they hit the limit and return empty content.
-                       Set to -1 for unlimited, or a large value like 32768:
+                       to the per-call max_tokens value.  Set to -1 for
+                       unlimited output (recommended for thinking models and
+                       large flow/spec batches):
                          export LOCAL_LLM_NUM_PREDICT=-1   # unlimited
                          export LOCAL_LLM_NUM_PREDICT=32768
+                       vLLM equivalent: max_tokens is passed directly in the
+                       payload — set LOCAL_LLM_NUM_PREDICT=-1 has no effect;
+                       use a large LLM_MAX_TOKENS instead.
     LOCAL_LLM_THINKING "1" | "true" to enable Ollama extended-thinking mode
                        for models that support it (e.g. qwen3, deepseek-r1).
-                       Disabled by default because thinking-only models set
-                       content="" and put all output in the "thinking" field,
-                       which breaks structured-output parsing.  The pipeline
-                       always uses explicit chain-of-thought prompting instead.
-                         export LOCAL_LLM_THINKING=1  # re-enable if needed
+                       Disabled by default; the pipeline uses explicit CoT
+                       system prompts instead.
+                         export LOCAL_LLM_THINKING=1
+    VLLM_GUIDED_JSON   "1" to use vLLM's guided_json field for constrained
+                       decoding instead of the OpenAI-style response_format.
+                       Use this with vLLM < 0.4.3 that predates structured-
+                       output support.  Default: 0 (use response_format).
+                         export VLLM_GUIDED_JSON=1
 
     Response cache (pipeline/llm_cache.py):
     LLM_CACHE_ENABLED  "1"|"true"|"yes" to enable the SQLite exact-match cache
@@ -265,7 +278,12 @@ def call_llm(
         json_mode = True  # schema implies json_mode
     tag      = f"[{label}] " if label else ""
 
-    print(f"  {tag}LLM provider : {provider} ({model})")
+    _backend_label = os.environ.get("LOCAL_LLM_BACKEND", "").strip().lower()
+    _provider_str  = (
+        f"{provider}/{_backend_label}" if provider == "local" and _backend_label
+        else provider
+    )
+    print(f"  {tag}LLM provider : {_provider_str} ({model})")
 
     # ── Exact-match cache lookup ───────────────────────────────────────────────
     cache_key = _cache.make_key(model, system_prompt, user_prompt,
@@ -419,34 +437,45 @@ def _call_local(
     json_schema:   dict | None = None,
 ) -> str:
     """
-    Call a local LLM server.
+    Call a local LLM server (Ollama / vLLM / LM Studio / llama.cpp).
 
-    Routing:
-      - LOCAL_LLM_NUM_CTX set → Ollama native /api/chat (supports num_ctx)
-      - Otherwise            → OpenAI-compatible /v1/chat/completions
-                               (Ollama, LM Studio, llama.cpp)
+    Routing
+    -------
+    LOCAL_LLM_BACKEND=ollama (default)
+      LOCAL_LLM_NUM_CTX set  → Ollama native /api/chat  (supports num_ctx at runtime)
+      LOCAL_LLM_NUM_CTX unset → OpenAI-compat /v1/chat/completions
 
-    No external SDK required — uses only the Python standard library (urllib).
+    LOCAL_LLM_BACKEND=vllm | lmstudio | llamacpp
+      Always → OpenAI-compat /v1/chat/completions
+      LOCAL_LLM_NUM_CTX is ignored (set --max-model-len at vLLM server launch)
 
-    Environment variables consumed:
-        LOCAL_LLM_URL      Base URL  (default: http://localhost:11434)
-        LOCAL_LLM_MODEL    Model name (required — e.g. "llama3.2")
-        LOCAL_LLM_API_KEY  Bearer token (optional)
-        LOCAL_LLM_NUM_CTX  Ollama only: total context window tokens; when set,
-                           the native /api/chat endpoint is used so that Ollama
-                           loads the model with this context size at request time.
-                           Recommended: 16384 or 32768 for large batch workloads.
+    Constrained decoding (JSON schema)
+    -----------------------------------
+    Ollama  (native path)  → payload["format"] = schema
+    Ollama  (compat path)  → response_format.json_schema
+    vLLM  ≥ 0.4.3          → response_format.json_schema   (default)
+    vLLM  < 0.4.3          → guided_json in body           (set VLLM_GUIDED_JSON=1)
+    LM Studio / llama.cpp  → response_format.json_schema
+
+    No external SDK required — pure Python standard library (urllib).
     """
     import json
     import urllib.error
     import urllib.request
 
+    _backend = os.environ.get("LOCAL_LLM_BACKEND", "").strip().lower()
+    # "ollama" (default), "vllm", "lmstudio", "llamacpp"
+
+    # ── Ollama native path: only when backend is ollama AND num_ctx is set ──────
     num_ctx = int(os.environ.get("LOCAL_LLM_NUM_CTX", "0") or "0")
-    if num_ctx > 0:
+    if num_ctx > 0 and _backend not in ("vllm", "lmstudio", "llamacpp"):
         return _call_local_ollama_native(
             system_prompt, user_prompt, max_tokens, temperature,
             model, num_ctx, prefill, json_mode=json_mode, json_schema=json_schema,
         )
+    if num_ctx > 0 and _backend == "vllm":
+        print(f"  [llm_client] Note: LOCAL_LLM_NUM_CTX={num_ctx} is ignored for vLLM — "
+              f"set --max-model-len at server launch instead.")
 
     base_url = get_local_url()
     endpoint = f"{base_url}/v1/chat/completions"
@@ -469,15 +498,23 @@ def _call_local(
         "stream":      False,
     }
     if json_schema is not None:
-        # Structured output via JSON schema — Ollama ≥0.4.6, LM Studio ≥0.3.
-        # Grammar-level enforcement: invalid JSON is literally impossible.
-        payload["response_format"] = {
-            "type": "json_schema",
-            "json_schema": {"name": "response", "strict": True, "schema": json_schema},
-        }
+        # Constrained decoding — grammar-level JSON schema enforcement.
+        # vLLM < 0.4.3: use guided_json in the request body (VLLM_GUIDED_JSON=1)
+        # vLLM ≥ 0.4.3 / Ollama ≥ 0.4.6 / LM Studio ≥ 0.3: response_format.json_schema
+        _use_guided = (
+            _backend == "vllm"
+            and os.environ.get("VLLM_GUIDED_JSON", "0").strip() == "1"
+        )
+        if _use_guided:
+            payload["guided_json"] = json_schema
+        else:
+            payload["response_format"] = {
+                "type": "json_schema",
+                "json_schema": {"name": "response", "strict": True, "schema": json_schema},
+            }
     elif json_mode:
-        # Forces Ollama / LM Studio / llama.cpp to output valid JSON.
-        # Supported by Ollama ≥ 0.1.14 and LM Studio ≥ 0.2.
+        # JSON-object mode — valid JSON output without a fixed schema.
+        # Supported by Ollama ≥ 0.1.14, vLLM ≥ 0.3, LM Studio ≥ 0.2.
         payload["response_format"] = {"type": "json_object"}
 
     body    = json.dumps(payload).encode("utf-8")
@@ -494,12 +531,16 @@ def _call_local(
         _handle_local_http_error(exc, base_url, model)
     except urllib.error.URLError as exc:
         # Connection refused / DNS failure — server is not running
+        _backend_hint = {
+            "vllm":     "  vLLM:      python -m vllm.entrypoints.openai.api_server "
+                        "--model <model-id> --port 8000",
+            "lmstudio": "  LM Studio: start the Local Server in the LM Studio UI",
+            "llamacpp": "  llama.cpp: ./server -m your-model.gguf --port 8080",
+        }.get(_backend, "  Ollama:    ollama serve")
         raise RuntimeError(
             f"Cannot connect to local LLM server at {base_url}.\n"
             f"Is the server running?\n"
-            f"  Ollama:    ollama serve\n"
-            f"  LM Studio: start the Local Server in the LM Studio UI\n"
-            f"  llama.cpp: ./server -m your-model.gguf\n"
+            f"{_backend_hint}\n"
             f"Original error: {exc.reason}"
         )
     except TimeoutError:
