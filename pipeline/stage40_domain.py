@@ -953,7 +953,7 @@ def _build_user_prompt(ctx: PipelineContext, chunks: list[dict]) -> str:
         _shown_tables = unique_tables[:_CAP_DB_TABLES] if _CAP_DB_TABLES > 0 else unique_tables
         _omitted_tbl  = len(unique_tables) - len(_shown_tables)
         parts.append(f"\n=== DATABASE TABLES ({len(unique_tables)} total"
-                     + (f", showing {len(_shown_tables)})" if _omitted_tbl else ")")
+                     + (f", showing {len(_shown_tables)})" if _omitted_tbl else ")"))
         parts.append(", ".join(_shown_tables)
                      + (f"  … +{_omitted_tbl} more omitted" if _omitted_tbl else ""))
 
