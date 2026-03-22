@@ -127,8 +127,24 @@ from __future__ import annotations
 
 import os
 import socket
+import threading
 import time
 from typing import Optional
+
+
+# ── Per-call token stats ───────────────────────────────────────────────────────
+# Thread-local so concurrent stage50 agents don't overwrite each other's counts.
+# Provider functions write here; call_llm reads after each call.
+_tok_stats = threading.local()
+
+def _set_tok(in_tok: int, out_tok: int) -> None:
+    """Called by provider functions to store real input/output token counts."""
+    _tok_stats.in_tok  = in_tok
+    _tok_stats.out_tok = out_tok
+
+def _get_tok() -> tuple[int, int]:
+    """Returns (in_tokens, out_tokens); (-1, -1) if provider did not report."""
+    return getattr(_tok_stats, "in_tok", -1), getattr(_tok_stats, "out_tok", -1)
 
 
 # ── Defaults ──────────────────────────────────────────────────────────────────
@@ -755,6 +771,12 @@ def _call_local_ollama_native(
             f"  Fix: export LOCAL_LLM_NUM_PREDICT=-1  (unlimited) or a larger value."
         )
 
+    # Report real token counts (Ollama native fields)
+    _set_tok(
+        in_tok  = data.get("prompt_eval_count", -1),
+        out_tok = data.get("eval_count", -1),
+    )
+
     return (prefill + content) if prefill else content
 
 
@@ -887,6 +909,13 @@ def _call_claude(
     if text is None:
         raise _NonRetryableError("Claude returned no text content block.")
 
+    # Report real token counts (includes cache_read / cache_creation breakdowns)
+    usage = message.usage
+    _set_tok(
+        in_tok  = getattr(usage, "input_tokens",  -1),
+        out_tok = getattr(usage, "output_tokens", -1),
+    )
+
     # Restore prefill so the caller gets the complete value
     return (prefill + text) if prefill else text
 
@@ -974,6 +1003,13 @@ def _call_gemini(
 
     if not text:
         raise _NonRetryableError("Gemini returned an empty text response.")
+
+    # Report real token counts
+    meta = getattr(response, "usage_metadata", None)
+    _set_tok(
+        in_tok  = getattr(meta, "prompt_token_count",     -1) if meta else -1,
+        out_tok = getattr(meta, "candidates_token_count", -1) if meta else -1,
+    )
 
     return text
 
