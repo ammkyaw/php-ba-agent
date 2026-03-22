@@ -412,7 +412,7 @@ def call_llm(
                 raise RuntimeError(
                     f"{tag}Context window still exceeded after {_MAX_OVERFLOW} "
                     f"max_tokens reductions (current budget: {max_tokens}). "
-                    f"Set LLM_CONTEXT_WINDOW to pre-trim the prompt."
+                    f"Set LLM_MAX_INPUT_TOKENS to pre-trim the prompt."
                 )
             # Re-apply the buffer with the current (doubled) margin so each
             # successive call leaves more room, compensating for any tokeniser

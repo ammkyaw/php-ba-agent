@@ -104,16 +104,15 @@ _CAP_REDIRECTS     = int(os.environ.get("STAGE4_CAP_REDIRECTS",      "60")  or "
 _CAP_AUTH_SIGNALS  = int(os.environ.get("STAGE4_CAP_AUTH_SIGNALS",   "40")  or "40")
 
 # ── Context-window budget ─────────────────────────────────────────────────────
-# LLM_CONTEXT_WINDOW: total token capacity of the model (input + output).
-# When set, stage40 auto-trims the user prompt so that
-#   prompt_tokens + max_output_tokens ≤ LLM_CONTEXT_WINDOW
+# LLM_MAX_INPUT_TOKENS: maximum input tokens to send in a single LLM call.
+# When set, stage40 auto-trims the user prompt to stay within this budget.
 # Works for any backend (Ollama, vLLM, LM Studio).
 # Examples:
-#   export LLM_CONTEXT_WINDOW=16384   # 16K model (e.g. qwen3.5-27b default)
-#   export LLM_CONTEXT_WINDOW=32768   # 32K (Ollama with NUM_CTX=32768)
-#   export LLM_CONTEXT_WINDOW=131072  # 128K (large-context models)
+#   export LLM_MAX_INPUT_TOKENS=12000   # 16K model, leaving room for output
+#   export LLM_MAX_INPUT_TOKENS=28000   # 32K model
+#   export LLM_MAX_INPUT_TOKENS=120000  # 128K model
 # Default 0 means "no trimming" (original behaviour).
-_CTX_WINDOW = int(os.environ.get("LLM_CONTEXT_WINDOW", "0") or "0")
+_CTX_WINDOW = int(os.environ.get("LLM_MAX_INPUT_TOKENS", "0") or "0")
 
 # Safety headroom reserved for the system prompt and misc overhead (tokens).
 _SYSTEM_OVERHEAD = int(os.environ.get("LLM_SYSTEM_OVERHEAD", "1500") or "1500")
@@ -157,7 +156,7 @@ def run(ctx: PipelineContext) -> None:
           f"{len(RETRIEVAL_QUERIES)} query angles")
 
     # ── Build shared user prompt (same evidence for all 3 calls) ─────────────
-    # Auto-trim to fit LLM_CONTEXT_WINDOW when set; uses the largest per-call
+    # Auto-trim to fit LLM_MAX_INPUT_TOKENS when set; uses the largest per-call
     # output budget (Call B: features) as the trim target so the prompt fits
     # for all calls (A/B/C share the same user_prompt).
     quality_score = _get_quality_score(ctx)
@@ -166,9 +165,9 @@ def run(ctx: PipelineContext) -> None:
     _prompt_est   = len(user_prompt) // 4
     print(f"  [stage4] User prompt assembled: {len(user_prompt):,} chars "
           f"(~{_prompt_est:,} tokens).  "
-          + (f"Context window: {_CTX_WINDOW:,} tok, budget: {(_CTX_WINDOW - _max_out_any - _SYSTEM_OVERHEAD):,} tok input."
+          + (f"Input cap: {_CTX_WINDOW:,} tok (LLM_MAX_INPUT_TOKENS), trimmed to ~{(_CTX_WINDOW - _SYSTEM_OVERHEAD):,} tok."
              if _CTX_WINDOW > 0 else
-             "Set LLM_CONTEXT_WINDOW=<model_max_tokens> to enable auto-trim."))
+             "Set LLM_MAX_INPUT_TOKENS=<max_input_tokens> to enable auto-trim."))
 
     # ── RAG augmentation ──────────────────────────────────────────────────────
     # When RAG_ENABLED=1, build an FTS5 code chunk index and append the most
@@ -1465,15 +1464,13 @@ def _estimate_tokens(text: str) -> int:
 
 def _budget_chars(max_output_tokens: int) -> int:
     """
-    Return the maximum character length allowed for the user prompt given the
-    configured context window.  Returns a very large number (no cap) when
-    LLM_CONTEXT_WINDOW is not set.
+    Return the maximum character length allowed for the user prompt.
+    LLM_MAX_INPUT_TOKENS is the direct input token cap (excluding system
+    overhead).  Returns a very large number (no cap) when unset.
     """
     if _CTX_WINDOW <= 0:
         return 10_000_000   # effectively unlimited
-    available_tokens = _CTX_WINDOW - max_output_tokens - _SYSTEM_OVERHEAD
-    if available_tokens < 256:
-        available_tokens = 256   # always leave at least something
+    available_tokens = max(256, _CTX_WINDOW - _SYSTEM_OVERHEAD)
     return available_tokens * 4  # tokens → chars
 
 
@@ -1491,7 +1488,7 @@ def _trim_user_prompt(
       Pass 3 — drop the form-inputs section entirely
       Pass 4 — hard-truncate (last resort, keeps beginning of prompt)
 
-    If LLM_CONTEXT_WINDOW is not set, builds normally with all chunks.
+    If LLM_MAX_INPUT_TOKENS is not set, builds normally with all chunks.
     """
     budget = _budget_chars(max_output_tokens)
 
