@@ -344,6 +344,13 @@ def call_llm(
     else:
         call_fn = _call_local
 
+    # For vLLM: omit max_tokens so the server uses remaining context space instead
+    # of pre-allocating a fixed KV-cache budget.  This avoids spurious 400 errors
+    # when prompt_tokens + max_tokens exceeds max_model_len even though the model
+    # would naturally stop well before that limit.
+    if provider == "local" and _backend_label == "vllm":
+        max_tokens = -1   # signals _call_local to omit the field from the payload
+
     last_exc: Exception | None = None
     delay    = RETRY_BASE_DELAY
     attempt  = 0          # counts transient-error retries (sleeps); capped at MAX_RETRIES
@@ -580,13 +587,16 @@ def _call_local(
         # assistant pre-fill — the model continues from the given text.
         messages_payload.append({"role": "assistant", "content": prefill})
 
-    payload = {
+    payload: dict = {
         "model":       model,
         "messages":    messages_payload,
-        "max_tokens":  max_tokens,
         "temperature": temperature,
         "stream":      False,
     }
+    # max_tokens ≤ 0 means "let the server decide" — omit the field so vLLM
+    # uses remaining context space rather than pre-allocating a fixed budget.
+    if max_tokens > 0:
+        payload["max_tokens"] = max_tokens
     if json_schema is not None:
         # Constrained decoding — grammar-level JSON schema enforcement.
         # vLLM < 0.4.3: use guided_json in the request body (VLLM_GUIDED_JSON=1)
