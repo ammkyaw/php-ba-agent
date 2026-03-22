@@ -345,9 +345,13 @@ def call_llm(
         call_fn = _call_local
 
     last_exc: Exception | None = None
-    delay = RETRY_BASE_DELAY
+    delay    = RETRY_BASE_DELAY
+    attempt  = 0          # counts transient-error retries (sleeps); capped at MAX_RETRIES
+    _overflow_count  = 0  # counts _ContextLengthError reductions; has its own cap
+    _MAX_OVERFLOW    = 12 # allow up to 12 successive token-budget reductions
+    _overflow_buffer = 256  # initial safety margin; doubles on each overflow to converge
 
-    for attempt in range(MAX_RETRIES + 1):   # attempt 0 = first try
+    while True:
         try:
             _set_tok(-1, -1)                  # reset before each attempt
             _t0 = time.monotonic()
@@ -388,20 +392,37 @@ def call_llm(
             raise   # bad key, safety block, empty response — don't retry
 
         except _ContextLengthError as exc:
-            # Prompt too long — reduce max_tokens to what fits and retry once.
-            # Do NOT count this against MAX_RETRIES; it's a parameter fix, not a
-            # transient failure.
-            reduced = exc.available_tokens
+            # Prompt too long for the model's context window.
+            # Reduce max_tokens and retry immediately — this does NOT consume a
+            # transient-error retry slot (separate counter with its own cap).
+            #
+            # The server reports (ctx_max, prompt_toks) in the error body.
+            # We compute: available = ctx_max - prompt_toks - _overflow_buffer
+            # and double the buffer each time so successive retries converge
+            # quickly even when vLLM's token count drifts between requests.
+            _overflow_count += 1
+            if _overflow_count > _MAX_OVERFLOW:
+                raise RuntimeError(
+                    f"{tag}Context window still exceeded after {_MAX_OVERFLOW} "
+                    f"max_tokens reductions (current budget: {max_tokens}). "
+                    f"Set LLM_CONTEXT_WINDOW to pre-trim the prompt."
+                )
+            # Re-apply the buffer with the current (doubled) margin so each
+            # successive call leaves more room, compensating for any tokeniser
+            # drift the server reports.
+            raw_available = exc.available_tokens   # ctx_max - prompt_toks - 64
+            reduced = max(256, raw_available - (_overflow_buffer - 64))
             print(
-                f"  {tag}Context overflow — reducing max_tokens "
-                f"{max_tokens} → {reduced} and retrying ..."
+                f"  {tag}Context overflow (attempt {_overflow_count}/{_MAX_OVERFLOW}) — "
+                f"reducing max_tokens {max_tokens} → {reduced} and retrying ..."
             )
             max_tokens = reduced
-            continue   # retry immediately with the new budget
+            _overflow_buffer = min(_overflow_buffer * 2, 4096)  # double, cap at 4096
+            # continue loop immediately without incrementing `attempt`
 
         except Exception as exc:
             last_exc = exc
-            if attempt == MAX_RETRIES:
+            if attempt >= MAX_RETRIES:
                 break   # exhausted — fall through to final raise
 
             wait = min(delay, RETRY_MAX_DELAY)
@@ -412,9 +433,10 @@ def call_llm(
             print(f"  {tag}Retrying in {wait:.0f}s ...")
             time.sleep(wait)
             delay *= RETRY_BACKOFF
+            attempt += 1
 
     raise RuntimeError(
-        f"LLM call failed after {MAX_RETRIES + 1} attempt(s). "
+        f"LLM call failed after {attempt + 1} attempt(s). "
         f"Last error: {last_exc}"
     )
 
