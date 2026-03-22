@@ -84,9 +84,25 @@ RETRIEVAL_QUERIES = [
     ("navigation flow redirect pages include session check",          "nav"),
     ("core functions business logic processing validation",           "logic"),
 ]
-TOP_K_PER_QUERY  = 5
-MAX_TOTAL_CHUNKS = 15     # hard cap on chunks sent to Claude
-MAX_CONTEXT_CHARS = 5000  # soft cap on total context character length
+TOP_K_PER_QUERY   = 5
+MAX_TOTAL_CHUNKS  = 25    # hard cap on chunks sent to the LLM
+MAX_CONTEXT_CHARS = 20_000  # soft cap on total context character length
+
+# ── Per-section caps inside _build_user_prompt ────────────────────────────────
+# Large codebases (SuiteCRM, etc.) produce thousands of entries per section.
+# These caps keep the prompt within a manageable token budget while still
+# giving the LLM enough signal to identify patterns.
+# Override any cap with env vars (set to 0 to disable a section entirely).
+_CAP_EXEC_PATHS    = int(os.environ.get("STAGE4_CAP_EXEC_PATHS",    "40")  or "40")
+_CAP_HTTP_EPS      = int(os.environ.get("STAGE4_CAP_HTTP_EPS",      "80")  or "80")
+_CAP_TABLE_COLS    = int(os.environ.get("STAGE4_CAP_TABLE_COLS",     "60")  or "60")
+_CAP_DB_TABLES     = int(os.environ.get("STAGE4_CAP_DB_TABLES",      "60")  or "60")
+_CAP_FUNCTIONS     = int(os.environ.get("STAGE4_CAP_FUNCTIONS",      "80")  or "80")
+_CAP_CALL_GRAPH    = int(os.environ.get("STAGE4_CAP_CALL_GRAPH",     "40")  or "40")
+_CAP_FORM_FILES    = int(os.environ.get("STAGE4_CAP_FORM_FILES",     "60")  or "60")
+_CAP_REDIRECTS     = int(os.environ.get("STAGE4_CAP_REDIRECTS",      "60")  or "60")
+_CAP_AUTH_SIGNALS  = int(os.environ.get("STAGE4_CAP_AUTH_SIGNALS",   "40")  or "40")
+
 
 
 # ─── Public Entry Point ────────────────────────────────────────────────────────
@@ -129,6 +145,8 @@ def run(ctx: PipelineContext) -> None:
     # ── Build shared user prompt (same evidence for all 3 calls) ─────────────
     quality_score = _get_quality_score(ctx)
     user_prompt   = _build_user_prompt(ctx, chunks)
+    print(f"  [stage4] User prompt assembled: {len(user_prompt):,} chars "
+          f"(~{len(user_prompt) // 4:,} tokens)")
 
     # ── RAG augmentation ──────────────────────────────────────────────────────
     # When RAG_ENABLED=1, build an FTS5 code chunk index and append the most
@@ -211,55 +229,44 @@ def run(ctx: PipelineContext) -> None:
     if len(_ensemble_models) > 1:
         print(f"  [stage4] Ensemble mode: {len(_ensemble_models)} models")
 
-    # ── Call A: meta + entities + contexts (fast, ~4K tokens) ────────────────
-    _total_a = _consistency_runs * len(_ensemble_models)
-    print(f"  [stage4] Call 1/3 — domain name, entities, contexts "
-          f"(x{_total_a} runs) ...")
-    _a_results: list[dict] = []
-    for _mdl in _ensemble_models:
-        for _run in range(_consistency_runs):
-            _suffix = f"{_ensemble_models.index(_mdl)+1}.{_run+1}" if len(_ensemble_models) > 1 else str(_run+1)
-            _lbl = f"stage4-A{_suffix}" if _total_a > 1 else "stage4-A"
-            _a_results.append(_parse_partial(
-                _call_part(_system_meta(quality_score), user_prompt, MAX_TOKENS_META, _lbl,
-                           model_override=_mdl),
-                f"A{_suffix}", debug_dir,
-            ))
-    data_a = _merge_consistency_a(_a_results)
-
-    # ── Call B: features (largest field, ~8K tokens) ──────────────────────────
-    _total_b = _consistency_runs * len(_ensemble_models)
-    print(f"  [stage4] Call 2/3 — features "
-          f"(x{_total_b} runs) ...")
-    _b_results: list[dict] = []
+    # ── Calls A + B + C (sequential — Ollama processes one request at a time) ───
     _sys_b = _system_features(quality_score,
                                known_tables=known_tables,
                                known_pages=known_pages,
                                known_fields=known_fields,
                                table_columns=getattr(cm, "table_columns", None) or [])
     _user_prompt_b = (user_prompt + "\n\n" + _rag_ctx_b) if _rag_ctx_b else user_prompt
-    for _mdl in _ensemble_models:
-        for _run in range(_consistency_runs):
-            _suffix = f"{_ensemble_models.index(_mdl)+1}.{_run+1}" if len(_ensemble_models) > 1 else str(_run+1)
-            _lbl = f"stage4-B{_suffix}" if _total_b > 1 else "stage4-B"
-            _b_results.append(_parse_partial(
-                _call_part(_sys_b, _user_prompt_b, MAX_TOKENS_FEATURES, _lbl,
-                           model_override=_mdl),
-                f"B{_suffix}", debug_dir,
-            ))
-    data_b = _merge_consistency_b(_b_results)
 
-    # Filter hallucinated page/table names.
-    # Use known_files_all (not just known_pages) so that controller / service
-    # file references are preserved — only truly invented filenames are dropped.
+    def _make_suffix(mdl_idx: int, run: int, total: int, letter: str) -> str:
+        if total == 1:
+            return letter
+        if len(_ensemble_models) > 1:
+            return f"{letter}{mdl_idx+1}.{run+1}"
+        return f"{letter}{run+1}"
+
+    _a_results: list[dict] = []
+    _b_results: list[dict] = []
+    _total_a = _consistency_runs * len(_ensemble_models)
+    _total_b = _consistency_runs * len(_ensemble_models)
+    for _mi, _mdl in enumerate(_ensemble_models):
+        for _run in range(_consistency_runs):
+            raw_a = _call_part(_system_meta(quality_score), user_prompt,
+                               MAX_TOKENS_META, f"stage4-{_make_suffix(_mi, _run, _total_a, 'A')}",
+                               model_override=_mdl)
+            _a_results.append(_parse_partial(raw_a, _make_suffix(_mi, _run, _total_a, "A"), debug_dir))
+            raw_b = _call_part(_sys_b, _user_prompt_b,
+                               MAX_TOKENS_FEATURES, f"stage4-{_make_suffix(_mi, _run, _total_b, 'B')}",
+                               model_override=_mdl)
+            _b_results.append(_parse_partial(raw_b, _make_suffix(_mi, _run, _total_b, "B"), debug_dir))
+
+    raw_c = _call_part(_system_roles_workflows(quality_score), user_prompt,
+                       MAX_TOKENS_ROLES_WF, "stage4-C")
+
+    data_a = _merge_consistency_a(_a_results)
+    data_b = _merge_consistency_b(_b_results)
     data_b = _filter_hallucinated_refs(data_b,
                                        known_pages_lower=known_files_all,
                                        known_tables_lower={t.lower() for t in known_tables})
-
-    # ── Call C: user roles + workflows (~8K tokens) ───────────────────────────
-    print(f"  [stage4] Call 3/3 — user roles, workflows ...")
-    raw_c = _call_part(_system_roles_workflows(quality_score), user_prompt,
-                       MAX_TOKENS_ROLES_WF, "stage4-C")
     data_c = _parse_partial(raw_c, "C", debug_dir)
 
     # ── Merge all three dicts (A wins on overlaps, B/C fill in their fields) ──
@@ -861,12 +868,34 @@ Output ONLY this JSON (no other fields):
 Now produce the JSON for new features covering the uncovered modules/pages:"""
 
 
+def _rag_relevant_stems(chunks: list[dict]) -> set[str]:
+    """
+    Return the set of lowercase file stem names that appear in the top RAG chunks.
+    Used to RAG-sort static sections so the most relevant files survive the cap.
+    """
+    stems: set[str] = set()
+    for chunk in chunks:
+        src = chunk.get("metadata", {}).get("source_file", "")
+        if src:
+            stems.add(Path(src).stem.lower())
+    return stems
+
+
+def _rag_sort(items: list, key_fn, relevant_stems: set[str]) -> list:
+    """
+    Stable-sort *items* so entries whose key_fn(item) stem appears in
+    relevant_stems come first.  Order within each group is preserved.
+    """
+    return sorted(items, key=lambda x: (0 if Path(key_fn(x)).stem.lower() in relevant_stems else 1))
+
+
 def _build_user_prompt(ctx: PipelineContext, chunks: list[dict]) -> str:
     """
     Assemble the user prompt from retrieved chunks, CodeMap metadata,
     and graph summary.
     """
     parts: list[str] = []
+    _rel_stems = _rag_relevant_stems(chunks)   # files surfaced by RAG — prioritised in caps
 
     # ── System metadata header ────────────────────────────────────────────────
     cm = ctx.code_map
@@ -888,11 +917,15 @@ def _build_user_prompt(ctx: PipelineContext, chunks: list[dict]) -> str:
         if q.get("table") and q["table"] not in ("UNKNOWN", "")
     })
     if unique_tables:
-        parts.append(f"\n=== DATABASE TABLES ===")
-        parts.append(", ".join(unique_tables))
+        _shown_tables = unique_tables[:_CAP_DB_TABLES] if _CAP_DB_TABLES > 0 else unique_tables
+        _omitted_tbl  = len(unique_tables) - len(_shown_tables)
+        parts.append(f"\n=== DATABASE TABLES ({len(unique_tables)} total"
+                     + (f", showing {len(_shown_tables)})" if _omitted_tbl else ")"))
+        parts.append(", ".join(_shown_tables)
+                     + (f"  … +{_omitted_tbl} more omitted" if _omitted_tbl else ""))
 
         # Per-table: which files read/write it
-        for table in unique_tables:
+        for table in _shown_tables:
             readers = sorted({q["file"] for q in cm.sql_queries
                               if q.get("table") == table and q.get("operation") == "SELECT"})
             writers = sorted({q["file"] for q in cm.sql_queries
@@ -914,7 +947,11 @@ def _build_user_prompt(ctx: PipelineContext, chunks: list[dict]) -> str:
         sg_by_file: dict[str, list] = defaultdict(list)
         for sg in cm.superglobals:
             sg_by_file[sg["file"]].append(sg)
-        for filepath, sgs in sorted(sg_by_file.items()):
+        _form_files = _rag_sort(list(sg_by_file.items()), lambda x: x[0], _rel_stems)
+        if _CAP_FORM_FILES > 0 and len(_form_files) > _CAP_FORM_FILES:
+            parts.append(f"  (showing {_CAP_FORM_FILES}/{len(_form_files)} files — RAG-prioritised)")
+            _form_files = _form_files[:_CAP_FORM_FILES]
+        for filepath, sgs in _form_files:
             filename  = Path(filepath).name
             post_keys = sorted({s["key"] for s in sgs
                                 if s["var"] == "$_POST" and s.get("key")})
@@ -927,10 +964,18 @@ def _build_user_prompt(ctx: PipelineContext, chunks: list[dict]) -> str:
 
     # ── Redirect / navigation summary ────────────────────────────────────────
     if cm.redirects:
-        parts.append(f"\n=== NAVIGATION / REDIRECTS ===")
-        for r in cm.redirects:
+        _redirects = _rag_sort(list(cm.redirects), lambda r: r.get("file", ""), _rel_stems)
+        _omit_r = 0
+        if _CAP_REDIRECTS > 0 and len(_redirects) > _CAP_REDIRECTS:
+            _omit_r = len(_redirects) - _CAP_REDIRECTS
+            _redirects = _redirects[:_CAP_REDIRECTS]
+        parts.append(f"\n=== NAVIGATION / REDIRECTS"
+                     + (f" ({len(cm.redirects)} total, showing {len(_redirects)})" if _omit_r else "") + " ===")
+        for r in _redirects:
             filename = Path(r["file"]).name
             parts.append(f"{filename} → {r['target']}")
+        if _omit_r:
+            parts.append(f"  … +{_omit_r} more redirects omitted")
 
     # ── HTML pages (entry points) ─────────────────────────────────────────────
     if cm.html_pages:
@@ -939,14 +984,22 @@ def _build_user_prompt(ctx: PipelineContext, chunks: list[dict]) -> str:
 
     # ── Functions ─────────────────────────────────────────────────────────────
     if cm.functions:
-        parts.append(f"\n=== USER-DEFINED FUNCTIONS ===")
-        for fn in cm.functions:
+        _fns = cm.functions
+        _omit_fn = 0
+        if _CAP_FUNCTIONS > 0 and len(_fns) > _CAP_FUNCTIONS:
+            _omit_fn = len(_fns) - _CAP_FUNCTIONS
+            _fns = _fns[:_CAP_FUNCTIONS]
+        parts.append(f"\n=== USER-DEFINED FUNCTIONS ({len(cm.functions)} total"
+                     + (f", showing {len(_fns)})" if _omit_fn else ")"))
+        for fn in _fns:
             params = [p["name"] for p in fn.get("params", [])]
             doc    = fn.get("docblock") or ""
             line   = f"  {fn['name']}({', '.join(params)})"
             if doc:
                 line += f" — {doc}"
             parts.append(line)
+        if _omit_fn:
+            parts.append(f"  … +{_omit_fn} more functions omitted")
 
     # ── Call graph ────────────────────────────────────────────────────────────
     call_graph = getattr(cm, "call_graph", None) or []
@@ -959,9 +1012,16 @@ def _build_user_prompt(ctx: PipelineContext, chunks: list[dict]) -> str:
             by_file[edge.get("file","?")].append(
                 f"{edge.get('caller','?')} → {edge.get('callee','?')}"
             )
-        for fpath, edges in sorted(by_file.items()):
+        _cg_files = _rag_sort(list(by_file.items()), lambda x: x[0], _rel_stems)
+        _omit_cg = 0
+        if _CAP_CALL_GRAPH > 0 and len(_cg_files) > _CAP_CALL_GRAPH:
+            _omit_cg = len(_cg_files) - _CAP_CALL_GRAPH
+            _cg_files = _cg_files[:_CAP_CALL_GRAPH]
+        for fpath, edges in _cg_files:
             parts.append(f"{Path(fpath).name}: {', '.join(edges[:8])}"
                          + (" ..." if len(edges) > 8 else ""))
+        if _omit_cg:
+            parts.append(f"  … +{_omit_cg} more files omitted")
 
     # ── Form fields ───────────────────────────────────────────────────────────
     form_fields = getattr(cm, "form_fields", None) or []
@@ -1062,11 +1122,16 @@ def _build_user_prompt(ctx: PipelineContext, chunks: list[dict]) -> str:
         parts.append("  Signal counts: " + ", ".join(
             f"{t}={n}" for t, n in sorted(by_type.items())))
         seen_pats: set = set()
+        _auth_shown = 0
         for sig in auth_signals:
+            if _CAP_AUTH_SIGNALS > 0 and _auth_shown >= _CAP_AUTH_SIGNALS:
+                parts.append(f"  … +{len(auth_signals) - _auth_shown} more signals omitted")
+                break
             pat = sig.get("pattern", "?")
             if pat in seen_pats:
                 continue
             seen_pats.add(pat)
+            _auth_shown += 1
             detail = f" [{sig['detail']}]" if sig.get("detail") else ""
             parts.append(f"  {sig['type']}: {pat}{detail}"
                          f" ({Path(sig.get('file','?')).name}:{sig.get('line','?')})")
@@ -1074,19 +1139,33 @@ def _build_user_prompt(ctx: PipelineContext, chunks: list[dict]) -> str:
     # ── HTTP entry points ─────────────────────────────────────────────────────
     http_endpoints = getattr(cm, "http_endpoints", None) or []
     if http_endpoints:
-        parts.append(f"\n=== HTTP ENTRY POINTS ({len(http_endpoints)}) ===")
-        for ep in http_endpoints:
+        _eps = http_endpoints
+        _omit_ep = 0
+        if _CAP_HTTP_EPS > 0 and len(_eps) > _CAP_HTTP_EPS:
+            _omit_ep = len(_eps) - _CAP_HTTP_EPS
+            _eps = _eps[:_CAP_HTTP_EPS]
+        parts.append(f"\n=== HTTP ENTRY POINTS ({len(http_endpoints)} total"
+                     + (f", showing {len(_eps)})" if _omit_ep else ")"))
+        for ep in _eps:
             handler  = ep.get("handler") or Path(ep.get("file", "?")).name
             accepts  = "/".join(ep.get("accepts", []))
             produces = ep.get("produces", "?")
             ep_type  = ep.get("type", "page")
             parts.append(f"  [{ep_type}] {handler} — accepts {accepts}, produces {produces}")
+        if _omit_ep:
+            parts.append(f"  … +{_omit_ep} more endpoints omitted")
 
     # ── Table/column definitions ──────────────────────────────────────────────
     table_columns = getattr(cm, "table_columns", None) or []
     if table_columns:
-        parts.append(f"\n=== DATABASE TABLES & COLUMNS ({len(table_columns)} tables) ===")
-        for tbl in table_columns:
+        _tcols = table_columns
+        _omit_tc = 0
+        if _CAP_TABLE_COLS > 0 and len(_tcols) > _CAP_TABLE_COLS:
+            _omit_tc = len(_tcols) - _CAP_TABLE_COLS
+            _tcols = _tcols[:_CAP_TABLE_COLS]
+        parts.append(f"\n=== DATABASE TABLES & COLUMNS ({len(table_columns)} tables"
+                     + (f", showing {len(_tcols)})" if _omit_tc else ")"))
+        for tbl in _tcols:
             tname   = tbl.get("table", "?")
             source  = tbl.get("source", "?")
             cols    = tbl.get("columns", [])
@@ -1094,16 +1173,24 @@ def _build_user_prompt(ctx: PipelineContext, chunks: list[dict]) -> str:
             if len(cols) > 12:
                 col_str += f" ... +{len(cols) - 12} more"
             parts.append(f"  {tname} ({source}): {col_str}")
+        if _omit_tc:
+            parts.append(f"  … +{_omit_tc} more tables omitted")
 
     # ── Execution paths (stage15) ────────────────────────────────────────────
     exec_paths = getattr(cm, "execution_paths", None) or []
     if exec_paths:
-        parts.append(f"\n=== EXECUTION PATHS & BRANCH ANALYSIS ===")
+        _exps = _rag_sort(list(exec_paths), lambda ep: ep.get("file", ""), _rel_stems)
+        _omit_exp = 0
+        if _CAP_EXEC_PATHS > 0 and len(_exps) > _CAP_EXEC_PATHS:
+            _omit_exp = len(_exps) - _CAP_EXEC_PATHS
+            _exps = _exps[:_CAP_EXEC_PATHS]
+        parts.append(f"\n=== EXECUTION PATHS & BRANCH ANALYSIS ({len(exec_paths)} files"
+                     + (f", showing {len(_exps)})" if _omit_exp else ")"))
         parts.append(
             "Each entry below is derived from static analysis of a PHP file. "
             "Use this to identify workflows, auth requirements, and business rules."
         )
-        for ep in exec_paths:
+        for ep in _exps:
             fname = ep.get("file", "?")
             parts.append(f"\nFile: {fname}")
 
@@ -1149,6 +1236,8 @@ def _build_user_prompt(ctx: PipelineContext, chunks: list[dict]) -> str:
                     parts.append(f"      then: {', '.join(then) or 'none'}")
                     if els:
                         parts.append(f"      else: {', '.join(els)}")
+        if _omit_exp:
+            parts.append(f"\n  … +{_omit_exp} more execution-path files omitted")
 
     # ── Detected modules from Stage 2 Pass 15 ───────────────────────────────
     # Pre-seed the LLM with structurally-detected bounded contexts so it
@@ -1334,6 +1423,8 @@ def _build_user_prompt(ctx: PipelineContext, chunks: list[dict]) -> str:
     parts.append("\n=== END OF CODEBASE EVIDENCE ===")
 
     return "\n".join(parts)
+
+
 
 
 # ─── LLM Call Helper ───────────────────────────────────────────────────────────

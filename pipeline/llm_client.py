@@ -168,6 +168,35 @@ RETRY_MAX_DELAY    = 60.0       # cap so we never wait more than 1 minute
 
 # ─── Public API ────────────────────────────────────────────────────────────────
 
+def get_max_workers() -> int:
+    """
+    Recommended ThreadPoolExecutor size for concurrent LLM calls.
+
+    vLLM uses continuous batching — multiple requests are processed in
+    parallel on the GPU, so higher concurrency = higher throughput.
+    Ollama queues one request at a time, so concurrency > 1 gives no GPU
+    speedup but does eliminate Python hand-off overhead between calls.
+
+    Defaults:
+        vllm     → 4   (tune up if GPU has headroom)
+        ollama   → 1   (no GPU parallelism; sequential is fine)
+        lmstudio → 1
+        llamacpp → 1
+        cloud    → 1   (Claude / Gemini — rate-limited by the API)
+
+    Override any default with:
+        export LLM_MAX_WORKERS=8
+    """
+    explicit = os.environ.get("LLM_MAX_WORKERS", "").strip()
+    if explicit:
+        return max(1, int(explicit))
+    backend  = os.environ.get("LOCAL_LLM_BACKEND", "").strip().lower()
+    provider = get_provider()
+    if provider == "local" and backend == "vllm":
+        return 4
+    return 1
+
+
 def get_provider() -> str:
     """
     Determine which LLM provider to use.
@@ -315,10 +344,21 @@ def call_llm(
     else:
         call_fn = _call_local
 
-    last_exc: Exception | None = None
-    delay = RETRY_BASE_DELAY
+    # For vLLM: omit max_tokens so the server uses remaining context space instead
+    # of pre-allocating a fixed KV-cache budget.  This avoids spurious 400 errors
+    # when prompt_tokens + max_tokens exceeds max_model_len even though the model
+    # would naturally stop well before that limit.
+    if provider == "local" and _backend_label == "vllm":
+        max_tokens = -1   # signals _call_local to omit the field from the payload
 
-    for attempt in range(MAX_RETRIES + 1):   # attempt 0 = first try
+    last_exc: Exception | None = None
+    delay    = RETRY_BASE_DELAY
+    attempt  = 0          # counts transient-error retries (sleeps); capped at MAX_RETRIES
+    _overflow_count  = 0  # counts _ContextLengthError reductions; has its own cap
+    _MAX_OVERFLOW    = 12 # allow up to 12 successive token-budget reductions
+    _overflow_buffer = 256  # initial safety margin; doubles on each overflow to converge
+
+    while True:
         try:
             _set_tok(-1, -1)                  # reset before each attempt
             _t0 = time.monotonic()
@@ -358,9 +398,38 @@ def call_llm(
         except _NonRetryableError:
             raise   # bad key, safety block, empty response — don't retry
 
+        except _ContextLengthError as exc:
+            # Prompt too long for the model's context window.
+            # Reduce max_tokens and retry immediately — this does NOT consume a
+            # transient-error retry slot (separate counter with its own cap).
+            #
+            # The server reports (ctx_max, prompt_toks) in the error body.
+            # We compute: available = ctx_max - prompt_toks - _overflow_buffer
+            # and double the buffer each time so successive retries converge
+            # quickly even when vLLM's token count drifts between requests.
+            _overflow_count += 1
+            if _overflow_count > _MAX_OVERFLOW:
+                raise RuntimeError(
+                    f"{tag}Context window still exceeded after {_MAX_OVERFLOW} "
+                    f"max_tokens reductions (current budget: {max_tokens}). "
+                    f"Reduce the prompt size or use a larger-context model."
+                )
+            # Re-apply the buffer with the current (doubled) margin so each
+            # successive call leaves more room, compensating for any tokeniser
+            # drift the server reports.
+            raw_available = exc.available_tokens   # ctx_max - prompt_toks - 64
+            reduced = max(256, raw_available - (_overflow_buffer - 64))
+            print(
+                f"  {tag}Context overflow (attempt {_overflow_count}/{_MAX_OVERFLOW}) — "
+                f"reducing max_tokens {max_tokens} → {reduced} and retrying ..."
+            )
+            max_tokens = reduced
+            _overflow_buffer = min(_overflow_buffer * 2, 4096)  # double, cap at 4096
+            # continue loop immediately without incrementing `attempt`
+
         except Exception as exc:
             last_exc = exc
-            if attempt == MAX_RETRIES:
+            if attempt >= MAX_RETRIES:
                 break   # exhausted — fall through to final raise
 
             wait = min(delay, RETRY_MAX_DELAY)
@@ -371,9 +440,10 @@ def call_llm(
             print(f"  {tag}Retrying in {wait:.0f}s ...")
             time.sleep(wait)
             delay *= RETRY_BACKOFF
+            attempt += 1
 
     raise RuntimeError(
-        f"LLM call failed after {MAX_RETRIES + 1} attempt(s). "
+        f"LLM call failed after {attempt + 1} attempt(s). "
         f"Last error: {last_exc}"
     )
 
@@ -435,6 +505,17 @@ class _NonRetryableError(RuntimeError):
     Wraps errors where retrying is pointless (bad API key, safety block, etc.).
     Raised inside provider functions; caught in call_llm and re-raised as-is.
     """
+
+class _ContextLengthError(Exception):
+    """
+    Raised when the server returns HTTP 400 because prompt + max_tokens
+    exceeds the model's context window.
+
+    Carries available_tokens so call_llm can retry with a reduced budget.
+    """
+    def __init__(self, message: str, available_tokens: int) -> None:
+        super().__init__(message)
+        self.available_tokens = available_tokens
     pass
 
 
@@ -506,13 +587,16 @@ def _call_local(
         # assistant pre-fill — the model continues from the given text.
         messages_payload.append({"role": "assistant", "content": prefill})
 
-    payload = {
+    payload: dict = {
         "model":       model,
         "messages":    messages_payload,
-        "max_tokens":  max_tokens,
         "temperature": temperature,
         "stream":      False,
     }
+    # max_tokens ≤ 0 means "let the server decide" — omit the field so vLLM
+    # uses remaining context space rather than pre-allocating a fixed budget.
+    if max_tokens > 0:
+        payload["max_tokens"] = max_tokens
     if json_schema is not None:
         # Constrained decoding — grammar-level JSON schema enforcement.
         # vLLM < 0.4.3: use guided_json in the request body (VLLM_GUIDED_JSON=1)
@@ -806,10 +890,26 @@ def _handle_local_http_error(
             f"Response body: {body[:200]}"
         )
     if code == 400:
+        # Check for context-length overflow — auto-retry with a smaller budget
+        import re as _re
+        # Matches: "maximum context length is 16384 tokens ... 12385 input tokens"
+        _ctx_m = _re.search(
+            r"maximum context length is (\d+).*?(\d+)\s+input tokens",
+            body, _re.DOTALL | _re.IGNORECASE,
+        )
+        if _ctx_m:
+            ctx_max      = int(_ctx_m.group(1))
+            prompt_toks  = int(_ctx_m.group(2))
+            available    = max(256, ctx_max - prompt_toks - 64)   # 64-token safety margin
+            raise _ContextLengthError(
+                f"Context overflow: model max={ctx_max}, prompt={prompt_toks}, "
+                f"available for output={available} tokens.",
+                available_tokens=available,
+            )
         raise _NonRetryableError(
             f"Local LLM rejected the request (HTTP 400).\n"
             f"This may mean the model doesn't support the parameters sent.\n"
-            f"Response body: {body[:200]}"
+            f"Response body: {body[:300]}"
         )
     if code == 401:
         raise _NonRetryableError(
