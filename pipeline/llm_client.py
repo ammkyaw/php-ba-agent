@@ -278,9 +278,8 @@ def get_provider() -> str:
             f"Valid values: claude | gemini | local"
         )
 
-    # Auto-detect: prefer local if LOCAL_LLM_URL is set (user explicitly
-    # configured a local server), then fall back to cloud providers.
-    if os.environ.get("LOCAL_LLM_URL"):
+    # Auto-detect: prefer local if backend or URL is configured.
+    if os.environ.get("LOCAL_LLM_URL") or os.environ.get("LOCAL_LLM_BACKEND"):
         return "local"
     if os.environ.get("ANTHROPIC_API_KEY"):
         return "claude"
