@@ -200,11 +200,16 @@ def _compute(ctx: Any) -> dict[str, Any]:
     # is absent (e.g. legacy inline routes).
     route_files: set[str] = set()
     _SKIP_METHODS = {"GROUP", "MIDDLEWARE", "PREFIX", "MIDDLEWARE_GROUP"}
+    # UI page routes (Next.js App Router page.tsx, Pages Router pages/) are not
+    # API handlers — exclude them from route coverage (they have no server handler).
+    _SKIP_KINDS = {"nextjs_page", "nextjs_app_router", "nextjs_pages_router"}
     if cm and cm.routes:
         for r in cm.routes:
             if not r.get("file"):
                 continue
             if (r.get("method") or "GROUP").upper() in _SKIP_METHODS:
+                continue
+            if r.get("kind", "") in _SKIP_KINDS:
                 continue
             handler_file = _handler_to_filename(r.get("handler"))
             if handler_file:
@@ -252,13 +257,18 @@ def _compute(ctx: Any) -> dict[str, Any]:
     def _entry(label: str, covered: set, total: set, missing: list) -> dict:
         n_cov   = len(covered)
         n_total = len(total)
-        pct     = n_cov / n_total if n_total else 0.0
-        if pct >= WARNING_THRESHOLD:
+        if n_total == 0:
+            # Nothing to measure — N/A, not a failure
+            pct    = 1.0
             status = "ok"
-        elif pct >= CRITICAL_THRESHOLD:
-            status = "warning"
         else:
-            status = "critical"
+            pct = n_cov / n_total
+            if pct >= WARNING_THRESHOLD:
+                status = "ok"
+            elif pct >= CRITICAL_THRESHOLD:
+                status = "warning"
+            else:
+                status = "critical"
         return {
             "label":   label,
             "covered": n_cov,
@@ -307,7 +317,7 @@ def _print_summary(report: dict[str, Any]) -> None:
     for key in ("exec_path", "route", "table", "form"):
         m = report[key]
         icon = _status_icon(m["status"])
-        pct_str = f"{m['pct']:.0%}"
+        pct_str = "N/A" if m["total"] == 0 else f"{m['pct']:.0%}"
         print(
             f"  {icon} {m['label']:<30} "
             f"{m['covered']:>8,} {m['total']:>8,} {pct_str:>10}"
