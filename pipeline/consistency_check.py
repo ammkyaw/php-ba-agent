@@ -217,6 +217,11 @@ def _check_bounded_contexts(ctx: Any) -> list[dict]:
         # not formal domain model entries, so skip validation.
         if "/" in bc or "\\" in bc:
             continue
+        # Generic catch-all labels produced when a flow doesn't belong to any
+        # specific domain context — not real domain model violations.
+        _GENERIC_BCS = {"misc", "miscellaneous", "other", "general", "unknown", "n/a"}
+        if bc.lower() in _GENERIC_BCS:
+            continue
         if bc.lower() not in known_bcs and bc not in reported:
             reported.add(bc)
             issues.append(_issue(
