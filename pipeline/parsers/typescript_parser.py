@@ -279,12 +279,28 @@ def _extract_env_vars(src: str, rel: str, env_vars: list) -> None:
 
 def _extract_auth_signals(src: str, rel: str, auth_signals: list) -> None:
     patterns = [
+        # Server-side patterns
         (r"passport\.authenticate\s*\(", "passport"),
         (r"jwt\.verify\s*\(", "jwt"),
         (r"@(?:UseGuards|AuthGuard)", "nestjs_guard"),
         (r"verifyToken|verifyJwt|checkAuth|isAuthenticated|requireAuth", "auth_middleware"),
         (r"\.session\s*\.\s*user|req\.user\b", "session_user"),
         (r"bearerAuth|Bearer\s+token", "bearer"),
+        # Firebase client-side auth
+        (r"signInWithEmailAndPassword\s*\(", "firebase_email_signin"),
+        (r"createUserWithEmailAndPassword\s*\(", "firebase_email_signup"),
+        (r"signInWithPopup\s*\(", "firebase_oauth_popup"),
+        (r"signInWithRedirect\s*\(", "firebase_oauth_redirect"),
+        (r"signOut\s*\(\s*auth", "firebase_signout"),
+        (r"onAuthStateChanged\s*\(", "firebase_auth_state"),
+        (r"GoogleAuthProvider|GithubAuthProvider|FacebookAuthProvider", "firebase_oauth_provider"),
+        # Supabase auth
+        (r"supabase\.auth\.signIn|supabase\.auth\.signUp", "supabase_auth"),
+        (r"supabase\.auth\.signOut", "supabase_signout"),
+        # Clerk
+        (r"useAuth\s*\(\)|SignIn|SignUp|useUser\s*\(\)", "clerk_auth"),
+        # NextAuth
+        (r"signIn\s*\(\s*['\"]|useSession\s*\(\)|getServerSession\s*\(", "nextauth"),
     ]
     for pattern, kind in patterns:
         if re.search(pattern, src, re.IGNORECASE):
