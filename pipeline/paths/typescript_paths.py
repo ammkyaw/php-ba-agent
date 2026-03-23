@@ -166,14 +166,59 @@ def _find_handlers(src: str, rel: str) -> list[dict]:
         body = _extract_function_body(src, src.index("(", m.end()) if "(" in src[m.end():m.end()+50] else m.end())
         handlers.append({"name": fn_name, "http_method": method, "route": "", "body": body})
 
-    # Exported async functions (Next.js page handlers, generic)
+    # Next.js App Router: export async function GET/POST/... (request: NextRequest)
+    # Also catches generic exported HTTP-method-named functions
     for m in re.finditer(r"export\s+(?:default\s+)?(?:async\s+)?function\s+(\w+)\s*\(", src):
         fn_name = m.group(1)
-        if fn_name.upper() in ("GET", "POST", "PUT", "PATCH", "DELETE"):
+        if fn_name.upper() in ("GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS"):
             body = _extract_function_body(src, m.end() - 1)
-            handlers.append({"name": fn_name, "http_method": fn_name.upper(), "route": "", "body": body})
+            handlers.append({"name": fn_name, "http_method": fn_name.upper(), "route": _route_from_path(rel), "body": body})
+
+    # Next.js App Router arrow: export const GET = async (request) => { ... }
+    for m in re.finditer(
+        r"export\s+const\s+(GET|POST|PUT|PATCH|DELETE|HEAD|OPTIONS)\s*=\s*(?:async\s*)?\(",
+        src, re.IGNORECASE
+    ):
+        fn_name = m.group(1).upper()
+        body = _extract_function_body(src, m.end() - 1)
+        handlers.append({"name": fn_name, "http_method": fn_name, "route": _route_from_path(rel), "body": body})
+
+    # Next.js Pages Router: export default function handler(req, res)
+    # Only in pages/api/** files
+    if "pages/api" in rel or "pages\\api" in rel:
+        for m in re.finditer(
+            r"export\s+default\s+(?:async\s+)?function\s+(\w+)\s*\(\s*\w*\s*(?:,\s*\w+\s*)?\)",
+            src
+        ):
+            fn_name = m.group(1)
+            body = _extract_function_body(src, m.end() - 1)
+            # Pages Router handler handles all methods
+            handlers.append({"name": fn_name, "http_method": "ANY", "route": _route_from_path(rel), "body": body})
 
     return handlers
+
+
+def _route_from_path(rel: str) -> str:
+    """Derive a route string from a Next.js file path.
+
+    app/api/users/route.ts      → /api/users
+    pages/api/users/index.ts    → /api/users
+    pages/api/users/[id].ts     → /api/users/[id]
+    """
+    p = rel.replace("\\", "/")
+    # App Router: strip leading 'app/' and trailing '/route.ts'
+    if p.startswith("app/"):
+        p = p[len("app/"):]
+        p = re.sub(r"/route\.(ts|tsx|js|jsx)$", "", p)
+        p = re.sub(r"\.(ts|tsx|js|jsx)$", "", p)
+        return "/" + p
+    # Pages Router: strip leading 'pages/' and trailing extension/index
+    if p.startswith("pages/"):
+        p = p[len("pages/"):]
+        p = re.sub(r"\.(ts|tsx|js|jsx)$", "", p)
+        p = re.sub(r"/index$", "", p)
+        return "/" + p
+    return ""
 
 
 def _extract_function_body(src: str, pos: int) -> str:
