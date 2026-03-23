@@ -31,7 +31,7 @@ ERROR_FILE   = "execution_paths_errors.json"
 
 _SKIP_DIRS = {
     "node_modules", ".git", "dist", "build", ".next", ".nuxt",
-    "coverage", "tests", "test", "spec", "__tests__",
+    "coverage", "tests", "test", "spec", "__tests__", ".claude",
 }
 _TS_EXTS = {".ts", ".tsx", ".js", ".jsx", ".mjs"}
 

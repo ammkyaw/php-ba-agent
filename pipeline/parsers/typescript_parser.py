@@ -356,12 +356,18 @@ def _extract_sql_queries(src: str, rel: str, sql_queries: list) -> None:
     # TypeORM: repository.save / find / delete
     for m in re.finditer(r"(?:repository|repo)\.(?:save|find|findOne|delete|update|insert)\b", src):
         sql_queries.append({"file": rel, "orm": "typeorm", "operation": m.group(0)})
-    # Firestore: collection().add / doc().set / doc().update / doc().delete
+    # Firestore: collection(db, 'name') / collection(db, 'name').doc() etc.
+    # Also: addDoc/getDocs/setDoc/updateDoc/deleteDoc(collection(db, 'name'), ...)
     for m in re.finditer(
-        r"(?:collection|doc)\s*\(\s*['\"`](\w+)['\"`]\s*\)\s*\.\s*(add|set|update|delete|get|getDocs|getDoc)\b",
+        r"collection\s*\([^,)]+,\s*['\"`](\w+)['\"`]\s*\)",
         src
     ):
-        sql_queries.append({"file": rel, "orm": "firestore", "table": m.group(1), "operation": m.group(2)})
+        sql_queries.append({"file": rel, "orm": "firestore", "table": m.group(1), "operation": "collection"})
+    for m in re.finditer(
+        r"(addDoc|setDoc|updateDoc|deleteDoc|getDocs|getDoc|getCountFromServer)\s*\(\s*collection\s*\([^,)]+,\s*['\"`](\w+)['\"`]",
+        src
+    ):
+        sql_queries.append({"file": rel, "orm": "firestore", "table": m.group(2), "operation": m.group(1)})
 
 
 # ─── Route extractors ─────────────────────────────────────────────────────────
