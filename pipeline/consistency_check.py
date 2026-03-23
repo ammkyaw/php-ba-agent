@@ -146,12 +146,24 @@ def _check_actor_roles(ctx: Any) -> list[dict]:
     }
     all_roles_str = ", ".join(r["role"] for r in (domain.user_roles or []) if isinstance(r, dict))
 
+    # Skip check when domain model has no user_roles defined (TS/Firebase apps
+    # without server-side auth guards often produce an empty roles list)
+    if not known_roles:
+        return []
+
+    # Common generic actor aliases that are always acceptable regardless of
+    # what the domain model names them (Guest = unauthenticated, etc.)
+    _GENERIC_ACTORS = {"user", "guest", "guest user", "anonymous", "visitor",
+                       "admin", "administrator", "system"}
+
     issues: list[dict] = []
     reported: set[str] = set()
 
     for flow in flows.flows:
         actor = (flow.actor or "").strip()
         if not actor:
+            continue
+        if actor.lower() in _GENERIC_ACTORS:
             continue
         if actor.lower() not in known_roles and actor not in reported:
             reported.add(actor)
@@ -189,12 +201,21 @@ def _check_bounded_contexts(ctx: Any) -> list[dict]:
     }
     all_bcs_str = ", ".join(domain.bounded_contexts or [])
 
+    # Skip check when domain model has no bounded_contexts defined
+    if not known_bcs:
+        return []
+
     issues: list[dict] = []
     reported: set[str] = set()
 
     for flow in flows.flows:
         bc = (flow.bounded_context or "").strip()
         if not bc:
+            continue
+        # Directory-path bounded contexts (e.g. "components/settings") are
+        # internal flow annotations from client-side skeleton building —
+        # not formal domain model entries, so skip validation.
+        if "/" in bc or "\\" in bc:
             continue
         if bc.lower() not in known_bcs and bc not in reported:
             reported.add(bc)
@@ -458,10 +479,13 @@ def _check_routes_not_in_flows(ctx: Any) -> list[dict]:
     # route endpoint produce only one issue.
     reported: set[tuple[str, str]] = set()
 
+    _SKIP_KINDS = {"nextjs_page", "nextjs_app_router", "nextjs_pages_router"}
     for r in cm.routes:
         method = r.get("method", "")
         if method in ("GROUP", ""):
             continue   # skip grouping pseudo-entries
+        if r.get("kind", "") in _SKIP_KINDS:
+            continue   # UI page routes are not API handlers
 
         path  = r.get("path", "")
         rfile = r.get("file", "")
