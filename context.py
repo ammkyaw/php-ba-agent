@@ -61,6 +61,7 @@ class Framework(str, Enum):
     # ── TypeScript / JavaScript frameworks ───────────────────────────────────
     NEXTJS      = "nextjs"
     NUXTJS      = "nuxtjs"
+    ANGULAR     = "angular"
     VUE         = "vue"
     REACT       = "react"
     EXPRESS     = "express"
