@@ -132,6 +132,60 @@ import time
 from typing import Optional
 
 
+# ── Backend config-file loader ─────────────────────────────────────────────────
+def _load_backend_config() -> None:
+    """
+    Load per-backend env config file, setting variables that are not already
+    in the environment (env vars always take precedence).
+
+    Lookup order (first found wins):
+      1. .llm/<backend>.env          — project-local (gitignored)
+      2. ~/.config/php-ba-agent/<backend>.env  — user-level
+
+    File format — plain KEY=VALUE, one per line:
+      VLLM_MODEL=qwen3.5-27b-nvfp4
+      VLLM_MAX_WORKERS=8
+      # comments are ignored
+      OLLAMA_NUM_CTX=32768
+
+    Security: files are parsed as plain text (no eval/shell execution).
+    Sensitive values (API keys etc.) belong in the user-level file with
+    chmod 600, not in the project-local file.
+    """
+    backend = os.environ.get("LOCAL_LLM_BACKEND", "").strip().lower()
+    if not backend:
+        return
+
+    candidates = [
+        os.path.join(os.getcwd(), ".llm", f"{backend}.env"),
+        os.path.expanduser(f"~/.config/php-ba-agent/{backend}.env"),
+    ]
+
+    for path in candidates:
+        if not os.path.isfile(path):
+            continue
+        loaded: list[str] = []
+        with open(path) as _f:
+            for line in _f:
+                line = line.strip()
+                if not line or line.startswith("#"):
+                    continue
+                if "=" not in line:
+                    continue
+                key, _, val = line.partition("=")
+                key = key.strip()
+                val = val.strip().strip('"').strip("'")
+                if key and key not in os.environ:
+                    os.environ[key] = val
+                    loaded.append(key)
+        if loaded:
+            print(f"  [llm_client] Loaded backend config: {path} ({', '.join(loaded)})")
+        return   # stop after first found
+
+
+_load_backend_config()   # runs once at import time
+
+
 # ── Per-call token stats ───────────────────────────────────────────────────────
 # Thread-local so concurrent stage50 agents don't overwrite each other's counts.
 # Provider functions write here; call_llm reads after each call.
@@ -151,6 +205,18 @@ def _get_tok() -> tuple[int, int]:
 DEFAULT_CLAUDE_MODEL  = "claude-sonnet-4-20250514"
 DEFAULT_GEMINI_MODEL  = "gemini-2.5-flash-lite"      # stable free tier default
 DEFAULT_LOCAL_LLM_URL = "http://localhost:11434" # Ollama default
+
+# Default ports per backend — combined with LOCAL_LLM_HOST when set.
+# Set LOCAL_LLM_URL to override the full URL entirely.
+_BACKEND_DEFAULT_PORTS: dict[str, int] = {
+    "ollama":   11434,
+    "vllm":     8000,
+    "lmstudio": 1234,
+    "llamacpp": 8080,
+}
+_BACKEND_DEFAULT_URLS: dict[str, str] = {
+    k: f"http://localhost:{v}" for k, v in _BACKEND_DEFAULT_PORTS.items()
+}
 
 # Gemini free tier: 15 RPM, 1M TPM, 1500 RPD
 # Add a small delay between calls to stay well within limits
@@ -172,26 +238,22 @@ def get_max_workers() -> int:
     """
     Recommended ThreadPoolExecutor size for concurrent LLM calls.
 
-    vLLM uses continuous batching — multiple requests are processed in
-    parallel on the GPU, so higher concurrency = higher throughput.
-    Ollama queues one request at a time, so concurrency > 1 gives no GPU
-    speedup but does eliminate Python hand-off overhead between calls.
-
-    Defaults:
-        vllm     → 4   (tune up if GPU has headroom)
-        ollama   → 1   (no GPU parallelism; sequential is fine)
-        lmstudio → 1
-        llamacpp → 1
-        cloud    → 1   (Claude / Gemini — rate-limited by the API)
-
-    Override any default with:
-        export LLM_MAX_WORKERS=8
+    Resolution order:
+      1. LLM_MAX_WORKERS          — global explicit override
+      2. OLLAMA_MAX_WORKERS /
+         VLLM_MAX_WORKERS / etc.  — backend-specific override
+      3. coded default per backend (vllm=4, others=1)
     """
     explicit = os.environ.get("LLM_MAX_WORKERS", "").strip()
     if explicit:
         return max(1, int(explicit))
     backend  = os.environ.get("LOCAL_LLM_BACKEND", "").strip().lower()
     provider = get_provider()
+    if provider == "local" and backend:
+        backend_var = f"{backend.upper()}_MAX_WORKERS"
+        backend_explicit = os.environ.get(backend_var, "").strip()
+        if backend_explicit:
+            return max(1, int(backend_explicit))
     if provider == "local" and backend == "vllm":
         return 4
     return 1
@@ -237,11 +299,14 @@ def get_provider() -> str:
 
 def get_model() -> str:
     """
-    Return the active model name (respects LLM_MODEL override).
+    Return the active model name.
 
-    For the local provider, LOCAL_LLM_MODEL is the primary source.
-    LLM_MODEL overrides everything.
-    Raises RuntimeError if local is selected but no model is specified.
+    Resolution order:
+      1. LLM_MODEL               — global explicit override
+      2. OLLAMA_MODEL /
+         VLLM_MODEL / etc.       — backend-specific model
+      3. LOCAL_LLM_MODEL         — legacy fallback (any backend)
+      4. cloud defaults          — Claude / Gemini built-in defaults
     """
     override = os.environ.get("LLM_MODEL", "").strip()
     if override:
@@ -250,14 +315,19 @@ def get_model() -> str:
     provider = get_provider()
 
     if provider == "local":
+        backend = os.environ.get("LOCAL_LLM_BACKEND", "").strip().lower()
+        if backend:
+            backend_model = os.environ.get(f"{backend.upper()}_MODEL", "").strip()
+            if backend_model:
+                return backend_model
         model = os.environ.get("LOCAL_LLM_MODEL", "").strip()
         if not model:
             raise RuntimeError(
-                "LOCAL_LLM_MODEL is not set.\n"
-                "Set it to the model name your local server has loaded, e.g.:\n"
-                "  export LOCAL_LLM_MODEL=llama3.2          # Ollama\n"
-                "  export LOCAL_LLM_MODEL=qwen2.5-coder:14b # Ollama\n"
-                "  export LOCAL_LLM_MODEL=your-model-name   # LM Studio"
+                "No model configured for local LLM.\n"
+                "Set a backend-specific model or the generic fallback, e.g.:\n"
+                "  export VLLM_MODEL=qwen3.5-27b-nvfp4\n"
+                "  export OLLAMA_MODEL=qwen3.5:27b\n"
+                "  export LOCAL_LLM_MODEL=your-model-name   # any backend"
             )
         return model
 
@@ -267,8 +337,23 @@ def get_model() -> str:
 
 
 def get_local_url() -> str:
-    """Return the base URL for the local LLM server."""
-    return os.environ.get("LOCAL_LLM_URL", DEFAULT_LOCAL_LLM_URL).rstrip("/")
+    """Return the base URL for the local LLM server.
+
+    Resolution order:
+      1. LOCAL_LLM_URL   — full URL override, always wins
+      2. LOCAL_LLM_HOST  — host/IP only; port auto-derived from backend
+      3. backend default — http://localhost:<backend-port>
+      4. DEFAULT_LOCAL_LLM_URL (Ollama :11434) — final fallback
+    """
+    explicit = os.environ.get("LOCAL_LLM_URL", "").strip()
+    if explicit:
+        return explicit.rstrip("/")
+    host = os.environ.get("LOCAL_LLM_HOST", "").strip()
+    backend = os.environ.get("LOCAL_LLM_BACKEND", "").strip().lower()
+    port = _BACKEND_DEFAULT_PORTS.get(backend)
+    if host and port:
+        return f"http://{host}:{port}"
+    return _BACKEND_DEFAULT_URLS.get(backend, DEFAULT_LOCAL_LLM_URL).rstrip("/")
 
 
 def call_llm(
@@ -564,7 +649,13 @@ def _call_local(
     # "ollama" (default), "vllm", "lmstudio", "llamacpp"
 
     # ── Ollama native path: only when backend is ollama AND num_ctx is set ──────
-    num_ctx = int(os.environ.get("LOCAL_LLM_NUM_CTX", "0") or "0")
+    # Resolution: LOCAL_LLM_NUM_CTX (global) → OLLAMA_NUM_CTX (backend-specific)
+    _num_ctx_str = (
+        os.environ.get("LOCAL_LLM_NUM_CTX", "").strip()
+        or os.environ.get(f"{_backend.upper()}_NUM_CTX", "").strip()
+        or "0"
+    )
+    num_ctx = int(_num_ctx_str or "0")
     if num_ctx > 0 and _backend not in ("vllm", "lmstudio", "llamacpp"):
         return _call_local_ollama_native(
             system_prompt, user_prompt, max_tokens, temperature,

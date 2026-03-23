@@ -216,3 +216,4 @@ composer.*
 .continue
 vendor
 .llm_cache.db
+.llm/
