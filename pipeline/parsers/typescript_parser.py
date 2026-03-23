@@ -288,7 +288,7 @@ def _extract_auth_signals(src: str, rel: str, auth_signals: list) -> None:
     ]
     for pattern, kind in patterns:
         if re.search(pattern, src, re.IGNORECASE):
-            auth_signals.append({"file": rel, "kind": kind})
+            auth_signals.append({"file": rel, "type": kind})
 
 
 def _extract_input_params(src: str, rel: str, input_params: list) -> None:

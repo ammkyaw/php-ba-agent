@@ -1118,7 +1118,10 @@ def _build_user_prompt(ctx: PipelineContext, chunks: list[dict]) -> str:
     if auth_signals:
         from collections import Counter as _Counter
         parts.append(f"\n=== AUTHENTICATION & AUTHORISATION SIGNALS ===")
-        by_type: _Counter = _Counter(s["type"] for s in auth_signals)
+        # PHP parser uses "type"; TypeScript parser uses "kind" — accept both
+        def _sig_type(s: dict) -> str:
+            return s.get("type") or s.get("kind") or "unknown"
+        by_type: _Counter = _Counter(_sig_type(s) for s in auth_signals)
         parts.append("  Signal counts: " + ", ".join(
             f"{t}={n}" for t, n in sorted(by_type.items())))
         seen_pats: set = set()
@@ -1133,7 +1136,7 @@ def _build_user_prompt(ctx: PipelineContext, chunks: list[dict]) -> str:
             seen_pats.add(pat)
             _auth_shown += 1
             detail = f" [{sig['detail']}]" if sig.get("detail") else ""
-            parts.append(f"  {sig['type']}: {pat}{detail}"
+            parts.append(f"  {_sig_type(sig)}: {pat}{detail}"
                          f" ({Path(sig.get('file','?')).name}:{sig.get('line','?')})")
 
     # ── HTTP entry points ─────────────────────────────────────────────────────
