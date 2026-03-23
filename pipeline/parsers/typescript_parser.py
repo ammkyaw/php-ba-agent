@@ -340,18 +340,28 @@ def _extract_form_fields(src: str, rel: str, form_fields: list) -> None:
 
 
 def _extract_sql_queries(src: str, rel: str, sql_queries: list) -> None:
-    # Raw SQL strings
+    # Raw SQL strings — require a second SQL keyword to avoid matching UI strings
+    # e.g. "Select Role" is NOT SQL; "SELECT id FROM users" IS SQL
     for m in re.finditer(
         r"['\"`](SELECT|INSERT|UPDATE|DELETE|CREATE|DROP|ALTER)\b[^'\"`;]{0,300}",
         src, re.IGNORECASE
     ):
-        sql_queries.append({"file": rel, "operation": m.group(1).upper(), "raw": m.group(0)[:120]})
+        snippet = m.group(0)
+        if not re.search(r"\b(FROM|WHERE|INTO|SET|TABLE|JOIN|VALUES)\b", snippet, re.IGNORECASE):
+            continue   # UI string, not real SQL
+        sql_queries.append({"file": rel, "operation": m.group(1).upper(), "raw": snippet[:120]})
     # Prisma: prisma.user.create / findMany / update / delete
     for m in re.finditer(r"prisma\.(\w+)\.(create|findMany|findFirst|update|delete|upsert)\b", src):
         sql_queries.append({"file": rel, "orm": "prisma", "table": m.group(1), "operation": m.group(2)})
     # TypeORM: repository.save / find / delete
     for m in re.finditer(r"(?:repository|repo)\.(?:save|find|findOne|delete|update|insert)\b", src):
         sql_queries.append({"file": rel, "orm": "typeorm", "operation": m.group(0)})
+    # Firestore: collection().add / doc().set / doc().update / doc().delete
+    for m in re.finditer(
+        r"(?:collection|doc)\s*\(\s*['\"`](\w+)['\"`]\s*\)\s*\.\s*(add|set|update|delete|get|getDocs|getDoc)\b",
+        src
+    ):
+        sql_queries.append({"file": rel, "orm": "firestore", "table": m.group(1), "operation": m.group(2)})
 
 
 # ─── Route extractors ─────────────────────────────────────────────────────────
@@ -388,30 +398,57 @@ def _extract_nestjs_routes(src: str, rel: str, routes: list, controllers: list) 
 def _extract_nextjs_routes(src_file: Path, root: Path, rel: str, routes: list) -> None:
     """
     Next.js file-based routing:
-    pages/api/users.ts       → /api/users  (all methods)
-    app/api/users/route.ts   → /api/users  (exported GET/POST/… functions)
+    pages/api/users.ts            → /api/users  (API route, all methods)
+    app/api/users/route.ts        → /api/users  (API route, exported GET/POST/…)
+    app/prism/page.tsx            → /prism       (page route, GET)
+    pages/dashboard/index.tsx     → /dashboard   (page route, GET)
     """
     parts = src_file.parts
-    # pages/api/...
+
+    def _normalise_path(path_parts: tuple) -> str:
+        path = "/" + "/".join(path_parts).replace("\\", "/")
+        path = re.sub(r"\(([^)]+)\)", "", path)   # remove (group) layout segments
+        path = re.sub(r"\[(\w+)\]", r":\1", path)  # [id] → :id
+        path = re.sub(r"//+", "/", path)            # collapse double slashes
+        return path.rstrip("/") or "/"
+
+    # pages/api/** — API routes
     if "pages" in parts:
         idx = list(parts).index("pages")
         api_parts = parts[idx+1:]
         if api_parts and api_parts[0] == "api":
-            path = "/" + "/".join(api_parts).replace("\\", "/")
+            path = _normalise_path(api_parts)
             path = re.sub(r"\.(ts|tsx|js|jsx)$", "", path)
-            path = re.sub(r"\[(\w+)\]", r":\1", path)   # [id] → :id
-            routes.append({"method": "ANY", "path": path, "file": rel, "kind": "nextjs_pages"})
+            routes.append({"method": "ANY", "path": path, "file": rel, "kind": "nextjs_pages_api"})
+        elif src_file.name in ("page.tsx", "page.ts", "page.jsx", "page.js",
+                               "index.tsx", "index.ts", "index.jsx", "index.js"):
+            # pages/** page routes
+            page_parts = parts[idx+1:]
+            path = _normalise_path(page_parts)
+            path = re.sub(r"\.(ts|tsx|js|jsx)$", "", path)
+            path = re.sub(r"/index$", "", path)
+            routes.append({"method": "GET", "path": path or "/", "file": rel, "kind": "nextjs_page"})
 
-    # app/**/route.ts (App Router)
-    if "app" in parts and src_file.name in ("route.ts", "route.js"):
+    # app/** (App Router)
+    if "app" in parts:
         idx = list(parts).index("app")
-        path_parts = parts[idx+1:-1]   # exclude "route.ts"
-        path = "/" + "/".join(path_parts).replace("\\", "/")
-        path = re.sub(r"\(([^)]+)\)", "", path)   # (group) → removed
-        path = re.sub(r"\[(\w+)\]", r":\1", path)
-        src = LanguageParser.safe_read(src_file) or ""
-        for method in re.findall(r"export\s+(?:async\s+)?function\s+(GET|POST|PUT|PATCH|DELETE)\b", src):
-            routes.append({"method": method, "path": path or "/", "file": rel, "kind": "nextjs_app"})
+        # API routes: app/**/route.ts
+        if src_file.name in ("route.ts", "route.js"):
+            path_parts = parts[idx+1:-1]
+            path = _normalise_path(path_parts)
+            src_content = LanguageParser.safe_read(src_file) or ""
+            for method in re.findall(
+                r"export\s+(?:const\s+|async\s+)?(?:function\s+)?(GET|POST|PUT|PATCH|DELETE|HEAD)\b",
+                src_content
+            ):
+                routes.append({"method": method, "path": path or "/", "file": rel, "kind": "nextjs_app_api"})
+            if not re.search(r"export\s+(?:const\s+|async\s+)?(?:function\s+)?(GET|POST|PUT|PATCH|DELETE|HEAD)\b", src_content):
+                routes.append({"method": "ANY", "path": path or "/", "file": rel, "kind": "nextjs_app_api"})
+        # Page routes: app/**/page.tsx
+        elif src_file.name in ("page.tsx", "page.ts", "page.jsx", "page.js"):
+            path_parts = parts[idx+1:-1]
+            path = _normalise_path(path_parts)
+            routes.append({"method": "GET", "path": path or "/", "file": rel, "kind": "nextjs_page"})
 
 
 def _extract_vue_router_routes(source_files: list[Path], root: Path, routes: list) -> None:
