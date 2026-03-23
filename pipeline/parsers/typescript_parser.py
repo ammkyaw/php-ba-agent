@@ -439,22 +439,29 @@ def _extract_nextjs_routes(src_file: Path, root: Path, rel: str, routes: list) -
     if "app" in parts:
         idx = list(parts).index("app")
         # API routes: app/**/route.ts
-        if src_file.name in ("route.ts", "route.js"):
+        if src_file.name in ("route.ts", "route.js", "route.tsx", "route.jsx"):
             path_parts = parts[idx+1:-1]
             path = _normalise_path(path_parts)
             src_content = LanguageParser.safe_read(src_file) or ""
+            dir_rel = str(Path(rel).parent).replace("\\", "/")
+            
+            methods_found = False
             for method in re.findall(
                 r"export\s+(?:const\s+|async\s+)?(?:function\s+)?(GET|POST|PUT|PATCH|DELETE|HEAD)\b",
                 src_content
             ):
-                routes.append({"method": method, "path": path or "/", "file": rel, "kind": "nextjs_app_api"})
-            if not re.search(r"export\s+(?:const\s+|async\s+)?(?:function\s+)?(GET|POST|PUT|PATCH|DELETE|HEAD)\b", src_content):
-                routes.append({"method": "ANY", "path": path or "/", "file": rel, "kind": "nextjs_app_api"})
+                methods_found = True
+                routes.append({"method": method, "path": path or "/", "file": dir_rel, "kind": "nextjs_app_route"})
+            
+            if not methods_found:
+                routes.append({"method": "ANY", "path": path or "/", "file": dir_rel, "kind": "nextjs_app_route"})
+                
         # Page routes: app/**/page.tsx
         elif src_file.name in ("page.tsx", "page.ts", "page.jsx", "page.js"):
             path_parts = parts[idx+1:-1]
             path = _normalise_path(path_parts)
-            routes.append({"method": "GET", "path": path or "/", "file": rel, "kind": "nextjs_page"})
+            dir_rel = str(Path(rel).parent).replace("\\", "/")
+            routes.append({"method": "GET", "path": path or "/", "file": dir_rel, "kind": "nextjs_app_route"})
 
 
 def _extract_vue_router_routes(source_files: list[Path], root: Path, routes: list) -> None:

@@ -12,6 +12,7 @@ Integration tests (which do require PHP + nikic/php-parser) are marked with
 from __future__ import annotations
 
 import json
+import sys
 from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent.parent))  # locate project root
 from unittest.mock import MagicMock, patch
