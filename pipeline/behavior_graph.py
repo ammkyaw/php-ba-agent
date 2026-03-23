@@ -322,6 +322,56 @@ def extract(ctx: Any) -> dict:
         if len(paths) >= _MAX_PATHS:
             break
 
+    # ── Client-side execution paths (Next.js / React / Firebase apps) ──────────
+    # When there are no server-route paths (e.g. pure SPA/Next.js+Firebase),
+    # build lightweight behavior paths from stage15 execution_paths instead.
+    exec_paths = getattr(cm, "execution_paths", None) or getattr(ctx, "execution_paths", None) or []
+    if not paths and exec_paths:
+        for ep in exec_paths:
+            if len(paths) >= _MAX_PATHS:
+                break
+            handler   = ep.get("handler") or ep.get("name") or ""
+            ep_file   = ep.get("file") or ""
+            ep_method = (ep.get("http_method") or "CLIENT").upper()
+            ep_route  = ep.get("route") or ""
+            if not handler:
+                continue
+
+            path_id = f"path_{len(paths)+1:03d}"
+
+            # Route node — use the page path or the handler as the label
+            route_label  = ep_route or f"[{ep_file}]"
+            route_nid    = _node_id("route", f"{ep_method}:{route_label}")
+            _upsert_node(nodes, route_nid, "route",
+                         f"{ep_method} {route_label}", ep_file,
+                         {"method": ep_method, "path": route_label})
+
+            # Handler node — the client function itself
+            handler_nid = _node_id("controller", f"{ep_file}::{handler}")
+            _upsert_node(nodes, handler_nid, "controller", handler, ep_file,
+                         {"fqn": ep_file, "short": handler, "method": handler})
+            _upsert_edge(edges, route_nid, handler_nid, "handles")
+
+            # Auth
+            has_auth = bool(ep.get("auth_guard", {}).get("present"))
+
+            paths.append({
+                "path_id":         path_id,
+                "entry_node":      route_nid,
+                "node_ids":        [route_nid, handler_nid],
+                "confidence":      0.5,
+                "route_method":    ep_method,
+                "route_path":      route_label,
+                "handler":         handler,
+                "controller_file": ep_file,
+                "sql_ops":         [],
+                "sql_tables":      [],
+                "redirect":        "",
+                "has_auth":        has_auth,
+                "middleware":      [],
+                "reachable_files": [ep_file] if ep_file else [],
+            })
+
     # ── Summary ────────────────────────────────────────────────────────────────
     nodes_list = list(nodes.values())
     edges_list = list(edges.values())
