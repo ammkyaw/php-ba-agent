@@ -527,7 +527,7 @@ def _build_gap_fill_skeletons(
             # Fallback: pull from entry_conditions for HTTP method
             http_method: str | None = None
             for ec in ep.get("entry_conditions", []):
-                if ec.get("type") == "method_check":
+                if isinstance(ec, dict) and ec.get("type") == "method_check":
                     http_method = ec.get("method")
 
             # Enrich action description with callee function hints when available
@@ -1887,23 +1887,28 @@ def _stitch_execution_paths(
             # Determine HTTP method from entry_conditions
             http_method: Optional[str] = None
             for ec in ep.get("entry_conditions", []):
-                if ec.get("type") == "method_check":
+                if isinstance(ec, dict) and ec.get("type") == "method_check":
                     http_method = ec.get("method")
 
             # Auth guard
-            auth_required = bool(ep.get("auth_guard"))
+            ag = ep.get("auth_guard")
+            auth_required = bool(ag) and ag.get("present", True) if isinstance(ag, dict) else bool(ag)
 
-            # Inputs: from form_fields / POST entry_conditions
+            # Inputs: from form_fields / POST entry_conditions (PHP dicts only)
             inputs: list[str] = list({
                 ec.get("key", "")
                 for ec in ep.get("entry_conditions", [])
-                if ec.get("key")
+                if isinstance(ec, dict) and ec.get("key")
             })
 
-            # Outputs: session keys written + redirect targets
+            # Outputs: session keys written + redirect targets (PHP format only)
             outputs: list[str] = []
             for b in ep.get("branches", []):
+                if not isinstance(b, dict):
+                    continue
                 for action in b.get("then", []) + b.get("else", []):
+                    if not isinstance(action, dict):
+                        continue
                     if action.get("action") == "session_write":
                         outputs.append(f"$_SESSION['{action.get('key','?')}']")
                     elif action.get("action") == "redirect":
@@ -1943,14 +1948,23 @@ def _stitch_execution_paths(
             step_num += 1
 
             # Collect branch info (alternate paths)
-            for b in ep.get("branches", []):
+            # PHP: "branches" list with then/else; TS: "branch_map" list with outcome
+            _all_branches = ep.get("branches", ep.get("branch_map", []))
+            for b in _all_branches:
+                if not isinstance(b, dict):
+                    continue
                 cond = b.get("condition", "")
+                # PHP format: else actions list; TS format: outcome string
                 else_actions = b.get("else", [])
-                if else_actions and cond:
+                outcome = b.get("outcome", "")
+                if cond and (else_actions or outcome):
                     branches.append({
                         "at_page":   page_name,
                         "condition": cond[:100],
-                        "alternate": [a.get("action","?") for a in else_actions[:3]],
+                        "alternate": (
+                            [outcome[:80]] if outcome
+                            else [a.get("action","?") for a in else_actions[:3] if isinstance(a, dict)]
+                        ),
                     })
 
         # Confidence heuristic: how many files have execution_path evidence
