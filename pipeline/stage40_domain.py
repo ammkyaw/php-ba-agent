@@ -1199,15 +1199,18 @@ def _build_user_prompt(ctx: PipelineContext, chunks: list[dict]) -> str:
 
             # Auth guard
             ag = ep.get("auth_guard")
-            if ag:
+            if ag and ag.get("present", True):
+                key = ag.get("key") or ag.get("guard") or "auth"
                 parts.append(
-                    f"  Auth guard: session['{ag['key']}'] required "
+                    f"  Auth guard: {key!r} required "
                     f"(else redirect → {ag.get('redirect','?')})"
                 )
 
-            # Entry conditions
+            # Entry conditions (PHP: dicts with "type"; TS: plain strings)
             for ec in ep.get("entry_conditions", []):
-                if ec.get("type") == "method_check":
+                if isinstance(ec, str):
+                    parts.append(f"  Condition: {ec}")
+                elif isinstance(ec, dict) and ec.get("type") == "method_check":
                     parts.append(f"  Accepts: HTTP {ec.get('method','?')}")
 
             # Happy path (primary success scenario)
@@ -1217,8 +1220,10 @@ def _build_user_prompt(ctx: PipelineContext, chunks: list[dict]) -> str:
                 for step in hp:
                     parts.append(f"    → {step}")
 
-            # Data flows
-            for flow in ep.get("data_flows", []):
+            # Data flows (PHP: "data_flows" list of dicts; TS: "data_flow")
+            for flow in ep.get("data_flows", ep.get("data_flow", [])):
+                if not isinstance(flow, dict):
+                    continue
                 fields = ", ".join(flow.get("field_mapping", {}).keys())
                 table  = flow.get("table", "?")
                 op     = flow.get("sink", "sql_query")
@@ -1227,18 +1232,24 @@ def _build_user_prompt(ctx: PipelineContext, chunks: list[dict]) -> str:
                         f"  Data flow: POST fields [{fields}] → {op} on `{table}`"
                     )
 
-            # Branches summary (condition + outcome)
-            branches = ep.get("branches", [])
+            # Branches summary (PHP: "branches" with then/else; TS: "branch_map" with outcome)
+            branches = ep.get("branches", ep.get("branch_map", []))
             if branches:
                 parts.append(f"  Branches ({len(branches)}):")
                 for b in branches[:3]:          # cap at 3 per file
+                    if not isinstance(b, dict):
+                        continue
                     cond = b.get("condition","?")[:80]
-                    then = [a.get("action","?") for a in b.get("then",[])]
-                    els  = [a.get("action","?") for a in b.get("else",[])]
-                    parts.append(f"    if ({cond})")
-                    parts.append(f"      then: {', '.join(then) or 'none'}")
-                    if els:
-                        parts.append(f"      else: {', '.join(els)}")
+                    # PHP format: then/else lists; TS format: outcome string
+                    if "outcome" in b:
+                        parts.append(f"    if ({cond}) → {b['outcome']}")
+                    else:
+                        then = [a.get("action","?") for a in b.get("then",[])]
+                        els  = [a.get("action","?") for a in b.get("else",[])]
+                        parts.append(f"    if ({cond})")
+                        parts.append(f"      then: {', '.join(then) or 'none'}")
+                        if els:
+                            parts.append(f"      else: {', '.join(els)}")
         if _omit_exp:
             parts.append(f"\n  … +{_omit_exp} more execution-path files omitted")
 
