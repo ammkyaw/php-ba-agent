@@ -953,7 +953,7 @@ def _format_business_flows_for_prompt(ctx: PipelineContext) -> str:
             lines.append(f"  Branches ({len(f.branches)}):")
             for b in f.branches:
                 lines.append(
-                    f"    • At {b['at_page']}: if ({b['condition']}) "
+                    f"    • At {b.get('at_page', '?')}: if ({b['condition']}) "
                     f"→ {', '.join(b['alternate'])}"
                 )
 
@@ -1047,7 +1047,7 @@ def _format_single_flow(f) -> str:
         lines.append(f"  Branches ({len(f.branches)}):")
         for b in f.branches:
             lines.append(
-                f"    • At {b['at_page']}: if ({b['condition']}) "
+                f"    • At {b.get('at_page', '?')}: if ({b['condition']}) "
                 f"→ {', '.join(b['alternate'])}"
             )
     return "\n".join(lines)
