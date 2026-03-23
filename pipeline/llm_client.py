@@ -140,7 +140,7 @@ def _load_backend_config() -> None:
 
     Lookup order (first found wins):
       1. .llm/<backend>.env          — project-local (gitignored)
-      2. ~/.config/php-ba-agent/<backend>.env  — user-level
+      2. ~/.config/codebase-ba/<backend>.env  — user-level
 
     File format — plain KEY=VALUE, one per line:
       VLLM_MODEL=qwen3.5-27b-nvfp4
@@ -158,7 +158,7 @@ def _load_backend_config() -> None:
 
     candidates = [
         os.path.join(os.getcwd(), ".llm", f"{backend}.env"),
-        os.path.expanduser(f"~/.config/php-ba-agent/{backend}.env"),
+        os.path.expanduser(f"~/.config/codebase-ba/{backend}.env"),
     ]
 
     for path in candidates:
