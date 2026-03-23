@@ -115,6 +115,11 @@ def _check_orphan_epics(ctx: Any, artefacts: dict[str, str]) -> list[dict]:
     issues: list[dict] = []
     for heading in epic_headings:
         heading_clean = heading.strip()
+        # Epics annotated with (Flow) or (Path) are intentional coverage
+        # extensions generated from business flows / execution paths — they are
+        # not expected to match domain model feature names directly.
+        if heading_clean.endswith("(Flow)") or heading_clean.endswith("(Path)"):
+            continue
         if not _fuzzy_match_any(heading_clean.lower(), feature_names):
             issues.append(_issue(
                 severity       = _MINOR,
