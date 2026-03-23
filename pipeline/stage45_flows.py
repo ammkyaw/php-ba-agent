@@ -571,6 +571,99 @@ def _build_gap_fill_skeletons(
     return skeletons
 
 
+# ─── Client-Side Flow Builder ──────────────────────────────────────────────────
+
+def _build_client_side_skeletons(exec_paths: list[dict]) -> list[dict]:
+    """
+    Build flow skeletons directly from CLIENT-method execution_paths
+    (pure front-end apps: Next.js+Firebase, React SPA, etc.) that have no
+    server routes or graph paths.
+
+    Groups all execution paths by parent directory so each skeleton covers an
+    entire UI component directory (e.g. src/components/login → Login flow).
+    Each handler in that directory becomes a FlowStep, giving the LLM rich
+    context to produce a meaningful BusinessFlow name.
+    """
+    from collections import defaultdict
+
+    # Only process CLIENT execution paths
+    client_eps = [ep for ep in exec_paths if ep.get("http_method") == "CLIENT"]
+    if not client_eps:
+        return []
+
+    # Group by parent directory — one skeleton per UI component directory
+    by_dir: dict[str, list[dict]] = defaultdict(list)
+    for ep in client_eps:
+        f = ep.get("file", "")
+        if f:
+            parent = str(Path(f).parent)
+            by_dir[parent].append(ep)
+
+    skeletons: list[dict] = []
+    for dir_path, eps in by_dir.items():
+        steps: list[FlowStep] = []
+        all_branches: list[dict] = []
+        files_in_dir: list[str] = list(dict.fromkeys(
+            ep["file"] for ep in eps if ep.get("file")
+        ))
+
+        for i, ep in enumerate(eps[:10], 1):
+            fpath   = ep.get("file", dir_path)
+            handler = ep.get("handler", Path(fpath).stem)
+
+            # Build readable action: handler name + first 2 branch conditions
+            branches = ep.get("branch_map", ep.get("branches", []))
+            conditions = [
+                b["condition"] for b in branches
+                if isinstance(b, dict) and b.get("condition")
+            ]
+            action = handler
+            if conditions:
+                action += f" [{', '.join(conditions[:2])}]"
+
+            # Auth guard
+            ag = ep.get("auth_guard")
+            auth_req = (
+                bool(ag) and ag.get("present", True)
+                if isinstance(ag, dict) else bool(ag)
+            )
+
+            steps.append(FlowStep(
+                step_num      = i,
+                page          = Path(fpath).name,
+                action        = action,
+                http_method   = "CLIENT",
+                auth_required = auth_req,
+                db_ops        = [],
+                inputs        = [],
+                outputs       = [],
+            ))
+
+            # Collect branches for skeleton
+            for b in branches[:3]:
+                if isinstance(b, dict) and b.get("condition"):
+                    all_branches.append({
+                        "condition": b["condition"],
+                        "alternate": [b.get("outcome", "")],
+                    })
+
+        if not steps:
+            continue
+
+        skeletons.append({
+            "path_nodes":       [],
+            "files":            files_in_dir,
+            "steps":            steps,
+            "branches":         all_branches[:8],
+            "evidence_files":   files_in_dir,
+            "raw_confidence":   0.40,
+            "_gap_fill_module": dir_path,
+            "_client_side":     True,
+        })
+
+    return skeletons
+
+
 # ─── Route Gap Stub Generator (Lite Dynamic Analysis) ─────────────────────────
 
 def _generate_missing_route_stubs(
@@ -791,6 +884,17 @@ def run(ctx: PipelineContext) -> None:
     print("  [stage45] Pass D–E: Stitching execution_paths onto graph paths ...")
     flow_skeletons = _stitch_execution_paths(all_raw, ctx, G)
     print(f"  [stage45]   {len(flow_skeletons)} flow skeleton(s) built")
+
+    # ── Client-side fallback: pure front-end apps (React/Next.js+Firebase) ──
+    # When graph traversal yields nothing (no server routes), build skeletons
+    # directly from CLIENT execution_paths grouped by component file.
+    _exec_paths_all = getattr(ctx.code_map, "execution_paths", None) or []
+    if not flow_skeletons and _exec_paths_all:
+        _client_skeletons = _build_client_side_skeletons(_exec_paths_all)
+        if _client_skeletons:
+            print(f"  [stage45]   Client-side fallback: "
+                  f"{len(_client_skeletons)} component skeleton(s)")
+            flow_skeletons.extend(_client_skeletons)
 
     # Back-fill branches AFTER stitching — _stitch_execution_paths creates
     # entirely new skeleton dicts so any branches filled in all_raw would be
