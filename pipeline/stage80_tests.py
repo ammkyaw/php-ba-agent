@@ -599,11 +599,58 @@ _FORMAT_SYSTEM: dict[str, str] = {
 }
 
 
+def _extract_format_content(raw: str, fmt: str) -> str:
+    """
+    Extract format content from raw LLM response using multiple strategies:
+    1. Delimiter tags  ---GHERKIN--- / ---END_GHERKIN---
+    2. Markdown code fence  ```gherkin / ``` or ```javascript / ``` or ```python / ```
+    3. Truncated delimiter (start tag present, end tag missing)
+    4. Bare response (whole response treated as content)
+    """
+    start_tag, end_tag = _DELIMITERS[fmt]
+
+    # Strategy 1: delimiters
+    pattern = re.escape(start_tag) + r"\s*(.*?)\s*" + re.escape(end_tag)
+    m = re.search(pattern, raw, re.DOTALL)
+    if m:
+        return m.group(1).strip()
+
+    # Strategy 2: markdown code fences
+    _FENCE_LANGS: dict[str, list[str]] = {
+        "gherkin":    ["gherkin", "feature", "cucumber"],
+        "playwright": ["javascript", "js", "typescript", "ts"],
+        "pytest":     ["python", "py"],
+    }
+    for lang in _FENCE_LANGS.get(fmt, []):
+        fence_pat = rf"```{lang}\s*(.*?)\s*```"
+        fm = re.search(fence_pat, raw, re.DOTALL | re.IGNORECASE)
+        if fm:
+            return fm.group(1).strip()
+    # generic fence
+    generic = re.search(r"```\s*(.*?)\s*```", raw, re.DOTALL)
+    if generic:
+        return generic.group(1).strip()
+
+    # Strategy 3: truncated delimiter
+    if start_tag in raw:
+        return raw[raw.index(start_tag) + len(start_tag):].strip()
+
+    # Strategy 4: bare response — use as-is if non-empty
+    stripped = raw.strip()
+    if stripped:
+        return stripped
+
+    return ""
+
+
 def _call_single_format(base_user: str, fmt: str, chunk_idx: int) -> str:
     """Call LLM for one format (gherkin/playwright/pytest) and return extracted content."""
-    start_tag, end_tag = _DELIMITERS[fmt]
+    start_tag, _end_tag = _DELIMITERS[fmt]
     label = f"{STAGE_NAME}_chunk{chunk_idx}_{fmt}"
-    user_prompt = base_user + "\n" + _FORMAT_INSTRUCTIONS[fmt]
+
+    # Prefill: end the user prompt with the start tag so the model continues from it
+    # rather than needing to emit the tag itself — more reliable on local models.
+    user_prompt = base_user + "\n" + _FORMAT_INSTRUCTIONS[fmt] + f"\n{start_tag}\n"
 
     raw = call_llm(
         system_prompt = _FORMAT_SYSTEM[fmt],
@@ -612,31 +659,19 @@ def _call_single_format(base_user: str, fmt: str, chunk_idx: int) -> str:
         label         = label,
     )
 
-    # Extract content between delimiters
-    pattern = re.escape(start_tag) + r"\s*(.*?)\s*" + re.escape(end_tag)
-    m = re.search(pattern, raw, re.DOTALL)
-    if m:
-        return m.group(1).strip()
-
-    # Truncation: start tag present but end tag missing → take everything after start
-    if start_tag in raw:
-        content = raw[raw.index(start_tag) + len(start_tag):].strip()
-        print(f"  [{STAGE_NAME}] ⚠️  Chunk {chunk_idx} {fmt}: truncated — using partial content.")
+    content = _extract_format_content(raw, fmt)
+    if content:
         return content
 
-    # Retry once with a stronger nudge
-    print(f"  [{STAGE_NAME}] ⚠️  Chunk {chunk_idx} {fmt}: no delimiter found — retrying ...")
+    # Last resort retry
+    print(f"  [{STAGE_NAME}] ⚠️  Chunk {chunk_idx} {fmt}: empty — retrying ...")
     retry_raw = call_llm(
         system_prompt = _FORMAT_SYSTEM[fmt],
-        user_prompt   = user_prompt + f"\n\nIMPORTANT: Start your response with {start_tag} immediately.",
+        user_prompt   = user_prompt,
         max_tokens    = MAX_TOKENS,
         label         = f"{label}_retry",
     )
-    m2 = re.search(pattern, retry_raw, re.DOTALL)
-    if m2:
-        return m2.group(1).strip()
-    if start_tag in retry_raw:
-        return retry_raw[retry_raw.index(start_tag) + len(start_tag):].strip()
-
-    print(f"  [{STAGE_NAME}] ⚠️  Chunk {chunk_idx} {fmt}: retry also empty — skipping.")
-    return ""
+    result = _extract_format_content(retry_raw, fmt)
+    if not result:
+        print(f"  [{STAGE_NAME}] ⚠️  Chunk {chunk_idx} {fmt}: retry also empty — skipping.")
+    return result
