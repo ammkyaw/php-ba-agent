@@ -192,8 +192,33 @@ def _find_handlers(src: str, rel: str) -> list[dict]:
         ):
             fn_name = m.group(1)
             body = _extract_function_body(src, m.end() - 1)
-            # Pages Router handler handles all methods
             handlers.append({"name": fn_name, "http_method": "ANY", "route": _route_from_path(rel), "body": body})
+
+    # Client-side action handlers (pure frontend apps: Firebase, Supabase, etc.)
+    # Extract async functions whose names suggest user actions: handleX, onX, submitX
+    if not handlers:  # only fall back to client-side if no server handlers found
+        for m in re.finditer(
+            r"(?:const|async function)\s+(handle\w+|on[A-Z]\w+|submit\w+|do[A-Z]\w+)\s*"
+            r"(?:=\s*(?:async\s*)?\(|(?:async\s*)?\()",
+            src
+        ):
+            fn_name = m.group(1)
+            body = _extract_function_body(src, m.end() - 1)
+            if not body:
+                continue
+            # Only include if body contains meaningful operations
+            if not re.search(
+                r"await\s|firebase|supabase|fetch\s*\(|axios|signIn|signUp|signOut"
+                r"|\.add\s*\(|\.set\s*\(|\.update\s*\(|\.delete\s*\(|router\.(push|replace)",
+                body, re.IGNORECASE
+            ):
+                continue
+            handlers.append({
+                "name": fn_name,
+                "http_method": "CLIENT",
+                "route": _route_from_path(rel),
+                "body": body,
+            })
 
     return handlers
 
