@@ -91,8 +91,17 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-# ── SQL write operations that represent meaningful state changes ───────────────
-_WRITE_OPS: frozenset[str] = frozenset({"INSERT", "UPDATE", "DELETE", "REPLACE"})
+# ── Write operations that represent meaningful state changes ──────────────────
+# Covers SQL/ORM and Firestore client SDK (read ops getDocs/getDoc excluded).
+_WRITE_OPS: frozenset[str] = frozenset({
+    # SQL / traditional ORM
+    "INSERT", "UPDATE", "DELETE", "REPLACE",
+    # Firestore client SDK
+    "ADDDOC", "SETDOC", "UPDATEDOC", "DELETEDOC",
+    "RUNTRANSACTION", "WRITEBATCH",
+    # React Query / Async Hooks
+    "USEMUTATION",
+})
 
 # ── Tables too generic to be informative ──────────────────────────────────────
 _SKIP_TABLES: frozenset[str] = frozenset({"", "unknown", "temp", "tmp", "dual"})
