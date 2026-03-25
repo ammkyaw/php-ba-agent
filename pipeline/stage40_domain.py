@@ -103,6 +103,7 @@ _CAP_CALL_GRAPH    = int(os.environ.get("STAGE4_CAP_CALL_GRAPH",     "40")  or "
 _CAP_FORM_FILES    = int(os.environ.get("STAGE4_CAP_FORM_FILES",     "60")  or "60")
 _CAP_REDIRECTS     = int(os.environ.get("STAGE4_CAP_REDIRECTS",      "60")  or "60")
 _CAP_AUTH_SIGNALS  = int(os.environ.get("STAGE4_CAP_AUTH_SIGNALS",   "40")  or "40")
+_CAP_COMPONENTS    = int(os.environ.get("STAGE4_CAP_COMPONENTS",     "60")  or "60")
 
 
 
@@ -980,6 +981,107 @@ def _build_user_prompt(ctx: PipelineContext, chunks: list[dict]) -> str:
                 parts.append(f"  {kind} {name}  [{src_f}]  (no fields extracted)")
         if _omitted_ty:
             parts.append(f"  … +{_omitted_ty} more type definitions omitted")
+
+    # ── Component hierarchy (stage22) ────────────────────────────────────────
+    # Feed page-level component trees to the LLM so it sees distinct features
+    # (e.g. SprintPlanningTab, RiskRegisterTab) as separate documented features
+    # rather than one undifferentiated "Dashboard" page.
+    components = getattr(cm, "components", None) or []
+    if components:
+        pages    = [c for c in components if c.get("is_page")]
+        non_pages = [c for c in components if not c.get("is_page")]
+
+        # Build a name→file lookup for quick child resolution
+        _name_to_file: dict[str, str] = {
+            c["name"]: c["file"] for c in components if c.get("name") and c.get("file")
+        }
+
+        _shown_comps = components[:_CAP_COMPONENTS] if _CAP_COMPONENTS > 0 else components
+        _omit_comp   = len(components) - len(_shown_comps)
+
+        parts.append(
+            f"\n=== COMPONENT HIERARCHY ({len(components)} total"
+            + (f", showing {len(_shown_comps)}" if _omit_comp else "")
+            + f" | {len(pages)} page(s), {len(non_pages)} shared component(s)) ==="
+        )
+        parts.append(
+            "These are the frontend React/Vue components extracted from Stage 2.2. "
+            "Page-level components are labelled with their route. "
+            "Each component's children list reveals sub-features visible on that page. "
+            "Use this hierarchy to identify distinct functional areas and user workflows."
+        )
+
+        # Show pages first (they are the feature entry points)
+        _page_shown = 0
+        for comp in _shown_comps:
+            if not comp.get("is_page"):
+                continue
+            _page_shown += 1
+            name   = comp.get("name", "?")
+            file_  = comp.get("file", "?")
+            route  = comp.get("route", "")
+            hooks  = comp.get("hooks", [])
+            ch     = comp.get("children", [])
+            props  = comp.get("props", [])
+
+            route_str = f"  route={route}" if route else ""
+            parts.append(f"\n  [PAGE] {name}  ({file_}){route_str}")
+            if props:
+                parts.append(f"    props: {', '.join(props[:8])}")
+            if hooks:
+                parts.append(f"    hooks: {', '.join(hooks[:6])}")
+            if ch:
+                # Prefer pre-resolved children_files dict (stage22 post-process);
+                # fall back to runtime lookup for old component_graph.json files.
+                # children_files values are list[str] — len>1 means a name collision.
+                _cf = comp.get("children_files") or {}
+                ch_resolved = []
+                for child_name in ch[:12]:
+                    paths = _cf.get(child_name)
+                    if paths is None:
+                        # old graph (str value) or runtime fallback
+                        legacy = _name_to_file.get(child_name)
+                        paths = [legacy] if legacy else None
+                    elif isinstance(paths, str):
+                        # old graph serialised as plain string — normalise to list
+                        paths = [paths]
+                    if paths:
+                        if len(paths) == 1:
+                            ch_resolved.append(f"{child_name} ({paths[0]})")
+                        else:
+                            # Ambiguous: two+ components share this name
+                            joined = ", ".join(paths[:3])
+                            ch_resolved.append(
+                                f"{child_name} ({len(paths)} matches: {joined})"
+                            )
+                    else:
+                        ch_resolved.append(child_name)
+                parts.append(f"    children: {', '.join(ch_resolved)}")
+
+        # Then shared/reusable components (condensed — one line each)
+        _shared_lines = []
+        for comp in _shown_comps:
+            if comp.get("is_page"):
+                continue
+            name   = comp.get("name", "?")
+            file_  = comp.get("file", "?")
+            hooks  = comp.get("hooks", [])
+            ch     = comp.get("children", [])
+            line   = f"  [COMPONENT] {name}  ({file_})"
+            if hooks:
+                line += f"  hooks=[{', '.join(hooks[:4])}]"
+            if ch:
+                line += f"  children=[{', '.join(ch[:6])}]"
+            _shared_lines.append(line)
+
+        if _shared_lines:
+            parts.append("\n  Shared / reusable components:")
+            parts.extend(_shared_lines[:30])   # cap to avoid excessive prompt bloat
+            if len(_shared_lines) > 30:
+                parts.append(f"  … +{len(_shared_lines) - 30} more shared components omitted")
+
+        if _omit_comp:
+            parts.append(f"  … +{_omit_comp} more components omitted (raise STAGE4_CAP_COMPONENTS to include)")
 
     # ── Form inputs summary ───────────────────────────────────────────────────
     if cm.superglobals:

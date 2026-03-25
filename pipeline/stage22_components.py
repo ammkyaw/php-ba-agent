@@ -83,6 +83,9 @@ def run(ctx: PipelineContext) -> None:
     # ── Resume check ──────────────────────────────────────────────────────────
     if ctx.is_stage_done("stage22_components") and Path(output_path).exists():
         components = json.loads(Path(output_path).read_text(encoding="utf-8"))
+        # Back-fill children_files for graphs written before this feature was added
+        if components and "children_files" not in components[0]:
+            _resolve_children_files(components)
         ctx.code_map.components = components
         print(f"  [stage22] Resuming — {len(components)} component(s) loaded")
         return
@@ -111,6 +114,9 @@ def run(ctx: PipelineContext) -> None:
             seen.add(c["file"])
             deduped.append(c)
     components = deduped
+
+    # Resolve child component names → file paths
+    _resolve_children_files(components)
 
     # Persist
     Path(output_path).parent.mkdir(parents=True, exist_ok=True)
@@ -323,6 +329,35 @@ def _rel(path: Path, root: Path) -> str:
         return str(path.relative_to(root)).replace("\\", "/")
     except ValueError:
         return str(path).replace("\\", "/")
+
+
+def _resolve_children_files(components: list[dict]) -> None:
+    """
+    Post-process pass: for each component's ``children`` list (PascalCase names),
+    add a ``children_files`` dict mapping name → list[str] of file paths using
+    the already-built component list as a lookup table.
+
+    The value is always a list so that name collisions (two components sharing
+    the same name in different directories, e.g. auth/SubmitButton.tsx vs
+    forms/SubmitButton.tsx) are preserved rather than silently overwritten.
+    A unique name maps to a one-element list; an ambiguous name maps to all
+    matching paths. Downstream renderers use list length to decide how to display.
+    """
+    # Build name → [files] — accumulate all paths for each name
+    name_to_files: dict[str, list[str]] = {}
+    for c in components:
+        name = c.get("name")
+        file_ = c.get("file")
+        if name and file_:
+            name_to_files.setdefault(name, []).append(file_)
+
+    for comp in components:
+        ch = comp.get("children", [])
+        comp["children_files"] = {
+            name: name_to_files[name]
+            for name in ch
+            if name in name_to_files
+        }
 
 
 def _print_summary(components: list[dict]) -> None:
