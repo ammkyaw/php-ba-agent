@@ -240,6 +240,8 @@ def _run_brd_agent(domain: DomainModel, ctx: PipelineContext) -> str:
     # these tokens are processed ONCE and cached (Claude prefix cache + Ollama
     # KV cache). Each section's user prompt then contains only the section-
     # specific instructions — a fraction of the total token cost.
+    tech_stack_block = _build_tech_stack_block(ctx)
+
     system = _append_traceability_hints(f"""You are a senior Business Analyst writing a formal Business Requirements Document (BRD).
 Write in professional business language using actual system names from the evidence.
 Use proper Markdown with headers, bullet points, and tables.
@@ -252,7 +254,7 @@ Quality rules:
 - Each feature section must state at least one measurable acceptance criterion
 - Output ONLY the requested section(s) — no preamble, no extra commentary
 
-Framework context: {hints.brd_note}{_preflight_system_note(ctx)}
+Framework context: {hints.brd_note}{_preflight_system_note(ctx)}{tech_stack_block}
 
 {domain_hdr}
 User Roles:
@@ -349,7 +351,8 @@ def _run_srs_agent(domain: DomainModel, ctx: PipelineContext) -> str:
     from pipeline.evidence_index import build_evidence_index, format_evidence_block
     from pipeline.framework_hints import get_hints
 
-    hints  = get_hints(ctx.code_map.framework if ctx.code_map else "unknown")
+    hints            = get_hints(ctx.code_map.framework if ctx.code_map else "unknown")
+    tech_stack_block = _build_tech_stack_block(ctx)
     ev_idx = build_evidence_index(ctx, domain)
 
     domain_hdr   = _compact_domain_header(domain)
@@ -394,7 +397,7 @@ Quality rules:
 - Never leave placeholder text like "TBD" or "as required"
 - Output ONLY the requested section(s)
 
-{hints.srs_note}{_preflight_system_note(ctx)}
+{hints.srs_note}{_preflight_system_note(ctx)}{tech_stack_block}
 
 {domain_hdr}{env_block}{gc_ctx}
 {spec_block}""")
@@ -488,7 +491,8 @@ def _run_ac_agent(domain: DomainModel, ctx: PipelineContext) -> str:
     from pipeline.evidence_index import build_evidence_index, format_evidence_block
     from pipeline.framework_hints import get_hints
 
-    hints  = get_hints(ctx.code_map.framework if ctx.code_map else "unknown")
+    hints            = get_hints(ctx.code_map.framework if ctx.code_map else "unknown")
+    tech_stack_block = _build_tech_stack_block(ctx)
     ev_idx = build_evidence_index(ctx, domain)
     spec_block = _format_spec_rules_for_prompt(ctx)
     domain_hdr = _compact_domain_header(domain)
@@ -508,7 +512,7 @@ Quality rules:
 - Do NOT write vague criteria like "system works correctly"
 - Output ONLY the requested section(s)
 
-{hints.ac_template}
+{hints.ac_template}{tech_stack_block}
 
 {domain_hdr}
 {spec_block}""")
@@ -622,7 +626,8 @@ def _run_userstories_agent(domain: DomainModel, ctx: PipelineContext) -> str:
     from pipeline.evidence_index import build_evidence_index, format_evidence_block
     from pipeline.framework_hints import get_hints
 
-    hints  = get_hints(ctx.code_map.framework if ctx.code_map else "unknown")
+    hints            = get_hints(ctx.code_map.framework if ctx.code_map else "unknown")
+    tech_stack_block = _build_tech_stack_block(ctx)
     ev_idx = build_evidence_index(ctx, domain)
 
     spec_block = _format_spec_rules_for_prompt(ctx, categories=["WORKFLOW", "AUTHORIZATION"])
@@ -642,7 +647,7 @@ Quality rules:
 - "So that" = concrete business benefit, not "the system works"
 - Output ONLY the requested section(s)
 
-{hints.story_note}
+{hints.story_note}{tech_stack_block}
 
 {domain_hdr}
 {spec_block}""")
@@ -1268,6 +1273,174 @@ def _preflight_system_note(ctx: PipelineContext) -> str:
         + "\n\nWrite around these gaps — do not fabricate evidence for sections "
         + "where signals are absent."
     )
+
+
+def _build_tech_stack_block(ctx) -> str:
+    """Parse package.json (and optional next.config / firebase config) from the
+    project root and return a formatted TECH STACK GROUND TRUTH block for
+    injection into BA agent system prompts as an inviolable guardrail.
+
+    Returns an empty string if package.json is not found (non-JS projects).
+    """
+    import json as _json
+    from pathlib import Path as _Path
+
+    root = _Path(getattr(ctx, "project_path", "") or "")
+    
+    # ── 1. Parse dependencies from package.json ───────────────────────────────
+    deps = {}
+    pkg_path = root / "package.json"
+    if pkg_path.exists():
+        try:
+            pkg = _json.loads(pkg_path.read_text(encoding="utf-8", errors="ignore"))
+            deps = {**pkg.get("dependencies", {}), **pkg.get("devDependencies", {})}
+        except Exception:
+            pass
+
+    # ── 2. Check for config files as strong signals ───────────────────────────
+    # next.config.* and tailwind.config.* always live at the project root.
+    has_next_config = any(root.glob("next.config.*"))
+    has_tailwind    = any(root.glob("tailwind.config.*"))
+    # Firebase config can live at the root (firebase.json = CLI config) OR in
+    # common subdirectories (src/lib/firebase.ts etc.).  Only check explicit
+    # extensions to avoid matching unrelated files like firebase.bak / firebase.md.
+    _FIREBASE_PATHS = [
+        "firebase.json",
+        "firebase.ts",          "firebase.js",
+        "src/lib/firebase.ts",  "src/lib/firebase.js",
+        "lib/firebase.ts",      "lib/firebase.js",
+        "src/firebase.ts",      "src/firebase.js",
+        "src/config/firebase.ts", "src/config/firebase.js",
+    ]
+    has_firebase = any((root / p).exists() for p in _FIREBASE_PATHS)
+
+    if not deps and not (has_next_config or has_tailwind or has_firebase):
+        return ""
+
+    # ── Categorise dependencies ───────────────────────────────────────────────
+    _DB       = {"firebase", "@firebase/firestore", "firebase-admin", "prisma",
+                 "@prisma/client", "mongoose", "pg", "mysql2", "better-sqlite3",
+                 "drizzle-orm", "typeorm", "sequelize", "redis", "ioredis",
+                 "supabase", "@supabase/supabase-js"}
+    _AUTH     = {"next-auth", "@auth/core", "firebase", "firebase-admin",
+                 "passport", "jsonwebtoken", "jose", "clerk", "@clerk/nextjs",
+                 "lucia", "better-auth"}
+    _UI       = {"@shadcn/ui", "shadcn-ui", "@radix-ui/react-dialog",
+                 "@radix-ui/react-dropdown-menu", "lucide-react",
+                 "react-icons", "@heroicons/react", "framer-motion",
+                 "antd", "@mui/material", "@chakra-ui/react",
+                 "mantine", "daisyui"}
+    _STYLING  = {"tailwindcss", "@tailwindcss/forms", "styled-components",
+                 "@emotion/react", "sass", "postcss"}
+    _STATE    = {"@tanstack/react-query", "react-query", "swr", "zustand",
+                 "jotai", "@reduxjs/toolkit", "redux", "mobx", "recoil",
+                 "valtio"}
+    _FORMS    = {"react-hook-form", "formik", "zod", "yup", "@hookform/resolvers"}
+    _RUNTIME  = {"next", "nuxt", "react", "react-dom", "vue", "@angular/core",
+                 "express", "fastify", "@nestjs/core", "hono", "remix"}
+
+    def _match(category: set) -> list[str]:
+        return sorted(k for k in deps if any(k == c or k.startswith(c + "/")
+                                             for c in category))
+
+    runtime  = set(_match(_RUNTIME))
+    database = set(_match(_DB))
+    auth     = set(_match(_AUTH))
+    ui_libs  = set(_match(_UI))
+    styling  = set(_match(_STYLING))
+    state    = set(_match(_STATE))
+    forms    = set(_match(_FORMS))
+
+    if has_next_config:
+        runtime.add("next")
+    if has_tailwind:
+        styling.add("tailwindcss")
+    if has_firebase:
+        database.add("firebase")
+        auth.add("firebase")
+
+    runtime  = sorted(list(runtime))
+    database = sorted(list(database))
+    auth     = sorted(list(auth))
+    ui_libs  = sorted(list(ui_libs))
+    styling  = sorted(list(styling))
+    state    = sorted(list(state))
+    forms    = sorted(list(forms))
+
+    # ── Derive human-readable database label ──────────────────────────────────
+    db_label = "unknown"
+    if any("firebase" in d for d in database):
+        db_label = "Firebase Firestore (NoSQL document store — NOT a relational database)"
+    elif any("supabase" in d for d in database):
+        db_label = "Supabase (PostgreSQL-backed — relational database)"
+    elif any("prisma" in d or "mongoose" in d or "drizzle" in d
+             or "typeorm" in d or "sequelize" in d for d in database):
+        db_label = next(
+            (d for d in database if any(x in d for x in
+             ("prisma","mongoose","drizzle","typeorm","sequelize"))),
+            database[0] if database else "ORM detected"
+        )
+    elif database:
+        db_label = ", ".join(database)
+
+    # ── Derive auth label ─────────────────────────────────────────────────────
+    auth_label = "unknown"
+    if any("firebase" in a for a in auth):
+        auth_label = "Firebase Authentication"
+    elif "next-auth" in auth or "@auth/core" in auth:
+        auth_label = "NextAuth.js"
+    elif any("clerk" in a for a in auth):
+        auth_label = "Clerk"
+    elif auth:
+        auth_label = ", ".join(auth)
+
+    # ── Read Next.js version for runtime label ────────────────────────────────
+    runtime_label = ""
+    if "next" in deps:
+        runtime_label = f"Next.js {deps['next'].lstrip('^~')} (App Router), TypeScript"
+    elif "next" in runtime:
+        runtime_label = "Next.js (App Router), TypeScript"
+    elif runtime:
+        runtime_label = ", ".join(runtime)
+
+    # ── Compose the guardrail block ───────────────────────────────────────────
+    lines: list[str] = [
+        "\nTECH STACK GROUND TRUTH (parsed from package.json — treat as inviolable):",
+    ]
+    if runtime_label:
+        lines.append(f"  Runtime    : {runtime_label}")
+    if db_label != "unknown":
+        lines.append(f"  Database   : {db_label}")
+    if auth_label != "unknown":
+        lines.append(f"  Auth       : {auth_label}")
+    if ui_libs:
+        lines.append(f"  UI libs    : {', '.join(ui_libs)}")
+    if styling:
+        lines.append(f"  Styling    : {', '.join(styling)}")
+    if state:
+        lines.append(f"  Data/State : {', '.join(state)}")
+    if forms:
+        lines.append(f"  Forms      : {', '.join(forms)}")
+
+    lines += [
+        "",
+        "STRICT GUARDRAILS — violating these rules is a hallucination:",
+    ]
+    if any("firebase" in d for d in database):
+        lines += [
+            "  ✗ NEVER describe storage as SQL, relational, PostgreSQL, or MySQL",
+            "  ✗ NEVER describe database tables — Firestore uses collections and documents",
+        ]
+    if "next" in deps or "next" in runtime:
+        lines += [
+            "  ✗ NEVER describe this as a PHP, Laravel, monolithic, or legacy backend",
+            "  ✗ NEVER invent backend technology not listed above",
+        ]
+    lines.append(
+        "  ✓ Every architecture or technology claim MUST reference the list above"
+    )
+
+    return "\n".join(lines)
 
 
 def _append_traceability_hints(system_prompt: str) -> str:
