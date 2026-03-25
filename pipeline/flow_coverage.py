@@ -215,8 +215,10 @@ def _compute(ctx: Any) -> dict[str, Any]:
             if handler_file:
                 route_files.add(handler_file)
             else:
-                # Closure / inline route — fall back to definition file basename
-                route_files.add(Path(r["file"]).name.lower())
+                # Closure / inline route — fall back to definition file basename or NextJS directory anchor
+                key = r.get("dir") or r.get("file") or ""
+                if key:
+                    route_files.add(Path(key).name.lower())
     rt_covered = route_files & module_flow_pages
     rt_missing = sorted(route_files - module_flow_pages)
 
