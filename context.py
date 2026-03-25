@@ -174,8 +174,9 @@ class CodeMap:
     table_columns:   list[dict[str, Any]] = field(default_factory=list)
     globals:         list[dict[str, Any]] = field(default_factory=list)
     execution_paths: list[dict[str, Any]] = field(default_factory=list)
-    components:      list[dict[str, Any]] = field(default_factory=list)   # NEW (Vue/React/Angular)
-    input_params:    list[dict[str, Any]] = field(default_factory=list)   # NEW (replaces superglobals)
+    components:       list[dict[str, Any]] = field(default_factory=list)   # NEW (Vue/React/Angular)
+    input_params:     list[dict[str, Any]] = field(default_factory=list)   # NEW (replaces superglobals)
+    type_definitions: list[dict[str, Any]] = field(default_factory=list)   # TS interfaces & type aliases
 
     # -- PHP-specific fields (backward compat, avoid in new parsers) ----------
     php_version:  Optional[str]        = None   # DEPRECATED → language_version
