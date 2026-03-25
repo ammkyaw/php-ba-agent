@@ -451,17 +451,17 @@ def _extract_nextjs_routes(src_file: Path, root: Path, rel: str, routes: list) -
                 src_content
             ):
                 methods_found = True
-                routes.append({"method": method, "path": path or "/", "file": dir_rel, "kind": "nextjs_app_route"})
+                routes.append({"method": method, "path": path or "/", "file": rel, "dir": dir_rel, "kind": "nextjs_app_api"})
             
             if not methods_found:
-                routes.append({"method": "ANY", "path": path or "/", "file": dir_rel, "kind": "nextjs_app_route"})
+                routes.append({"method": "ANY", "path": path or "/", "file": rel, "dir": dir_rel, "kind": "nextjs_app_api"})
                 
         # Page routes: app/**/page.tsx
         elif src_file.name in ("page.tsx", "page.ts", "page.jsx", "page.js"):
             path_parts = parts[idx+1:-1]
             path = _normalise_path(path_parts)
             dir_rel = str(Path(rel).parent).replace("\\", "/")
-            routes.append({"method": "GET", "path": path or "/", "file": dir_rel, "kind": "nextjs_app_route"})
+            routes.append({"method": "GET", "path": path or "/", "file": rel, "dir": dir_rel, "kind": "nextjs_page"})
 
 
 def _extract_vue_router_routes(source_files: list[Path], root: Path, routes: list) -> None:
