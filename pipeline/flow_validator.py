@@ -941,7 +941,9 @@ def _check_form_coverage(
 
     total = covered_count + len(uncovered)
     if total == 0:
-        pct, status, icon = 1.0, "ok", "✅"
+        # Warn rather than silently pass — "no forms found" may mean the
+        # parser missed React-controlled forms, not that the app has none.
+        pct, status, icon = 0.0, "warn", "⚠️"
     else:
         pct = covered_count / total
         status, icon = _cov_status(pct)
@@ -953,7 +955,7 @@ def _check_form_coverage(
         "covered":   covered_count,
         "total":     total,
         "pct":       round(pct, 4),
-        "detail":    ("N/A (no HTML forms detected)" if total == 0
+        "detail":    ("No forms detected (check for React-controlled forms)" if total == 0
                       else f"{covered_count}/{total} ({pct:.0%}) forms covered by flows"),
         "uncovered": uncovered[:_MAX_LIST],
     }

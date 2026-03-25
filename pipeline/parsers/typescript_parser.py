@@ -333,10 +333,69 @@ def _extract_call_graph(src: str, rel: str, call_graph: list) -> None:
 
 
 def _extract_form_fields(src: str, rel: str, form_fields: list) -> None:
-    # Zod / Yup schema fields: z.object({ email: z.string(), password: ... })
+    # ── Zod / Yup schema fields ────────────────────────────────────────────────
+    # z.object({ email: z.string(), password: ... })
     for m in re.finditer(r"z\.object\s*\(\s*\{([^}]{0,500})\}", src):
         for field_m in re.finditer(r"(\w+)\s*:", m.group(1)):
             form_fields.append({"file": rel, "field": field_m.group(1), "source": "zod"})
+
+    # ── React-controlled form containers ──────────────────────────────────────
+    # 1. Native JSX: <form onSubmit={handleLogin}> or <form onSubmit={(e) => {...}}>
+    #    [^}]+ stops at the first } so block-body inline functions are truncated.
+    #    Since the handler field is purely informational (V-07 only needs file/method),
+    #    we normalise any inline function to the label "(inline)".
+    for m in re.finditer(
+        r"<form\b[^>]*\bonSubmit\s*=\s*\{([^}]+)\}",
+        src, re.IGNORECASE
+    ):
+        raw = m.group(1).strip()
+        handler = "(inline)" if (raw.startswith("(") or "=>" in raw) else raw
+        form_fields.append({
+            "file": rel, "source": "react_form",
+            "method": "POST", "action": "", "handler": handler,
+        })
+
+    # 2. Next.js Server Actions: <form action={serverActionFn}>
+    #    action={fn} holds a function reference (not a URL) that IS the server
+    #    action.  Storing the function name in action lets flow coverage link it
+    #    to execution paths.  Exclude plain string literals ("/path") which are
+    #    traditional HTML actions handled separately.
+    for m in re.finditer(
+        r"<form\b[^>]*\baction\s*=\s*\{(\w+)\}",
+        src, re.IGNORECASE
+    ):
+        action_fn = m.group(1).strip()
+        form_fields.append({
+            "file": rel, "source": "server_action",
+            "method": "POST", "action": action_fn,
+        })
+
+    # 3. React Hook Form: useForm() / useForm<Schema>()
+    if re.search(r"\buseForm\s*[<(]", src):
+        form_fields.append({
+            "file": rel, "source": "rhf",
+            "method": "POST", "action": "",
+        })
+
+    # 4. Shadcn UI / RHF <Form> wrapper component
+    if re.search(r"<Form\b", src):
+        form_fields.append({
+            "file": rel, "source": "shadcn_form",
+            "method": "POST", "action": "",
+        })
+
+    # ── React form field names ─────────────────────────────────────────────────
+    # 4. RHF register("fieldName") / register("fieldName", { ... })
+    for m in re.finditer(r"\bregister\s*\(\s*['\"`](\w+)['\"`]", src):
+        form_fields.append({"file": rel, "field": m.group(1), "source": "rhf"})
+
+    # 5. <Input name="fieldName"> / <input name="fieldName"> (native + Shadcn)
+    for m in re.finditer(r"<[Ii]nput\b[^>]{0,200}\bname\s*=\s*['\"`](\w+)['\"`]", src):
+        form_fields.append({"file": rel, "field": m.group(1), "source": "react_input"})
+
+    # 6. RHF <Controller name="fieldName"> wrapper
+    for m in re.finditer(r"<Controller\b[^>]{0,200}\bname\s*=\s*['\"`](\w+)['\"`]", src):
+        form_fields.append({"file": rel, "field": m.group(1), "source": "rhf_controller"})
 
 
 def _extract_sql_queries(src: str, rel: str, sql_queries: list) -> None:
