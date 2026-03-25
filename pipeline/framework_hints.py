@@ -2,7 +2,7 @@
 pipeline/framework_hints.py — Framework-specific prompt hints for BA agents.
 
 Provides context strings injected into Stage 5 and Stage 6 prompts to
-tailor BA documentation for Laravel, Symfony, WordPress, CodeIgniter, and raw PHP.
+tailor BA documentation for all supported frameworks (PHP, TypeScript, Java).
 
 Usage:
     from pipeline.framework_hints import get_hints
@@ -220,8 +220,238 @@ _HINTS: dict[Framework, FrameworkHints] = {
         ),
     ),
 
+    # ── TypeScript / JavaScript frameworks ────────────────────────────────────
+
+    Framework.NEXTJS: FrameworkHints(
+        name        = "Next.js (App Router)",
+        brd_note    = (
+            "This is a Next.js application using the App Router (src/app/ directory). "
+            "Business requirements should reference React Server Components and Client "
+            "Components as the UI layer, Next.js Server Actions or API Route Handlers "
+            "(route.ts) as the server-side logic layer, and the detected data store "
+            "(see Tech Stack block) as the persistence layer. "
+            "Do NOT describe this as a PHP, monolithic, or legacy backend."
+        ),
+        srs_note    = (
+            "Next.js App Router specifics to include in functional requirements:\n"
+            "- Pages live in src/app/**/page.tsx — reference by their URL path, not filename\n"
+            "- API endpoints are src/app/**/route.ts exporting GET/POST/PUT/PATCH/DELETE\n"
+            "- Server Actions are async functions marked 'use server' — reference by function name\n"
+            "- Client Components are marked 'use client' — these run in the browser\n"
+            "- Layouts (layout.tsx) wrap pages — note shared navigation and auth guards here\n"
+            "- Middleware (middleware.ts) intercepts requests — cite for auth/redirect rules\n"
+            "Reference actual file paths and exported function names in FR entries."
+        ),
+        ac_template = (
+            "Write Acceptance Criteria using Next.js App Router conventions:\n"
+            "- Routes are URL paths matching src/app structure (e.g., GET /api/tasks)\n"
+            "- Auth checks: 'Given the user is unauthenticated, When they access /dashboard, "
+            "Then middleware redirects them to /login'\n"
+            "- Server Actions: 'When the form is submitted, Then createTask() server action "
+            "is invoked and persists data to [detected store]'\n"
+            "- Use 'use client' / 'use server' boundaries where test behaviour differs"
+        ),
+        story_note  = (
+            "Next.js user story conventions:\n"
+            "- Actors map to authenticated/unauthenticated states (reference auth provider)\n"
+            "- Reference page paths as UI surfaces (e.g., '/dashboard', '/projects/[id]')\n"
+            "- API stories should note whether the endpoint is a Route Handler or Server Action\n"
+            "- Dynamic segments ([id], [slug]) should be noted in page references"
+        ),
+        qa_focus    = (
+            "Next.js-specific QA checks:\n"
+            "- Verify route paths match actual src/app directory structure\n"
+            "- Confirm Server Action function names cited in AC match source code\n"
+            "- Check that auth middleware rules are consistently cited across BRD, SRS, and AC\n"
+            "- Ensure data store type (NoSQL/relational) is consistent across all documents"
+        ),
+    ),
+
+    Framework.REACT: FrameworkHints(
+        name        = "React (SPA)",
+        brd_note    = (
+            "This is a React single-page application. Business requirements should reference "
+            "React components as UI surfaces, client-side routing (React Router or similar) "
+            "as navigation, and the detected API/backend as the data layer. "
+            "Do NOT describe this as a server-rendered or PHP application."
+        ),
+        srs_note    = (
+            "React SPA specifics:\n"
+            "- Routes are client-side (React Router): reference path patterns not filenames\n"
+            "- Data fetching uses hooks (useEffect, React Query, SWR) — note the API endpoint\n"
+            "- Forms use controlled components or React Hook Form — reference field names\n"
+            "- Auth state is typically held in Context or a state manager (Redux, Zustand)"
+        ),
+        ac_template = (
+            "Write Acceptance Criteria using React SPA conventions:\n"
+            "- Given: auth state in Context/store\n"
+            "- When: user action triggers component event handler\n"
+            "- Then: API call result updates UI state and component re-renders"
+        ),
+        story_note  = (
+            "React user story conventions:\n"
+            "- Reference route paths and component names as UI surfaces\n"
+            "- Note whether the story requires an API call or is purely client-side"
+        ),
+        qa_focus    = (
+            "React SPA QA checks:\n"
+            "- Verify route paths match React Router configuration\n"
+            "- Confirm API endpoint URLs cited in AC are consistent with the backend\n"
+            "- Check that auth guard components are consistently referenced"
+        ),
+    ),
+
+    Framework.NESTJS: FrameworkHints(
+        name        = "NestJS",
+        brd_note    = (
+            "This is a NestJS application — a structured Node.js backend framework. "
+            "Business requirements should reference Controllers as API entry points, "
+            "Services as business logic, and the detected ORM/database as persistence. "
+            "Do NOT describe this as a PHP or monolithic application."
+        ),
+        srs_note    = (
+            "NestJS specifics:\n"
+            "- Controllers handle HTTP routes — reference @Controller() and @Get/@Post/@Put etc.\n"
+            "- Services encapsulate business logic — reference service class and method names\n"
+            "- DTOs (Data Transfer Objects) define input schemas — reference DTO class names\n"
+            "- Guards (@UseGuards) handle authentication — cite guard names in auth FRs\n"
+            "- Modules group related controllers/services — reference module name as feature boundary"
+        ),
+        ac_template = (
+            "Write Acceptance Criteria using NestJS conventions:\n"
+            "- Routes: HTTP method + path from @Controller + @Get/@Post decorators\n"
+            "- Validation: DTO class-validator rules (e.g., @IsEmail(), @IsNotEmpty())\n"
+            "- Auth: @UseGuards(JwtAuthGuard) — cite the guard name"
+        ),
+        story_note  = (
+            "NestJS user story conventions:\n"
+            "- Reference module names as feature boundaries\n"
+            "- API stories should cite the controller method and HTTP verb"
+        ),
+        qa_focus    = (
+            "NestJS QA checks:\n"
+            "- Verify HTTP verbs and paths match @Controller/@Get/@Post decorator values\n"
+            "- Confirm DTO field names match validation rules cited in AC\n"
+            "- Check Guard names are consistent across auth-related criteria"
+        ),
+    ),
+
+    Framework.EXPRESS: FrameworkHints(
+        name        = "Express.js",
+        brd_note    = (
+            "This is an Express.js Node.js backend. Business requirements should reference "
+            "route handlers as feature entry points and middleware as cross-cutting concerns. "
+            "Do NOT describe this as a PHP application."
+        ),
+        srs_note    = (
+            "Express specifics:\n"
+            "- Routes defined via app.get/post/put/delete or Router instances\n"
+            "- Middleware (app.use) handles auth, validation, logging\n"
+            "- Reference actual route path strings and handler function names"
+        ),
+        ac_template = (
+            "Write AC using Express conventions:\n"
+            "- Reference HTTP method + path (e.g., POST /api/users)\n"
+            "- Cite middleware by name for auth and validation steps"
+        ),
+        story_note  = "Reference route paths and middleware names directly.",
+        qa_focus    = (
+            "Express QA checks:\n"
+            "- Verify route paths are consistent across all documents\n"
+            "- Confirm middleware order is correctly described in auth flows"
+        ),
+    ),
+
+    Framework.FASTIFY: FrameworkHints(
+        name        = "Fastify",
+        brd_note    = (
+            "This is a Fastify Node.js backend. Reference route schemas and hooks "
+            "as the primary technical constructs. Do NOT describe this as PHP."
+        ),
+        srs_note    = (
+            "Fastify specifics:\n"
+            "- Routes registered via fastify.get/post/put/delete with JSON schema validation\n"
+            "- Hooks (onRequest, preHandler) handle auth and preprocessing\n"
+            "- Plugins encapsulate feature modules"
+        ),
+        ac_template = "Reference Fastify route paths, JSON schema field names, and hook names in AC.",
+        story_note  = "Reference plugin/route boundaries as feature surfaces.",
+        qa_focus    = "Verify JSON schema field names match AC validation rules.",
+    ),
+
+    Framework.NUXTJS: FrameworkHints(
+        name        = "Nuxt.js",
+        brd_note    = (
+            "This is a Nuxt.js application (Vue-based full-stack framework). "
+            "Business requirements should reference pages (pages/ directory), "
+            "server API routes (server/api/), and composables as the primary constructs. "
+            "Do NOT describe this as a PHP application."
+        ),
+        srs_note    = (
+            "Nuxt specifics:\n"
+            "- Pages in pages/ use file-system routing — reference by URL path\n"
+            "- Server routes in server/api/ — reference as API endpoints\n"
+            "- Composables (useXxx) encapsulate reusable reactive logic\n"
+            "- Middleware in middleware/ handles route guards"
+        ),
+        ac_template = (
+            "Write AC using Nuxt conventions:\n"
+            "- Reference page paths from the pages/ directory\n"
+            "- Server API routes: method + path under /api/"
+        ),
+        story_note  = "Reference page paths and composable names as feature surfaces.",
+        qa_focus    = "Verify page paths and API routes are consistent across documents.",
+    ),
+
+    Framework.VUE: FrameworkHints(
+        name        = "Vue.js (SPA)",
+        brd_note    = (
+            "This is a Vue.js single-page application. Reference Vue components and "
+            "Vue Router paths as UI surfaces. Do NOT describe this as a PHP application."
+        ),
+        srs_note    = (
+            "Vue SPA specifics:\n"
+            "- Routes defined in Vue Router — reference by path and component name\n"
+            "- Pinia/Vuex stores manage shared state — reference store module names\n"
+            "- Components in src/components/ — reference by component name"
+        ),
+        ac_template = "Reference Vue Router paths and component names in AC.",
+        story_note  = "Reference route paths and store names as feature surfaces.",
+        qa_focus    = "Verify Vue Router paths are consistent across all documents.",
+    ),
+
+    # ── Java frameworks ────────────────────────────────────────────────────────
+
+    Framework.SPRING_BOOT: FrameworkHints(
+        name        = "Spring Boot",
+        brd_note    = (
+            "This is a Spring Boot application. Business requirements should reference "
+            "@RestController endpoints as API entry points, @Service classes as business logic, "
+            "and JPA/Hibernate entities as the data model."
+        ),
+        srs_note    = (
+            "Spring Boot specifics:\n"
+            "- REST endpoints: @GetMapping/@PostMapping etc. on @RestController classes\n"
+            "- Business logic in @Service classes — reference class and method names\n"
+            "- JPA entities in @Entity classes — reference entity and field names\n"
+            "- Security via Spring Security — cite SecurityFilterChain rules for auth FRs"
+        ),
+        ac_template = (
+            "Write AC using Spring Boot conventions:\n"
+            "- HTTP method + path from @RequestMapping values\n"
+            "- @Valid DTO fields for validation rules\n"
+            "- Spring Security roles for auth preconditions"
+        ),
+        story_note  = "Reference @RestController paths and @Entity names as feature surfaces.",
+        qa_focus    = (
+            "Spring Boot QA checks:\n"
+            "- Verify @RequestMapping paths match routes cited in AC\n"
+            "- Confirm @Entity field names match validation rules"
+        ),
+    ),
+
     Framework.UNKNOWN: FrameworkHints(
-        name        = "Unknown PHP Framework",
+        name        = "Unknown Framework",
         brd_note    = "Framework could not be detected. Use filenames and table names as-is.",
         srs_note    = "Reference actual filenames and table names observed in the codebase.",
         ac_template = "Use concrete page names and field names from the domain model.",
