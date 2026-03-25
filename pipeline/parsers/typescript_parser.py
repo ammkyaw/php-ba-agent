@@ -363,11 +363,39 @@ def _extract_sql_queries(src: str, rel: str, sql_queries: list) -> None:
         src
     ):
         sql_queries.append({"file": rel, "orm": "firestore", "table": m.group(1), "operation": "collection"})
+    # Chained form: addDoc(collection(db, 'tasks'), data)
     for m in re.finditer(
         r"(addDoc|setDoc|updateDoc|deleteDoc|getDocs|getDoc|getCountFromServer)\s*\(\s*collection\s*\([^,)]+,\s*['\"`](\w+)['\"`]",
         src
     ):
         sql_queries.append({"file": rel, "orm": "firestore", "table": m.group(2), "operation": m.group(1)})
+    # Pre-referenced form: const ref = collection(db, 'tasks'); addDoc(ref, data)
+    # Table name is unknown but we still record the write so it counts in coverage.
+    _seen_chained = {m.start() for m in re.finditer(
+        r"(addDoc|setDoc|updateDoc|deleteDoc)\s*\(\s*collection\s*\(",
+        src
+    )}
+    for m in re.finditer(
+        r"(addDoc|setDoc|updateDoc|deleteDoc)\s*\(\s*(\w+)",
+        src
+    ):
+        if m.start() in _seen_chained:
+            continue   # already captured by chained form above
+        sql_queries.append({"file": rel, "orm": "firestore", "table": m.group(2), "operation": m.group(1)})
+
+    # React Query / SWR Mutations: useMutation(...)
+    # Note: useMutation is a broad signal — it wraps any async function, not
+    # exclusively DB writes.  It is recorded as a write because in Firebase
+    # projects it almost always wraps a Firestore mutation.
+    for m in re.finditer(r"\buseMutation\s*\(", src):
+        sql_queries.append({"file": rel, "orm": "hooks", "table": "(mutation)", "operation": "useMutation"})
+
+    # Firebase Transactions / Batches — use call-site regex to avoid matching
+    # comments, imports, or unrelated identifiers that contain the substring.
+    if re.search(r"\brunTransaction\s*\(", src):
+        sql_queries.append({"file": rel, "orm": "firestore", "table": "(transaction)", "operation": "runTransaction"})
+    if re.search(r"\bwriteBatch\s*\(", src) or re.search(r"\bbatch\s*\.\s*commit\s*\(", src):
+        sql_queries.append({"file": rel, "orm": "firestore", "table": "(batch)", "operation": "writeBatch"})
 
 
 # ─── Route extractors ─────────────────────────────────────────────────────────
