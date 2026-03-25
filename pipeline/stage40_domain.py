@@ -97,6 +97,7 @@ _CAP_EXEC_PATHS    = int(os.environ.get("STAGE4_CAP_EXEC_PATHS",    "40")  or "4
 _CAP_HTTP_EPS      = int(os.environ.get("STAGE4_CAP_HTTP_EPS",      "80")  or "80")
 _CAP_TABLE_COLS    = int(os.environ.get("STAGE4_CAP_TABLE_COLS",     "60")  or "60")
 _CAP_DB_TABLES     = int(os.environ.get("STAGE4_CAP_DB_TABLES",      "60")  or "60")
+_CAP_TS_TYPES      = int(os.environ.get("STAGE4_CAP_TS_TYPES",       "60")  or "60")
 _CAP_FUNCTIONS     = int(os.environ.get("STAGE4_CAP_FUNCTIONS",      "80")  or "80")
 _CAP_CALL_GRAPH    = int(os.environ.get("STAGE4_CAP_CALL_GRAPH",     "40")  or "40")
 _CAP_FORM_FILES    = int(os.environ.get("STAGE4_CAP_FORM_FILES",     "60")  or "60")
@@ -186,6 +187,17 @@ def run(ctx: PipelineContext) -> None:
         q.get("table", "") for q in (cm.sql_queries or [])
         if q.get("table") and q["table"] not in ("UNKNOWN", "")
     })
+
+    # For TypeScript / serverless projects without SQL, treat type definition
+    # names as the entity vocabulary — equivalent role to known_tables.
+    known_type_names: list[str] = sorted({
+        td.get("name", "") for td in (getattr(cm, "type_definitions", None) or [])
+        if td.get("name")
+    })
+    # Merge into known_tables so _format_schema_grounding and anti-hallucination
+    # filters accept both SQL table names and TS type names as valid entities.
+    if known_type_names and not known_tables:
+        known_tables = known_type_names
 
     # POST field names — used to ground 'inputs' arrays in features so the
     # LLM doesn't hallucinate form fields that don't exist in the codebase.
@@ -939,6 +951,35 @@ def _build_user_prompt(ctx: PipelineContext, chunks: list[dict]) -> str:
             if writers: lines.append(f"  Written by: {', '.join(writers)}")
             if readers: lines.append(f"  Read by: {', '.join(readers)}")
             parts.append("\n".join(lines))
+
+    # ── TypeScript type definitions (interfaces + type aliases) ─────────────
+    # This is the primary schema source of truth for serverless/NoSQL projects
+    # that have no SQL tables or ORM models.  Always shown when present so the
+    # LLM can ground entity names, field names, and relationships.
+    _ts_types = getattr(cm, "type_definitions", None) or []
+    if _ts_types:
+        _shown_types = _ts_types[:_CAP_TS_TYPES] if _CAP_TS_TYPES > 0 else _ts_types
+        _omitted_ty  = len(_ts_types) - len(_shown_types)
+        parts.append(
+            f"\n=== TYPESCRIPT TYPE DEFINITIONS ({len(_ts_types)} total"
+            + (f", showing {len(_shown_types)})" if _omitted_ty else ")")
+            + " — treat as the data schema ===" )
+        for td in _shown_types:
+            kind   = td.get("kind", "interface")
+            name   = td.get("name", "?")
+            src_f  = Path(td.get("file", "")).name
+            fields = td.get("fields", [])
+            if fields:
+                field_strs = [
+                    f"{f['name']}{'?' if f.get('optional') else ''}: {f.get('type','any')}"
+                    for f in fields
+                ]
+                parts.append(f"  {kind} {name}  [{src_f}]")
+                parts.append(f"    fields: {', '.join(field_strs)}")
+            else:
+                parts.append(f"  {kind} {name}  [{src_f}]  (no fields extracted)")
+        if _omitted_ty:
+            parts.append(f"  … +{_omitted_ty} more type definitions omitted")
 
     # ── Form inputs summary ───────────────────────────────────────────────────
     if cm.superglobals:

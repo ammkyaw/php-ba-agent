@@ -39,7 +39,7 @@ from context import CodeMap, Framework, Language, PipelineContext
 from pipeline.parsers.base import LanguageParser
 
 
-_TS_EXTS = {".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs", ".vue"}
+_TS_EXTS = {".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs", ".vue", ".d.ts"}
 
 # ─── Adapter ──────────────────────────────────────────────────────────────────
 
@@ -89,8 +89,9 @@ class TypeScriptParser(LanguageParser):
         service_deps : list[dict] = []
         env_vars     : list[dict] = []
         auth_signals : list[dict] = []
-        input_params : list[dict] = []
-        http_endpoints: list[dict] = []
+        input_params     : list[dict] = []
+        http_endpoints   : list[dict] = []
+        type_definitions : list[dict] = []
 
         total_lines = 0
 
@@ -111,6 +112,7 @@ class TypeScriptParser(LanguageParser):
             _extract_call_graph(src, rel, call_graph)
             _extract_form_fields(src, rel, form_fields)
             _extract_sql_queries(src, rel, sql_queries)
+            _extract_ts_types(src, rel, type_definitions)
 
             if framework in (Framework.EXPRESS, Framework.FASTIFY, Framework.NESTJS, Framework.UNKNOWN):
                 _extract_express_routes(src, rel, routes)
@@ -163,9 +165,10 @@ class TypeScriptParser(LanguageParser):
             service_deps     = service_deps,
             env_vars         = env_vars,
             auth_signals     = auth_signals,
-            http_endpoints   = http_endpoints,
-            table_columns    = table_columns,
-            input_params     = input_params,
+            http_endpoints    = http_endpoints,
+            table_columns     = table_columns,
+            input_params      = input_params,
+            type_definitions  = type_definitions,
         )
 
         # Persist as code_map.json (add metadata wrapper)
@@ -253,6 +256,88 @@ def _extract_classes(src: str, rel: str, classes: list, controllers: list, model
             services.append(entry)
         else:
             classes.append(entry)
+
+
+def _extract_ts_types(src: str, rel: str, type_definitions: list) -> None:
+    """Extract exported TypeScript interfaces and type aliases with their fields.
+
+    Each entry has the shape::
+
+        {
+          "name":   "Sprint",
+          "kind":   "interface" | "type_alias",
+          "file":   "src/types/sprint-data.ts",
+          "fields": [
+              {"name": "id",     "type": "string",   "optional": False},
+              {"name": "tasks",  "type": "Task[]",   "optional": True},
+          ]
+        }
+
+    Field extraction uses a single-depth regex pass — nested generics are
+    captured as their raw type string (e.g. ``Record<string, Task>``).
+    """
+    # ── Exported interfaces ───────────────────────────────────────────────────
+    for m in re.finditer(
+        r"export\s+(?:default\s+)?interface\s+(\w+)(?:\s+extends\s+[\w\s,<>]+)?\s*\{([^}]{0,2000})\}",
+        src, re.DOTALL
+    ):
+        name   = m.group(1)
+        body   = m.group(2)
+        fields = _parse_type_body(body)
+        type_definitions.append({
+            "name":   name,
+            "kind":   "interface",
+            "file":   rel,
+            "fields": fields,
+        })
+
+    # ── Exported type aliases (object shape only) ─────────────────────────────
+    # Matches: export type Sprint = { id: string; ... }
+    # Skips union/intersection aliases (no leading brace after =)
+    for m in re.finditer(
+        r"export\s+type\s+(\w+)\s*(?:<[^>]{0,100}>)?\s*=\s*\{([^}]{0,2000})\}",
+        src, re.DOTALL
+    ):
+        name   = m.group(1)
+        body   = m.group(2)
+        fields = _parse_type_body(body)
+        type_definitions.append({
+            "name":   name,
+            "kind":   "type_alias",
+            "file":   rel,
+            "fields": fields,
+        })
+
+
+def _parse_type_body(body: str) -> list[dict]:
+    """Extract field name, type, and optionality from an interface/type body string.
+
+    Handles both multi-line and inline (semicolon-separated) field formats::
+
+        # multi-line
+        id: string
+        name?: string
+
+        # inline
+        id: string; name?: string; tasks: Task[]
+    """
+    fields: list[dict] = []
+    # Split on ; or newlines so each segment contains at most one field declaration
+    for segment in re.split(r"[;\n]", body):
+        m = re.match(
+            r"\s*(?:readonly\s+)?(\w+)(\?)?\s*:\s*([^,;\n}{]{1,120})",
+            segment
+        )
+        if not m:
+            continue
+        field_name = m.group(1)
+        optional   = m.group(2) == "?"
+        field_type = m.group(3).strip().rstrip(",")
+        # Skip method signatures — field name would contain ( from the param list
+        if "(" in segment[:m.end()]:
+            continue
+        fields.append({"name": field_name, "type": field_type, "optional": optional})
+    return fields
 
 
 def _extract_functions(src: str, rel: str, functions: list) -> None:
