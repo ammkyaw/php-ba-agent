@@ -201,6 +201,106 @@ def _get_tok() -> tuple[int, int]:
     return getattr(_tok_stats, "in_tok", -1), getattr(_tok_stats, "out_tok", -1)
 
 
+# ── LLM call telemetry ─────────────────────────────────────────────────────────
+# Collects one record per successful call; written to JSONL during the run and
+# summarised into a grouped JSON at pipeline end.
+import json as _json_tel
+import datetime as _dt
+
+_telemetry_path: str | None = None          # set by run_pipeline via set_telemetry_path()
+_telemetry_lock = threading.Lock()          # guards file writes from concurrent stage50 threads
+
+
+def set_telemetry_path(path: str) -> None:
+    """Point the telemetry writer at *path* (JSONL, one record per call).
+    Call once after PipelineContext is created, before the pipeline runs."""
+    global _telemetry_path
+    _telemetry_path = path
+
+
+def _record_telemetry(label: str, model: str, duration_s: float,
+                      tokens_in: int, tokens_out: int) -> None:
+    """Append one JSON line to the telemetry file (no-op if path not set)."""
+    if not _telemetry_path:
+        return
+    record = {
+        "timestamp":  _dt.datetime.now(tz=_dt.timezone.utc).isoformat(),
+        "stage":      label or "unknown",
+        "model":      model,
+        "duration_s": round(duration_s, 3),
+        "tokens_in":  tokens_in,
+        "tokens_out": tokens_out,
+    }
+    with _telemetry_lock:
+        with open(_telemetry_path, "a", encoding="utf-8") as _f:
+            _f.write(_json_tel.dumps(record) + "\n")
+
+
+def write_telemetry_summary(summary_path: str) -> None:
+    """Read the JSONL telemetry file and write a grouped summary JSON.
+
+    Output format::
+
+        {
+          "generated_at": "<iso timestamp>",
+          "total_calls": 42,
+          "total_tokens_in": 1234567,
+          "total_tokens_out": 234567,
+          "total_duration_s": 456.7,
+          "by_stage": {
+            "stage40_domain": {
+              "calls": 5,
+              "total_tokens_in": 50000,
+              "total_tokens_out": 10000,
+              "total_duration_s": 45.2,
+              "entries": [ {...}, ... ]
+            },
+            ...
+          }
+        }
+    """
+    if not _telemetry_path:
+        return
+    import os as _os
+    if not _os.path.exists(_telemetry_path):
+        return
+
+    records: list[dict] = []
+    with open(_telemetry_path, encoding="utf-8") as _f:
+        for line in _f:
+            line = line.strip()
+            if line:
+                try:
+                    records.append(_json_tel.loads(line))
+                except _json_tel.JSONDecodeError:
+                    pass
+
+    by_stage: dict[str, dict] = {}
+    for r in records:
+        stage = r.get("stage", "unknown")
+        if stage not in by_stage:
+            by_stage[stage] = {"calls": 0, "total_tokens_in": 0,
+                               "total_tokens_out": 0, "total_duration_s": 0.0,
+                               "entries": []}
+        g = by_stage[stage]
+        g["calls"]            += 1
+        g["total_tokens_in"]  += r.get("tokens_in",  0) if r.get("tokens_in",  -1) >= 0 else 0
+        g["total_tokens_out"] += r.get("tokens_out", 0) if r.get("tokens_out", -1) >= 0 else 0
+        g["total_duration_s"] = round(g["total_duration_s"] + r.get("duration_s", 0.0), 3)
+        g["entries"].append(r)
+
+    summary = {
+        "generated_at":     _dt.datetime.now(tz=_dt.timezone.utc).isoformat(),
+        "total_calls":      len(records),
+        "total_tokens_in":  sum(r.get("tokens_in",  0) for r in records if r.get("tokens_in",  -1) >= 0),
+        "total_tokens_out": sum(r.get("tokens_out", 0) for r in records if r.get("tokens_out", -1) >= 0),
+        "total_duration_s": round(sum(r.get("duration_s", 0.0) for r in records), 3),
+        "by_stage":         by_stage,
+    }
+    with open(summary_path, "w", encoding="utf-8") as _f:
+        _json_tel.dump(summary, _f, indent=2)
+
+
 # ── Defaults ──────────────────────────────────────────────────────────────────
 DEFAULT_CLAUDE_MODEL  = "claude-sonnet-4-20250514"
 DEFAULT_GEMINI_MODEL  = "gemini-2.5-flash-lite"      # stable free tier default
@@ -463,6 +563,7 @@ def call_llm(
             else:
                 _tok_str = f"~{len(result.split()):,} words"  # fallback if provider didn't report
             print(f"  {tag}done in {_elapsed:.1f}s  ({_tok_str})")
+            _record_telemetry(label, model, _elapsed, _in, _out)
             # ── JSON validation + single correction retry ──────────────────
             if json_mode:
                 ok, err = _validate_json(result)
