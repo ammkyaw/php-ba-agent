@@ -220,3 +220,4 @@ vendor
 .claude/
 .agent/
 analysis_report*
+test_reports/
