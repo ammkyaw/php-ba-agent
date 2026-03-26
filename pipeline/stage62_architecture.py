@@ -333,8 +333,20 @@ def _parse_json(text: str) -> dict[str, Any]:
             )
         text = text[start:]
 
-    # ── Try direct parse first (fast path) ───────────────────────────────────
-    # Strip to outermost { … } in case there is trailing prose after the JSON.
+    # ── Fast path: raw_decode stops at the first complete JSON object ────────
+    # Handles "Extra data" errors where the model emits a second JSON object,
+    # trailing prose, or thinking-mode tokens after the first valid object.
+    # raw_decode() returns (obj, end_index) and ignores everything after end_index.
+    try:
+        obj, _ = json.JSONDecoder().raw_decode(text)
+        if isinstance(obj, dict):
+            return obj
+    except json.JSONDecodeError:
+        pass  # fall through to rfind recovery
+
+    # ── Fallback: strip to outermost { … } then re-try ────────────────────
+    # Catches cases where the JSON object itself contains a stray unbalanced
+    # brace in a string value that trips raw_decode's bracket counter.
     end = text.rfind("}")
     clean = text[: end + 1] if end != -1 else text
     try:
