@@ -2140,8 +2140,10 @@ def _parse_partial(raw: str, label: str, debug_dir: str | None = None) -> dict:
                 and not line.strip().startswith("#")
             ).strip()
 
+    # raw_decode stops at the first complete JSON object — handles "Extra data"
+    # errors when the model emits a second object or trailing thinking tokens.
     try:
-        data = json.loads(text)
+        data, _ = json.JSONDecoder().raw_decode(text)
     except json.JSONDecodeError:
         recovered = _attempt_json_recovery(text)
         if recovered:

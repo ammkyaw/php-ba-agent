@@ -338,6 +338,15 @@ def _parse_json_fallback(text: str) -> dict[str, Any]:
             return {}
         text = text[start:]
 
+    # raw_decode stops at the first complete JSON object — handles "Extra data"
+    # errors when the model emits a second object or trailing thinking tokens.
+    try:
+        obj, _ = json.JSONDecoder().raw_decode(text)
+        if isinstance(obj, dict):
+            return obj
+    except json.JSONDecodeError:
+        pass
+
     end = text.rfind("}")
     clean = text[: end + 1] if end != -1 else text
     try:
