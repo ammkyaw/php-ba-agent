@@ -1026,8 +1026,11 @@ def _strip_repetition_loop(content: str) -> str:
     """
     threshold = _VLLM_REPETITION_THRESHOLD
     # Try windows from small to large; stop at first detected loop.
-    # Small windows catch tight repeats; large windows catch paragraph loops.
-    _WINDOWS = [50, 100, 150, 200, 300, 400]
+    # Windows below 150 chars produce false positives on structured JSON output:
+    # normal keys like '"description": "' or '},\n    {' repeat 3+ times in any
+    # valid response.  150 chars is the practical minimum for a block that
+    # represents genuine degenerate repetition rather than valid JSON structure.
+    _WINDOWS = [150, 200, 300, 400]
 
     for window in _WINDOWS:
         if len(content) < window * threshold:
