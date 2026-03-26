@@ -115,7 +115,20 @@ def run(ctx: PipelineContext) -> None:
     all_playwright: list[str] = ["" for _ in chunks]
     all_pytest:     list[str] = ["" for _ in chunks]
 
-    def _single_task(idx_0: int, chunk: str, fmt: str) -> tuple[int, str, str]:
+    _FORMATS = ["gherkin", "playwright", "pytest"]
+
+    def _store(idx_0: int, fmt: str, res: str) -> None:
+        """Write a completed result into the correct output slot."""
+        if fmt == "gherkin":       all_gherkin[idx_0]    = res
+        elif fmt == "playwright":  all_playwright[idx_0] = res
+        elif fmt == "pytest":      all_pytest[idx_0]     = res
+
+    def _chunk_task(idx_0: int, chunk: str) -> list[tuple[str, str]]:
+        """
+        Process one chunk: fire all 3 format calls in parallel via an inner
+        pool, collect results, and return [(fmt, result), ...].
+        Raises if any format call fails — propagated to the outer pool.
+        """
         idx = idx_0 + 1
         base_user = _USER_PROMPT_BASE.format(
             context_block = context_block,
@@ -123,58 +136,60 @@ def run(ctx: PipelineContext) -> None:
             chunk_index   = idx,
             total_chunks  = len(chunks),
         )
-        return idx_0, fmt, _call_single_format(base_user, fmt, idx)
+        results: list[tuple[str, str]] = []
+        with ThreadPoolExecutor(max_workers=len(_FORMATS)) as inner:
+            fmt_futures = {
+                inner.submit(_call_single_format, base_user, fmt, idx): fmt
+                for fmt in _FORMATS
+            }
+            for fut in as_completed(fmt_futures):
+                fmt = fmt_futures[fut]
+                results.append((fmt, fut.result()))  # raises on LLM error
+        return results
 
-    def _store(idx_0: int, fmt: str, res: str) -> None:
-        """Write a completed task result back into the correct output slot."""
-        if fmt == "gherkin":       all_gherkin[idx_0]    = res
-        elif fmt == "playwright":  all_playwright[idx_0] = res
-        elif fmt == "pytest":      all_pytest[idx_0]     = res
-
-    tasks = []
-    for idx_0, chunk in enumerate(chunks):
-        for fmt in ["gherkin", "playwright", "pytest"]:
-            tasks.append((idx_0, chunk, fmt))
-
-    workers     = get_max_workers()
-    concurrency = min(len(tasks), workers)
+    # workers controls chunk-level concurrency; each chunk always fires all
+    # 3 format calls in parallel, so total concurrent LLM calls = workers × 3.
+    workers         = get_max_workers()
+    chunk_slots     = min(len(chunks), workers)
+    total_calls     = len(chunks) * len(_FORMATS)
+    max_concurrent  = chunk_slots * len(_FORMATS)
     print(
-        f"  [{STAGE_NAME}] {len(tasks)} LLM calls total "
-        f"({len(chunks)} chunk(s) × 3 formats) — "
-        f"{concurrency} running concurrently ..."
+        f"  [{STAGE_NAME}] {total_calls} LLM calls total "
+        f"({len(chunks)} chunk(s) × {len(_FORMATS)} formats) — "
+        f"{chunk_slots} chunk(s) at a time = {max_concurrent} concurrent calls ..."
     )
 
-    if workers > 1 and len(tasks) > 1:
-        with ThreadPoolExecutor(max_workers=concurrency) as pool:
-            future_to_task = {pool.submit(_single_task, *t): t for t in tasks}
+    if workers > 1 and len(chunks) > 1:
+        with ThreadPoolExecutor(max_workers=chunk_slots) as pool:
+            future_to_idx = {
+                pool.submit(_chunk_task, idx_0, chunk): idx_0
+                for idx_0, chunk in enumerate(chunks)
+            }
             failed = 0
-            for fut in as_completed(future_to_task):
-                idx_0, chunk, fmt = future_to_task[fut]
+            for fut in as_completed(future_to_idx):
+                idx_0 = future_to_idx[fut]
                 try:
-                    idx_0, fmt, res = fut.result()
-                    _store(idx_0, fmt, res)
-                    print(f"  [{STAGE_NAME}] ✓ chunk {idx_0 + 1}/{len(chunks)} [{fmt}]")
+                    for fmt, res in fut.result():
+                        _store(idx_0, fmt, res)
+                    print(f"  [{STAGE_NAME}] ✓ chunk {idx_0 + 1}/{len(chunks)} [all formats]")
                 except Exception as exc:
                     failed += 1
-                    print(
-                        f"  [{STAGE_NAME}] ✗ chunk {idx_0 + 1}/{len(chunks)} [{fmt}] "
-                        f"failed — {exc}"
-                    )
+                    print(f"  [{STAGE_NAME}] ✗ chunk {idx_0 + 1}/{len(chunks)} failed — {exc}")
             if failed:
                 raise RuntimeError(
-                    f"[{STAGE_NAME}] {failed}/{len(tasks)} task(s) failed. "
+                    f"[{STAGE_NAME}] {failed}/{len(chunks)} chunk(s) failed. "
                     f"See log above for details."
                 )
     else:
-        for t in tasks:
-            idx_0, chunk, fmt = t
+        # Single chunk or workers=1: still fire 3 formats in parallel per chunk
+        for idx_0, chunk in enumerate(chunks):
             try:
-                idx_0, fmt, res = _single_task(*t)
-                _store(idx_0, fmt, res)
-                print(f"  [{STAGE_NAME}] ✓ chunk {idx_0 + 1}/{len(chunks)} [{fmt}]")
+                for fmt, res in _chunk_task(idx_0, chunk):
+                    _store(idx_0, fmt, res)
+                print(f"  [{STAGE_NAME}] ✓ chunk {idx_0 + 1}/{len(chunks)} [all formats]")
             except Exception as exc:
                 raise RuntimeError(
-                    f"[{STAGE_NAME}] chunk {idx_0 + 1} [{fmt}] failed — {exc}"
+                    f"[{STAGE_NAME}] chunk {idx_0 + 1} failed — {exc}"
                 ) from exc
 
     # ── Merge chunks into final files ─────────────────────────────────────────
