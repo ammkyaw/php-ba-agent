@@ -597,7 +597,10 @@ def _extract_nextjs_routes(src_file: Path, root: Path, rel: str, routes: list) -
         if api_parts and api_parts[0] == "api":
             path = _normalise_path(api_parts)
             path = re.sub(r"\.(ts|tsx|js|jsx)$", "", path)
-            routes.append({"method": "ANY", "path": path, "file": rel, "kind": "nextjs_pages_api"})
+            # handler = file stem (conventionally the default-export handler fn)
+            handler = re.sub(r"\.(ts|tsx|js|jsx)$", "", src_file.name)
+            routes.append({"method": "ANY", "path": path, "handler": handler,
+                           "file": rel, "kind": "nextjs_pages_api"})
         elif src_file.name in ("page.tsx", "page.ts", "page.jsx", "page.js",
                                "index.tsx", "index.ts", "index.jsx", "index.js"):
             # pages/** page routes
@@ -605,7 +608,9 @@ def _extract_nextjs_routes(src_file: Path, root: Path, rel: str, routes: list) -
             path = _normalise_path(page_parts)
             path = re.sub(r"\.(ts|tsx|js|jsx)$", "", path)
             path = re.sub(r"/index$", "", path)
-            routes.append({"method": "GET", "path": path or "/", "file": rel, "kind": "nextjs_page"})
+            path_stem = (path.rstrip("/").split("/")[-1] or "root")
+            routes.append({"method": "GET", "path": path or "/", "handler": f"{path_stem}_page",
+                           "file": rel, "kind": "nextjs_page"})
 
     # app/** (App Router)
     if "app" in parts:
@@ -616,24 +621,29 @@ def _extract_nextjs_routes(src_file: Path, root: Path, rel: str, routes: list) -
             path = _normalise_path(path_parts)
             src_content = LanguageParser.safe_read(src_file) or ""
             dir_rel = str(Path(rel).parent).replace("\\", "/")
-            
+
             methods_found = False
             for method in re.findall(
                 r"export\s+(?:const\s+|async\s+)?(?:function\s+)?(GET|POST|PUT|PATCH|DELETE|HEAD)\b",
                 src_content
             ):
                 methods_found = True
-                routes.append({"method": method, "path": path or "/", "file": rel, "dir": dir_rel, "kind": "nextjs_app_api"})
-            
+                # In App Router, the exported HTTP-verb name IS the handler function name
+                routes.append({"method": method, "path": path or "/", "handler": method,
+                               "file": rel, "dir": dir_rel, "kind": "nextjs_app_api"})
+
             if not methods_found:
-                routes.append({"method": "ANY", "path": path or "/", "file": rel, "dir": dir_rel, "kind": "nextjs_app_api"})
-                
+                routes.append({"method": "ANY", "path": path or "/", "handler": "handler",
+                               "file": rel, "dir": dir_rel, "kind": "nextjs_app_api"})
+
         # Page routes: app/**/page.tsx
         elif src_file.name in ("page.tsx", "page.ts", "page.jsx", "page.js"):
             path_parts = parts[idx+1:-1]
             path = _normalise_path(path_parts)
             dir_rel = str(Path(rel).parent).replace("\\", "/")
-            routes.append({"method": "GET", "path": path or "/", "file": rel, "dir": dir_rel, "kind": "nextjs_page"})
+            path_stem = (path.rstrip("/").split("/")[-1] or "root")
+            routes.append({"method": "GET", "path": path or "/", "handler": f"{path_stem}_page",
+                           "file": rel, "dir": dir_rel, "kind": "nextjs_page"})
 
 
 def _extract_vue_router_routes(source_files: list[Path], root: Path, routes: list) -> None:
