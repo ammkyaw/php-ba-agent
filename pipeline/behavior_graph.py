@@ -118,6 +118,9 @@ def extract(ctx: Any) -> dict:
     edges:     dict[tuple, dict] = {} # (src, tgt, type) → edge dict
     paths:     list[dict]      = []
 
+    # HTTP verbs used as handler names by file-system routers (Next.js App Router)
+    _FS_HANDLER_VERBS = frozenset({"GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "ANY", "HANDLER"})
+
     for route in (cm.routes or []):
         method  = (route.get("method") or "").upper()
         path    = route.get("path") or route.get("uri") or ""
@@ -146,6 +149,21 @@ def extract(ctx: Any) -> dict:
             continue
 
         ctrl_file = fqn_to_file.get(ctrl_fqn) or class_to_file.get(ctrl_short, "")
+
+        # ── File-system router fallback (Next.js / Nuxt / SvelteKit) ──────────
+        # When the handler is an HTTP verb ("GET") or a file-derived name that
+        # doesn't resolve to an OOP class, use the route's source file directly
+        # as the handler file. This prevents all file-system routes from being
+        # dropped by the "no ctrl_file and no sql_ops" skip guard below.
+        if not ctrl_file and route.get("file"):
+            ctrl_file = route["file"]
+            route_fp  = Path(ctrl_file)
+            if ctrl_short.upper() in _FS_HANDLER_VERBS:
+                # e.g. "GET" → use parent dir name as the logical component name
+                ctrl_short    = route_fp.parent.name or route_fp.stem
+                ctrl_fqn      = ctrl_file          # file path as unique identity
+                action_method = handler             # keep "GET"/"POST" as the action
+            # else: handler is already a descriptive name ("dashboard_page") — keep it
 
         # ── Transitive BFS over service_deps ──────────────────────────────────
         visited: set[str] = {ctrl_short}
@@ -322,11 +340,18 @@ def extract(ctx: Any) -> dict:
         if len(paths) >= _MAX_PATHS:
             break
 
-    # ── Client-side execution paths (Next.js / React / Firebase apps) ──────────
-    # When there are no server-route paths (e.g. pure SPA/Next.js+Firebase),
-    # build lightweight behavior paths from stage15 execution_paths instead.
+    # ── Execution-path augmentation (Next.js / React / Firebase apps) ────────────
+    # Always merge stage15 execution_paths into the graph — not just as a fallback.
+    # Route-loop paths win for identical (method, path) pairs (OOP resolution is
+    # richer); exec_paths fill in every other handler that the OOP route loop
+    # couldn't trace (page components, Firebase hooks, API utilities, etc.).
     exec_paths = getattr(cm, "execution_paths", None) or getattr(ctx, "execution_paths", None) or []
-    if not paths and exec_paths:
+    if exec_paths:
+        # Build a set of (method, path) already covered by the route loop
+        route_loop_keys: set[tuple[str, str]] = {
+            (p["route_method"].upper(), p["route_path"]) for p in paths
+        }
+
         for ep in exec_paths:
             if len(paths) >= _MAX_PATHS:
                 break
@@ -335,6 +360,10 @@ def extract(ctx: Any) -> dict:
             ep_method = (ep.get("http_method") or "CLIENT").upper()
             ep_route  = ep.get("route") or ""
             if not handler:
+                continue
+
+            # Skip if a higher-quality route-loop path already covers this endpoint
+            if (ep_method, ep_route) in route_loop_keys:
                 continue
 
             path_id = f"path_{len(paths)+1:03d}"
@@ -353,21 +382,61 @@ def extract(ctx: Any) -> dict:
             _upsert_edge(edges, route_nid, handler_nid, "handles")
 
             # Auth
-            has_auth = bool(ep.get("auth_guard", {}).get("present"))
+            has_auth_ep = bool(ep.get("auth_guard", {}).get("present"))
+
+            # SQL — link any queries whose source file matches this exec_path's file
+            ep_sql: list[dict] = []
+            if ep_file:
+                sql_seen_ep: set[tuple[str, str]] = set()
+                for q in file_to_sql.get(ep_file, []):
+                    op    = (q.get("operation") or "").upper()
+                    table = (q.get("table") or "").strip()
+                    if not op or table.lower() in _SKIP_TABLES:
+                        continue
+                    key = (op, table.lower())
+                    if key not in sql_seen_ep:
+                        sql_seen_ep.add(key)
+                        ep_sql.append({"op": op, "table": table, "file": ep_file})
+                    if len(ep_sql) >= _MAX_SQL_PER_PATH:
+                        break
+
+            # SQL nodes + queries edges for exec_path
+            ep_sql_node_ids: list[str] = []
+            for sql_item in ep_sql:
+                sql_label = f"{sql_item['op']} {sql_item['table']}"
+                sql_nid   = _node_id("sql", sql_label)
+                _upsert_node(nodes, sql_nid, "sql", sql_label, sql_item["file"], {
+                    "operation": sql_item["op"],
+                    "table":     sql_item["table"],
+                })
+                ep_sql_node_ids.append(sql_nid)
+                _upsert_edge(edges, handler_nid, sql_nid, "queries")
+
+            # Dynamic confidence — same scoring function as the route loop
+            ep_confidence = _path_confidence(
+                has_ctrl_file = bool(ep_file),
+                has_services  = False,       # no constructor DI in file-system routing
+                has_sql       = bool(ep_sql),
+                n_sql_tables  = len({s["table"].lower() for s in ep_sql}),
+                has_redirect  = False,
+                has_auth      = has_auth_ep,
+            )
+
+            ep_node_ids = [route_nid, handler_nid] + ep_sql_node_ids
 
             paths.append({
                 "path_id":         path_id,
                 "entry_node":      route_nid,
-                "node_ids":        [route_nid, handler_nid],
-                "confidence":      0.5,
+                "node_ids":        ep_node_ids,
+                "confidence":      ep_confidence,
                 "route_method":    ep_method,
                 "route_path":      route_label,
                 "handler":         handler,
                 "controller_file": ep_file,
-                "sql_ops":         [],
-                "sql_tables":      [],
+                "sql_ops":         ep_sql,
+                "sql_tables":      [s["table"] for s in ep_sql],
                 "redirect":        "",
-                "has_auth":        has_auth,
+                "has_auth":        has_auth_ep,
                 "middleware":      [],
                 "reachable_files": [ep_file] if ep_file else [],
             })
