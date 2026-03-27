@@ -101,6 +101,12 @@ def run(ctx: PipelineContext) -> None:
 
     eps = _dispatch_detect(root, language, framework)
 
+    # Universal pass: add HTTP entry points from parsed routes (all languages)
+    eps += _detect_http_from_routes(ctx.code_map)
+
+    # Final dedup across all sources (non-HTTP by file, HTTP by file+trigger)
+    eps = _dedup(eps)
+
     # Assign sequential IDs
     for i, ep in enumerate(eps, 1):
         ep.ep_id = f"ep_{i:03d}"
@@ -159,6 +165,51 @@ def _detect_all(root: Path, framework: Framework) -> list[EntryPoint]:
     results += _detect_raw_queue_workers(root)
 
     return _dedup(results)
+
+
+# ─── Universal HTTP Entry-Point Pass ───────────────────────────────────────────
+
+def _detect_http_from_routes(code_map) -> list[EntryPoint]:
+    """
+    Convert CodeMap routes into HTTP EntryPoints.
+
+    Called after language-specific detection so that all three parsers
+    (PHP, TypeScript, Java) automatically get HTTP entries without each
+    language module needing to duplicate the logic.
+
+    One EntryPoint per unique (method, path) pair.  When multiple routes
+    share the same handler_file (e.g. a Next.js route.ts with GET + POST),
+    the _dedup pass downstream keeps the first one encountered — the file
+    still maps to ep_type "http" in the ep_type_map used by stage45.
+    """
+    if not code_map or not code_map.routes:
+        return []
+
+    eps: list[EntryPoint] = []
+    for r in code_map.routes:
+        handler_file = r.get("file", "")
+        if not handler_file:
+            continue
+        method  = (r.get("method") or "GET").upper()
+        path    = r.get("path") or "/"
+        handler = r.get("handler") or ""
+        kind    = r.get("kind") or r.get("source") or "http"
+
+        # Build a human-readable name
+        path_label = path.rstrip("/") or "/"
+        name = f"{method} {path_label}"
+        if handler and handler not in (method, "handler"):
+            name = f"{name}  [{handler}]"
+
+        eps.append(EntryPoint(
+            ep_type      = "http",
+            handler_file = handler_file,
+            name         = name,
+            trigger      = f"HTTP {method} {path_label}",
+            confidence   = _CONF_CONFIG,
+        ))
+
+    return eps
 
 
 # ─── Laravel Detectors ─────────────────────────────────────────────────────────
@@ -611,14 +662,27 @@ def _build_catalog(eps: list[EntryPoint]) -> EntryPointCatalog:
 
 def _dedup(eps: list[EntryPoint]) -> list[EntryPoint]:
     """
-    Deduplicate by handler_file.  When the same file is matched by multiple
-    detectors, keep the entry with the highest confidence.  If confidence
-    is equal, prefer the more specific ep_type (queue_worker > scheduled > cli > webhook).
+    Deduplicate entry points.
+
+    - HTTP entries use (handler_file, trigger) as the key so that multiple
+      routes in the same file (e.g. GET + POST in one route.ts) are each
+      preserved as distinct catalog entries.
+    - Non-HTTP entries use handler_file alone (one entry per file).  When
+      the same file is claimed by multiple detectors, keep the one with the
+      highest confidence; break ties by specificity order:
+      queue_worker > scheduled > cli > webhook > http.
     """
     _TYPE_PRIORITY = {"queue_worker": 4, "scheduled": 3, "cli": 2, "webhook": 1, "http": 0}
+
     seen: dict[str, EntryPoint] = {}
+
     for ep in eps:
-        key = ep.handler_file
+        # Unique key: HTTP routes differ by (file, trigger); non-HTTP by file only
+        if ep.ep_type == "http":
+            key = f"http::{ep.handler_file}::{ep.trigger}"
+        else:
+            key = ep.handler_file
+
         if key not in seen:
             seen[key] = ep
         else:
@@ -629,6 +693,7 @@ def _dedup(eps: list[EntryPoint]) -> list[EntryPoint]:
                 ep.confidence == existing.confidence and ep_pri > ex_pri
             ):
                 seen[key] = ep
+
     return list(seen.values())
 
 
