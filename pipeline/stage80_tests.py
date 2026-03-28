@@ -108,27 +108,74 @@ def run(ctx: PipelineContext) -> None:
     chunks = _chunk_ac(ac_text)
     print(f"  [{STAGE_NAME}] AC split into {len(chunks)} chunk(s)")
 
-    all_gherkin:    list[str] = []
-    all_playwright: list[str] = []
-    all_pytest:     list[str] = []
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+    from pipeline.llm_client import get_max_workers
 
-    for idx, chunk in enumerate(chunks, 1):
-        print(f"  [{STAGE_NAME}] Chunk {idx}/{len(chunks)} — calling LLM (3 calls: gherkin, playwright, pytest) ...")
+    all_gherkin:    list[str] = ["" for _ in chunks]
+    all_playwright: list[str] = ["" for _ in chunks]
+    all_pytest:     list[str] = ["" for _ in chunks]
 
+    def _single_task(idx_0: int, chunk: str, fmt: str) -> tuple[int, str, str]:
+        idx = idx_0 + 1
         base_user = _USER_PROMPT_BASE.format(
             context_block = context_block,
             ac_chunk      = chunk,
             chunk_index   = idx,
             total_chunks  = len(chunks),
         )
+        return idx_0, fmt, _call_single_format(base_user, fmt, idx)
 
-        gherkin_content    = _call_single_format(base_user, "gherkin",    idx)
-        playwright_content = _call_single_format(base_user, "playwright", idx)
-        pytest_content     = _call_single_format(base_user, "pytest",     idx)
+    def _store(idx_0: int, fmt: str, res: str) -> None:
+        """Write a completed task result back into the correct output slot."""
+        if fmt == "gherkin":       all_gherkin[idx_0]    = res
+        elif fmt == "playwright":  all_playwright[idx_0] = res
+        elif fmt == "pytest":      all_pytest[idx_0]     = res
 
-        all_gherkin.append(gherkin_content)
-        all_playwright.append(playwright_content)
-        all_pytest.append(pytest_content)
+    tasks = []
+    for idx_0, chunk in enumerate(chunks):
+        for fmt in ["gherkin", "playwright", "pytest"]:
+            tasks.append((idx_0, chunk, fmt))
+
+    workers     = get_max_workers()
+    concurrency = min(len(tasks), workers)
+    print(
+        f"  [{STAGE_NAME}] {len(tasks)} LLM calls total "
+        f"({len(chunks)} chunk(s) × 3 formats) — "
+        f"{concurrency} running concurrently ..."
+    )
+
+    if workers > 1 and len(tasks) > 1:
+        with ThreadPoolExecutor(max_workers=concurrency) as pool:
+            future_to_task = {pool.submit(_single_task, *t): t for t in tasks}
+            failed = 0
+            for fut in as_completed(future_to_task):
+                idx_0, chunk, fmt = future_to_task[fut]
+                try:
+                    idx_0, fmt, res = fut.result()
+                    _store(idx_0, fmt, res)
+                    print(f"  [{STAGE_NAME}] ✓ chunk {idx_0 + 1}/{len(chunks)} [{fmt}]")
+                except Exception as exc:
+                    failed += 1
+                    print(
+                        f"  [{STAGE_NAME}] ✗ chunk {idx_0 + 1}/{len(chunks)} [{fmt}] "
+                        f"failed — {exc}"
+                    )
+            if failed:
+                raise RuntimeError(
+                    f"[{STAGE_NAME}] {failed}/{len(tasks)} task(s) failed. "
+                    f"See log above for details."
+                )
+    else:
+        for t in tasks:
+            idx_0, chunk, fmt = t
+            try:
+                idx_0, fmt, res = _single_task(*t)
+                _store(idx_0, fmt, res)
+                print(f"  [{STAGE_NAME}] ✓ chunk {idx_0 + 1}/{len(chunks)} [{fmt}]")
+            except Exception as exc:
+                raise RuntimeError(
+                    f"[{STAGE_NAME}] chunk {idx_0 + 1} [{fmt}] failed — {exc}"
+                ) from exc
 
     # ── Merge chunks into final files ─────────────────────────────────────────
     domain_name = ctx.domain_model.domain_name if ctx.domain_model else "System"
