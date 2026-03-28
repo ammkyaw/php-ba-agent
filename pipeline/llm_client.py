@@ -635,6 +635,10 @@ def call_llm(
                         max_tokens, temperature, model, provider, label,
                     )
                     ok2, _ = _validate_json(corrected)
+                    if ok2 and _is_error_diagnostic(corrected):
+                        # Model returned an error-report dict (e.g. {"error":"..."})
+                        # instead of the corrected content — treat as correction failure.
+                        ok2 = False
                     if ok2:
                         result = corrected
                     else:
@@ -711,6 +715,25 @@ def _validate_json(text: str) -> tuple[bool, str]:
         return False, str(exc)
 
 
+def _is_error_diagnostic(text: str) -> bool:
+    """Return True if the model produced an error-report dict instead of the requested content.
+
+    Some models (notably quantised ones) respond to correction prompts by acting
+    as JSON linters: they return {"error": "..."} rather than the fixed content.
+    Detecting this prevents a syntactically-valid-but-useless response from being
+    accepted as a successful correction.
+    """
+    t = text.strip()
+    if not t.startswith("{"):
+        return False
+    try:
+        parsed = _json.loads(t)
+        # Error diagnostic: a small dict with an "error" key and nothing else meaningful
+        return isinstance(parsed, dict) and "error" in parsed and len(parsed) <= 3
+    except _json.JSONDecodeError:
+        return False
+
+
 def _json_correction_call(
     system_prompt: str,
     bad_response:  str,
@@ -724,17 +747,29 @@ def _json_correction_call(
     """
     Make a single correction call asking the model to fix its malformed JSON.
     Returns the corrected text (may still be invalid — caller decides).
+
+    Design notes
+    ------------
+    * Uses the ORIGINAL system_prompt so the model retains full task context.
+      A "JSON repair assistant" generic system causes quantised models to act as
+      JSON linters — they return {"error":"..."} diagnostics instead of the fix.
+    * Does NOT echo the bad_response back in the user message.  Sending the
+      malformed JSON to the model causes the same linter confusion: the model
+      describes what is wrong rather than producing the correct output.
     """
     tag = f"[{label}] " if label else ""
     fix_system = (
         system_prompt
         + "\n\nYour previous response was not valid JSON. "
-        "Return ONLY the corrected JSON — no prose, no fences, no explanation."
+        "Return ONLY valid JSON — no error messages, no prose, no fences."
     )
+    # Keep the correction user message minimal: tell the model what went wrong
+    # and ask it to try again.  Omitting the bad response prevents the model
+    # from treating the correction as a JSON-validation task.
     fix_user = (
-        f"Your previous response had a JSON parse error:\n{error_msg}\n\n"
-        f"Malformed response:\n{bad_response}\n\n"
-        "Please return the corrected JSON only."
+        f"Your previous response could not be parsed as JSON "
+        f"(error: {error_msg[:300]}).\n\n"
+        "Try again. Produce ONLY the valid JSON requested above."
     )
     print(f"  {tag}JSON invalid — requesting correction")
     if provider == "local":
