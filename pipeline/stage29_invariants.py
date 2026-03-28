@@ -631,11 +631,11 @@ def _extract_source_rules(
     raw: list[dict] = []
     seen_desc: set[str] = set()
 
-    # Collect unique file paths from execution_paths
-    file_paths: list[str] = list({
+    # Collect unique file paths from execution_paths (order-preserving dedup)
+    file_paths: list[str] = list(dict.fromkeys(
         ep.get("file", "") for ep in (cm.execution_paths or [])
         if ep.get("file")
-    })
+    ))
 
     project_root = Path(php_project_path)
 
@@ -944,10 +944,10 @@ def _extract_source_rules_ts(
     raw: list[dict] = []
     seen_desc: set[str] = set()
 
-    # Collect unique files from execution_paths
-    file_paths: list[str] = list({
+    # Collect unique files from execution_paths (order-preserving dedup)
+    file_paths: list[str] = list(dict.fromkeys(
         ep.get("file", "") for ep in (cm.execution_paths or []) if ep.get("file")
-    })
+    ))
 
     project_root = Path(project_path)
 
