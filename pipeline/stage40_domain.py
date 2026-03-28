@@ -2248,9 +2248,20 @@ def _static_enrich_tables_and_fields(
     tables_added = 0
     fields_added = 0
 
+    def _str_val(v: object) -> str:
+        """Coerce a feature list item to a plain string.
+
+        The LLM sometimes returns dicts like {"name": "email", "type": "string"}
+        instead of bare strings.  Extract the most useful key so the item is
+        still usable for dedup / coverage matching.
+        """
+        if isinstance(v, dict):
+            return str(v.get("name") or v.get("key") or v.get("field") or next(iter(v.values()), ""))
+        return str(v)
+
     for feat in domain_model.features:
-        existing_tables = {t.lower() for t in feat.get("tables", [])}
-        existing_fields = {inp.lower() for inp in feat.get("inputs", [])}
+        existing_tables = {_str_val(t).lower() for t in feat.get("tables", [])}
+        existing_fields = {_str_val(inp).lower() for inp in feat.get("inputs", [])}
 
         # Collect explicit page basenames, then expand to module siblings
         explicit_basenames: set[str] = {
@@ -2357,13 +2368,20 @@ def _compute_coverage(
     covered_pages  : set[str] = set()
     covered_tables : set[str] = set()
     covered_inputs : set[str] = set()
+    def _sv(v: object) -> str:
+        """Coerce a feature list item (str or dict) to a plain string."""
+        if isinstance(v, dict):
+            return str(v.get("name") or v.get("key") or v.get("field")
+                       or next(iter(v.values()), ""))
+        return str(v)
+
     for feat in domain_model.features:
         for p in feat.get("pages", []):
-            covered_pages.add(Path(p).name.lower())
+            covered_pages.add(Path(_sv(p)).name.lower())
         for t in feat.get("tables", []):
-            covered_tables.add(t.lower())
+            covered_tables.add(_sv(t).lower())
         for inp in feat.get("inputs", []):
-            covered_inputs.add(inp.lower())
+            covered_inputs.add(_sv(inp).lower())
 
     # ── Module-expanded coverage set ──────────────────────────────────────────
     # If any file in a module dir is explicitly covered, all sibling files in
