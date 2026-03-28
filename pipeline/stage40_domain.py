@@ -2214,15 +2214,35 @@ def _static_enrich_tables_and_fields(
         k = s.get("key", "")
         if f and k and s.get("var") in ("$_POST", "$_REQUEST"):
             file_to_fields[Path(f).name.lower()].add(k.lower())
-    # TypeScript / Java input_params — body only; query/route params are infrastructure
-    for ip in (cm.input_params or []):
-        f = ip.get("file", "")
-        k = ip.get("name", "") or ip.get("key", "")
-        if not f or not k:
+    # TypeScript / Java input_params — body only; query/route params are infrastructure.
+    # PHP already has its fields from the superglobals loop above; running input_params
+    # for PHP would double-add those keys AND add $_SERVER/$_SESSION/$_GET keys as fields.
+    if _is_ts_cm:
+        for ip in (cm.input_params or []):
+            f = ip.get("file", "")
+            k = ip.get("name", "") or ip.get("key", "")
+            if not f or not k:
+                continue
+            if ip.get("source", "body") != "body":
+                continue   # skip req.query.* and req.params.*
+            file_to_fields[Path(f).name.lower()].add(k.lower())
+
+    # ── Build module → file-basenames index (used for module-expanded enrichment) ──
+    # When a feature references one file in a module, enrich it with data from ALL
+    # sibling files in that module.  This recovers fields/tables that the LLM omitted
+    # because its evidence window only contained one or two representative files.
+    _module_to_basenames: dict[str, list[str]] = defaultdict(list)
+    _basename_to_module: dict[str, str] = {}
+    for ep in (cm.execution_paths or []):
+        _f = ep.get("file", "")
+        if not _f:
             continue
-        if _is_ts_cm and ip.get("source", "body") != "body":
-            continue   # skip req.query.* and req.params.* for TS
-        file_to_fields[Path(f).name.lower()].add(k.lower())
+        _mod = _extract_module_name(_f) or _extract_module_name_ts(_f)
+        if _mod:
+            _bn = Path(_f).name.lower()
+            _module_to_basenames[_mod].append(_bn)
+            if _bn not in _basename_to_module:
+                _basename_to_module[_bn] = _mod
 
     tables_added = 0
     fields_added = 0
@@ -2231,9 +2251,17 @@ def _static_enrich_tables_and_fields(
         existing_tables = {t.lower() for t in feat.get("tables", [])}
         existing_fields = {inp.lower() for inp in feat.get("inputs", [])}
 
-        for page in feat.get("pages", []):
-            basename = Path(page).name.lower()
+        # Collect explicit page basenames, then expand to module siblings
+        explicit_basenames: set[str] = {
+            Path(page).name.lower() for page in feat.get("pages", [])
+        }
+        expanded_basenames: set[str] = set(explicit_basenames)
+        for bn in explicit_basenames:
+            mod = _basename_to_module.get(bn)
+            if mod:
+                expanded_basenames.update(_module_to_basenames[mod])
 
+        for basename in expanded_basenames:
             for tbl in file_to_tables.get(basename, set()):
                 if tbl not in existing_tables:
                     feat.setdefault("tables", []).append(tbl)
@@ -2406,12 +2434,18 @@ def _compute_coverage(
     # TypeScript: only req.body.* fields are domain inputs.
     # req.query.* (page, limit, cursor, sort, filter) and req.params.* (id, slug)
     # are infrastructure — they inflate the denominator without being LLM-coverable.
-    _ts_fields: set[str] = {
-        (ip.get("name", "") or ip.get("key", ""))
-        for ip in (cm.input_params or [])
-        if (ip.get("name") or ip.get("key"))
-        and ip.get("source", "body") == "body"
-    }
+    # Guard with _is_ts: PHP populates cm.input_params with all superglobal data
+    # (no "source" field), so the default "body" would pull in every $_SERVER,
+    # $_SESSION, and $_GET key — inflating the PHP denominator by ~25%.
+    _ts_fields: set[str] = (
+        {
+            (ip.get("name", "") or ip.get("key", ""))
+            for ip in (cm.input_params or [])
+            if (ip.get("name") or ip.get("key"))
+            and ip.get("source", "body") == "body"
+        }
+        if _is_ts else set()
+    )
     # Merge both so a mixed PHP+TS project gets full coverage
     all_fields = sorted(_php_fields | _ts_fields)
     fields_covered   = [f for f in all_fields if f.lower() in covered_inputs]
