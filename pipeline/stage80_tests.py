@@ -727,6 +727,7 @@ def _call_single_format(base_user: str, fmt: str, chunk_idx: int) -> str:
         system_prompt = _FORMAT_SYSTEM[fmt],
         user_prompt   = user_prompt,
         max_tokens    = MAX_TOKENS,
+        temperature   = 0.1,   # test code: syntax must be consistent across chunks
         label         = label,
     )
 
@@ -740,6 +741,7 @@ def _call_single_format(base_user: str, fmt: str, chunk_idx: int) -> str:
         system_prompt = _FORMAT_SYSTEM[fmt],
         user_prompt   = user_prompt,
         max_tokens    = MAX_TOKENS,
+        temperature   = 0.1,
         label         = f"{label}_retry",
     )
     result = _extract_format_content(retry_raw, fmt)
