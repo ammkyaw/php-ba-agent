@@ -1988,7 +1988,8 @@ def _build_user_prompt(
 
 def _call_part(system_prompt: str, user_prompt: str,
                max_tokens: int, label: str,
-               model_override: str | None = None) -> str:
+               model_override: str | None = None,
+               temperature: float = 0.2) -> str:
     """Call the configured LLM and return the raw response string.
 
     json_mode=True forces local models (Ollama etc.) to output valid JSON:
@@ -2009,7 +2010,7 @@ def _call_part(system_prompt: str, user_prompt: str,
         system_prompt  = system_prompt,
         user_prompt    = user_prompt,
         max_tokens     = max_tokens,
-        temperature    = 0.2,   # extraction: recall > precision, keep generous default
+        temperature    = temperature,
         label          = label,
         json_mode      = True,
         prefill        = use_prefill,
@@ -2643,7 +2644,8 @@ def _gap_fill_pass(
         except Exception:
             round_user_prompt = user_prompt   # fall back to static prompt on error
 
-        raw_d  = _call_part(gap_system, round_user_prompt, MAX_TOKENS_GAP_FILL, call_label)
+        raw_d  = _call_part(gap_system, round_user_prompt, MAX_TOKENS_GAP_FILL, call_label,
+                            temperature=0.3)  # gap-fill: higher temp for recall of missed items
         data_d = _parse_partial(raw_d, f"D{gap_round}", debug_dir)
 
         # Filter hallucinated refs from gap-fill response
