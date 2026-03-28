@@ -81,7 +81,8 @@ DOMAIN_FILE      = "domain_model.json"
 COVERAGE_FILE    = "coverage_report.json"
 
 # Gap-fill: max modules per module-grouped call (covers ~10× more files than pages)
-GAP_FILL_MAX_MODULES = 30
+GAP_FILL_MAX_MODULES  = 30
+GAP_FILL_TEMPERATURE  = 0.3   # higher temp improves recall of missed items
 # Gap-fill: max individual files per call (fallback when no module structure)
 GAP_FILL_MAX_PAGES = 100
 # Gap-fill: maximum number of loop rounds.
@@ -2678,7 +2679,7 @@ def _gap_fill_pass(
 
         try:
             raw_d = _call_part(gap_system, round_user_prompt, MAX_TOKENS_GAP_FILL, call_label,
-                               temperature=0.3)  # gap-fill: higher temp for recall of missed items
+                               temperature=GAP_FILL_TEMPERATURE)
         except Exception as _gf_exc:
             print(f"  [stage4-gap] ⚠️  Round {gap_round} LLM call failed after retries: "
                   f"{_gf_exc} — skipping round")

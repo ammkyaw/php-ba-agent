@@ -650,11 +650,7 @@ def call_llm(
                     )
                     ok2, _ = _validate_json(corrected)
                     _corr_is_diag = ok2 and _is_error_diagnostic(corrected)
-                    if _corr_is_diag:
-                        # Model returned an error-report dict (e.g. {"error":"..."})
-                        # instead of the corrected content — treat as correction failure.
-                        ok2 = False
-                    if ok2:
+                    if ok2 and not _corr_is_diag:
                         result = corrected
                     else:
                         # Correction failed or returned an error diagnostic.
@@ -747,6 +743,7 @@ def _is_error_diagnostic(text: str) -> bool:
     Detecting this prevents a syntactically-valid-but-useless response from being
     accepted as a successful correction.
     """
+    import json as _json
     t = text.strip()
     # Strip markdown fences so fenced {"error": "..."} responses are also detected,
     # consistent with the fence-stripping in _validate_json.
@@ -755,10 +752,10 @@ def _is_error_diagnostic(text: str) -> bool:
     if not t.startswith("{"):
         return False
     try:
-        parsed = _json_tel.loads(t)
+        parsed = _json.loads(t)
         # Error diagnostic: a small dict with an "error" key and nothing else meaningful
         return isinstance(parsed, dict) and "error" in parsed and len(parsed) <= 3
-    except _json_tel.JSONDecodeError:
+    except _json.JSONDecodeError:
         return False
 
 

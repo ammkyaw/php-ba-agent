@@ -54,7 +54,8 @@ from context import PipelineContext, QAResult
 
 QA_REPORT_FILE = "qa_report.md"
 QA_JSON_FILE   = "qa_result.json"
-MAX_TOKENS     = 8192
+MAX_TOKENS          = 8192
+QA_PROSE_TEMPERATURE = 0.3   # review prose: reasoned but not creative
 
 # Characters of each artefact sent to Pass B.
 # 3000 × 4 = 12k + ~2k domain model = ~14k total — safe for a 4k response.
@@ -158,7 +159,7 @@ def run(ctx: PipelineContext) -> None:
     pass_a_prompt = _build_coverage_prompt(ctx, artefacts)
     print(f"  [stage6] Pass A — coverage ({len(pass_a_prompt):,} chars) ...")
     raw_a     = call_llm(system_prompt, pass_a_prompt,
-                         max_tokens=MAX_TOKENS, temperature=0.3,  # review prose: reasoned but not creative
+                         max_tokens=MAX_TOKENS, temperature=QA_PROSE_TEMPERATURE,
                          label="stage60_passA")
     pass_a_data = _parse_response(raw_a, pass_label="A")
 
@@ -167,7 +168,7 @@ def run(ctx: PipelineContext) -> None:
     pass_b_prompt = _build_consistency_prompt(ctx, artefacts, pass_d_issues)
     print(f"  [stage6] Pass B — consistency + issues ({len(pass_b_prompt):,} chars) ...")
     raw_b     = call_llm(system_prompt, pass_b_prompt,
-                         max_tokens=MAX_TOKENS, temperature=0.3,  # review prose: reasoned but not creative
+                         max_tokens=MAX_TOKENS, temperature=QA_PROSE_TEMPERATURE,
                          label="stage60_passB")
     pass_b_data = _parse_response(raw_b, pass_label="B")
 

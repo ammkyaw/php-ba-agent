@@ -57,7 +57,8 @@ from pipeline.llm_client import call_llm
 # ── Constants ──────────────────────────────────────────────────────────────────
 
 STAGE_NAME = "stage80_tests"
-MAX_TOKENS = 8192   # per-format call — one format per call avoids truncation
+MAX_TOKENS           = 8192   # per-format call — one format per call avoids truncation
+TEST_GEN_TEMPERATURE = 0.1    # test code: syntax must be consistent across chunks
 
 # AC text budget per LLM call — keeps prompt + response within model limits
 _MAX_AC_CHARS    = 3_500  # halved — smaller input → smaller output → less truncation risk
@@ -727,7 +728,7 @@ def _call_single_format(base_user: str, fmt: str, chunk_idx: int) -> str:
         system_prompt = _FORMAT_SYSTEM[fmt],
         user_prompt   = user_prompt,
         max_tokens    = MAX_TOKENS,
-        temperature   = 0.1,   # test code: syntax must be consistent across chunks
+        temperature   = TEST_GEN_TEMPERATURE,
         label         = label,
     )
 
@@ -741,7 +742,7 @@ def _call_single_format(base_user: str, fmt: str, chunk_idx: int) -> str:
         system_prompt = _FORMAT_SYSTEM[fmt],
         user_prompt   = user_prompt,
         max_tokens    = MAX_TOKENS,
-        temperature   = 0.1,
+        temperature   = TEST_GEN_TEMPERATURE,
         label         = f"{label}_retry",
     )
     result = _extract_format_content(retry_raw, fmt)
