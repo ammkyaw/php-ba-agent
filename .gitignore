@@ -218,3 +218,5 @@ vendor
 .llm_cache.db
 .llm/
 .claude/
+.agent/
+analysis_report*

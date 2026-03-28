@@ -51,6 +51,7 @@ from __future__ import annotations
 import asyncio
 import dataclasses
 import os
+import re
 from pathlib import Path
 from typing import Callable
 
@@ -69,6 +70,26 @@ _SECTION_BATCH  = max(1,   int(os.environ.get("STAGE5_SECTION_BATCH",  "20") or 
 _SECTION_TOKENS = max(500, int(os.environ.get("STAGE5_SECTION_TOKENS", "2500") or "2500"))
 _CAP_FLOWS      = max(1,   int(os.environ.get("STAGE5_CAP_FLOWS",      "30") or "30"))
 _CAP_EXEC_PATHS = max(1,   int(os.environ.get("STAGE5_CAP_EXEC_PATHS", "20") or "20"))
+# STAGE5_INPUT_BUDGET: available token budget for the *input* side of each section call.
+# = model context window  minus  max output tokens  minus  safety headroom.
+# Default 13000 works for a 16384-token context with 2500 output + 512 safety.
+# Raise this if you increase --max-model-len in vLLM.
+_STAGE5_INPUT_BUDGET = max(2048, int(os.environ.get("STAGE5_INPUT_BUDGET", "13000") or "13000"))
+_PROMPT_SAFETY       = max(128,  int(os.environ.get("STAGE5_PROMPT_SAFETY", "512") or "512"))
+_RULE_LIMIT     = max(1,    int(os.environ.get("STAGE5_RELEVANT_RULE_LIMIT", "8") or "8"))
+_FLOW_STEP_CAP  = max(3,    int(os.environ.get("STAGE5_FLOW_STEP_CAP", "8") or "8"))
+_FLOW_BRANCH_CAP = max(1,   int(os.environ.get("STAGE5_FLOW_BRANCH_CAP", "3") or "3"))
+_EXEC_DATA_FLOW_CAP = max(1, int(os.environ.get("STAGE5_EXEC_DATA_FLOW_CAP", "2") or "2"))
+_EXEC_BRANCH_CAP = max(1,   int(os.environ.get("STAGE5_EXEC_BRANCH_CAP", "2") or "2"))
+_TOKEN_RE = re.compile(r"[a-z0-9_]+")
+_STOPWORDS = {
+    "the", "and", "for", "with", "from", "that", "this", "into", "onto", "when",
+    "then", "given", "user", "users", "system", "page", "pages", "table", "tables",
+    "feature", "features", "form", "fields", "path", "flow", "write", "using",
+    "must", "should", "could", "would", "have", "has", "had", "are", "was", "were",
+    "your", "their", "them", "they", "only", "each", "through", "where", "what",
+    "which", "will", "into", "than", "true", "false", "none", "redirect",
+}
 
 # ── Critic loop feature flag ───────────────────────────────────────────────────
 # Set STAGE5_SKIP_CRITIC=1 to disable the critic loop (e.g. for fast local runs)
@@ -222,7 +243,6 @@ def _run_brd_agent(domain: DomainModel, ctx: PipelineContext) -> str:
     ) or "  - None explicitly defined"
 
     domain_hdr = _compact_domain_header(domain)
-    spec_block  = _format_spec_rules_for_prompt(ctx)
     plain_rules = _format_plain_english_rules(ctx)
     bg_flows    = _format_background_flows(ctx)
 
@@ -235,14 +255,13 @@ def _run_brd_agent(domain: DomainModel, ctx: PipelineContext) -> str:
         except Exception:
             pass
 
-    # ── System prompt includes all stable shared context (prefix-cached) ──────
-    # Placing domain_hdr / spec_block / plain_rules in the system prompt means
-    # these tokens are processed ONCE and cached (Claude prefix cache + Ollama
-    # KV cache). Each section's user prompt then contains only the section-
-    # specific instructions — a fraction of the total token cost.
+    # ── Shared system prompt base ─────────────────────────────────────────────
+    # Keep the stable domain/quality instructions in the base system prompt,
+    # then attach only the rules that matter for each section. This trims
+    # repeated low-value context without dropping feature-local evidence.
     tech_stack_block = _build_tech_stack_block(ctx)
 
-    system = _append_traceability_hints(f"""You are a senior Business Analyst writing a formal Business Requirements Document (BRD).
+    system_base = _append_traceability_hints(f"""You are a senior Business Analyst writing a formal Business Requirements Document (BRD).
 Write in professional business language using actual system names from the evidence.
 Use proper Markdown with headers, bullet points, and tables.
 When an Evidence block is provided, use routes/SQL/fields to write specific grounded criteria.
@@ -259,8 +278,19 @@ Framework context: {hints.brd_note}{_preflight_system_note(ctx)}{tech_stack_bloc
 {domain_hdr}
 User Roles:
 {role_lines}
-Features: {all_feature_names}
-{spec_block}{plain_rules}{gc_ctx}""")
+Features: {all_feature_names}""")
+
+    front_system = _join_prompt_blocks(
+        system_base,
+        _format_spec_rules_for_prompt(ctx, max_rules_per_category=4, total_limit=10),
+        gc_ctx,
+    )
+    tail_system = _join_prompt_blocks(
+        system_base,
+        _format_spec_rules_for_prompt(ctx, max_rules_per_category=5, total_limit=12),
+        plain_rules,
+        gc_ctx,
+    )
 
     parts: list[str] = []
 
@@ -286,11 +316,11 @@ List every feature: {all_feature_names}
 ## 4. Stakeholders
 Markdown table: Role | Description | Key Interests"""
 
-    parts.append(_call_section(system, front_user, "stage50_brd_front", 0.5, 1500))
+    parts.append(_call_section(front_system, front_user, "stage50_brd_front", 0.5, 1500))
 
     # ── Section B: business requirements batched by feature ───────────────────
     def _br_entry(i: int, f: dict) -> str:
-        ev_block = format_evidence_block(ev_idx.get(f["name"], {}))
+        ev_block = format_evidence_block(ev_idx.get(f["name"], {}), profile="brd")
         ev_str   = f"\n{ev_block}" if ev_block else ""
         return (
             f"### BR-{i:02d}: {f['name']}\n"
@@ -300,23 +330,34 @@ Markdown table: Role | Description | Key Interests"""
             f"{ev_str}"
         )
 
-    _brd_req_args: list[tuple] = []
-    for batch_start, batch in _feature_batches(domain.features, _SECTION_BATCH):
+    def _build_brd_req_args(batch_start: int, batch: list[dict]) -> tuple[str, str, str, float, int]:
         br_from = batch_start + 1
         br_to   = batch_start + len(batch)
         scaffold = "\n\n".join(_br_entry(i, f) for i, f in enumerate(batch, br_from))
         section_hdr = "## 5. Business Requirements\n\n" if batch_start == 0 else ""
-
-        req_user = f"""Write ONLY Business Requirements BR-{br_from:02d} through BR-{br_to:02d}.
+        relevant_rules = _select_relevant_spec_rules(ctx, features=batch)
+        dynamic_rules = _format_spec_rules_for_prompt(ctx, rules_override=relevant_rules)
+        req_user_text = f"""Write ONLY Business Requirements BR-{br_from:02d} through BR-{br_to:02d}.
 Do NOT write any other section. Do NOT repeat the document title or previous BRs.
 
 {section_hdr}Fill in Priority and Acceptance for EACH entry below.
 For trivial features write Priority: Low and a brief 1-line criterion.
 
 {scaffold}"""
-        _brd_req_args.append((system, req_user,
-                               f"stage50_brd_req_{batch_start // _SECTION_BATCH + 1}",
-                               0.4, _SECTION_TOKENS))
+        req_user = _join_prompt_blocks(dynamic_rules, req_user_text)
+        return (
+            system_base,
+            req_user,
+            f"stage50_brd_req_{br_from:02d}_{br_to:02d}",
+            0.4,
+            _SECTION_TOKENS,
+        )
+
+    _brd_req_args: list[tuple] = []
+    for batch_start, batch in _feature_batches(domain.features, _SECTION_BATCH):
+        _brd_req_args.extend(
+            _fit_feature_batch_calls("stage50_brd", batch_start, batch, _build_brd_req_args)
+        )
     parts.extend(_parallel_call_sections(_brd_req_args))
 
     # ── Section C: tail (6–9) ─────────────────────────────────────────────────
@@ -340,7 +381,7 @@ Numbered list of all rules extracted from features and spec rules above.
 ## 9. Glossary
 Markdown table: Term | Definition"""
 
-    parts.append(_call_section(system, tail_user, "stage50_brd_tail", 0.5, 1200))
+    parts.append(_call_section(tail_system, tail_user, "stage50_brd_tail", 0.5, 1200))
     return "\n\n".join(parts)
 
 
@@ -356,9 +397,6 @@ def _run_srs_agent(domain: DomainModel, ctx: PipelineContext) -> str:
     ev_idx = build_evidence_index(ctx, domain)
 
     domain_hdr   = _compact_domain_header(domain)
-    spec_block   = _format_spec_rules_for_prompt(
-        ctx, categories=["VALIDATION", "REFERENTIAL", "STATE", "BUSINESS_LIMIT"])
-
     # Collect env vars for sections 2.3 / 6
     env_block = ""
     if ctx.code_map:
@@ -385,7 +423,7 @@ def _run_srs_agent(domain: DomainModel, ctx: PipelineContext) -> str:
         except Exception:
             pass
 
-    system = _append_traceability_hints(f"""You are a senior software engineer writing a formal SRS (IEEE 830).
+    system_base = _append_traceability_hints(f"""You are a senior software engineer writing a formal SRS (IEEE 830).
 Be precise and technical. Use Evidence blocks to derive concrete Input/Processing/Output/Tables values.
 
 Quality rules:
@@ -399,8 +437,19 @@ Quality rules:
 
 {hints.srs_note}{_preflight_system_note(ctx)}{tech_stack_block}
 
-{domain_hdr}{env_block}{gc_ctx}
-{spec_block}""")
+{domain_hdr}{env_block}""")
+
+    front_system = _join_prompt_blocks(system_base, gc_ctx)
+    tail_system = _join_prompt_blocks(
+        system_base,
+        gc_ctx,
+        _format_spec_rules_for_prompt(
+            ctx,
+            categories=["VALIDATION", "REFERENTIAL", "STATE", "BUSINESS_LIMIT"],
+            max_rules_per_category=4,
+            total_limit=10,
+        ),
+    )
 
     parts: list[str] = []
 
@@ -423,11 +472,11 @@ For each user role: name, technical level, frequency of use, key tasks.
 ### 2.3 Operating Environment
 ### 2.4 Assumptions and Dependencies"""
 
-    parts.append(_call_section(system, front_user, "stage50_srs_front", 0.4, 1500))
+    parts.append(_call_section(front_system, front_user, "stage50_srs_front", 0.4, 1500))
 
     # ── Section B: FR batches (Section 3) ────────────────────────────────────
     def _fr_entry(i: int, f: dict) -> str:
-        ev_block = format_evidence_block(ev_idx.get(f["name"], {}))
+        ev_block = format_evidence_block(ev_idx.get(f["name"], {}), profile="srs")
         ev_str   = f"\n{ev_block}" if ev_block else ""
         return (
             f"### 3.{i} {f['name']}\n"
@@ -440,23 +489,38 @@ For each user role: name, technical level, frequency of use, key tasks.
             f"{ev_str}"
         )
 
-    _srs_fr_args: list[tuple] = []
-    for batch_start, batch in _feature_batches(domain.features, _SECTION_BATCH):
+    def _build_srs_fr_args(batch_start: int, batch: list[dict]) -> tuple[str, str, str, float, int]:
         fr_from = batch_start + 1
         fr_to   = batch_start + len(batch)
         scaffold = "\n\n".join(_fr_entry(i, f) for i, f in enumerate(batch, fr_from))
         section_hdr = "## 3. Functional Requirements\n\n" if batch_start == 0 else ""
-
-        fr_user = f"""Write ONLY functional requirements 3.{fr_from} through 3.{fr_to}.
+        relevant_rules = _select_relevant_spec_rules(
+            ctx,
+            categories=["VALIDATION", "REFERENTIAL", "STATE", "BUSINESS_LIMIT"],
+            features=batch,
+        )
+        dynamic_rules = _format_spec_rules_for_prompt(ctx, rules_override=relevant_rules)
+        fr_user_text = f"""Write ONLY functional requirements 3.{fr_from} through 3.{fr_to}.
 Do NOT write any other section. Do NOT repeat the document title or previous FRs.
 For trivial features write: Input=none, Processing=minimal, Output=redirect or display, Tables=none.
 
 {section_hdr}Fill in all bracketed placeholders using the Evidence blocks provided.
 
 {scaffold}"""
-        _srs_fr_args.append((system, fr_user,
-                              f"stage50_srs_fr_{batch_start // _SECTION_BATCH + 1}",
-                              0.4, _SECTION_TOKENS))
+        fr_user = _join_prompt_blocks(dynamic_rules, fr_user_text)
+        return (
+            system_base,
+            fr_user,
+            f"stage50_srs_fr_{fr_from:02d}_{fr_to:02d}",
+            0.4,
+            _SECTION_TOKENS,
+        )
+
+    _srs_fr_args: list[tuple] = []
+    for batch_start, batch in _feature_batches(domain.features, _SECTION_BATCH):
+        _srs_fr_args.extend(
+            _fit_feature_batch_calls("stage50_srs", batch_start, batch, _build_srs_fr_args)
+        )
     parts.extend(_parallel_call_sections(_srs_fr_args))
 
     # ── Section C: tail (4–6) ─────────────────────────────────────────────────
@@ -479,7 +543,7 @@ Describe each table, its purpose, and key fields.
 ## 6. System Constraints
 Technical and business constraints on the implementation."""
 
-    parts.append(_call_section(system, tail_user, "stage50_srs_tail", 0.4, 1200))
+    parts.append(_call_section(tail_system, tail_user, "stage50_srs_tail", 0.4, 1200))
     return "\n\n".join(parts)
 
 
@@ -494,11 +558,20 @@ def _run_ac_agent(domain: DomainModel, ctx: PipelineContext) -> str:
     hints            = get_hints(ctx.code_map.framework if ctx.code_map else "unknown")
     tech_stack_block = _build_tech_stack_block(ctx)
     ev_idx = build_evidence_index(ctx, domain)
-    spec_block = _format_spec_rules_for_prompt(ctx)
     domain_hdr = _compact_domain_header(domain)
 
+    # Graph-aware context (features/flows) — injected into flow and exec-path calls
+    gc_ctx = ""
+    try:
+        if hasattr(ctx, "graph_query"):
+            _gc = ctx.graph_query("business flows workflows features authorization acceptance criteria")
+            if _gc and _gc.strip():
+                gc_ctx = "\n\nGRAPH-AWARE CONTEXT (for feature/flow validation):\n" + _gc.strip()
+    except Exception:
+        pass
+
     # Lean system prompt — no flows/exec_paths (those go in individual user prompts)
-    system = _append_traceability_hints(f"""You are a QA lead writing Acceptance Criteria.
+    system_base = _append_traceability_hints(f"""You are a QA lead writing Acceptance Criteria.
 Use Given/When/Then (Gherkin) for interactive scenarios; plain pass/fail for display rules.
 Derive Given/When/Then from Evidence blocks:
   - Given: auth guard / session precondition
@@ -514,8 +587,7 @@ Quality rules:
 
 {hints.ac_template}{tech_stack_block}
 
-{domain_hdr}
-{spec_block}""")
+{domain_hdr}""")
 
     parts: list[str] = []
     all_parallel_args: list[tuple] = []
@@ -530,11 +602,11 @@ Output EXACTLY:
 ## Overview
 Brief description of how acceptance testing should be approached for this system."""
 
-    parts.append(_call_section(system, hdr_user, "stage50_ac_header", 0.35, 400))
+    parts.append(_call_section(system_base, hdr_user, "stage50_ac_header", 0.35, 400))
 
     # ── Section B: feature-batch calls (parallel) ─────────────────────────────
     def _ac_entry(i: int, f: dict) -> str:
-        ev_block = format_evidence_block(ev_idx.get(f["name"], {}))
+        ev_block = format_evidence_block(ev_idx.get(f["name"], {}), profile="ac")
         ev_str   = f"\n{ev_block}\n" if ev_block else ""
         return (
             f"## AC-{i:02d}: {f['name']}\n"
@@ -553,28 +625,44 @@ Brief description of how acceptance testing should be approached for this system
             f"- Then: [expected error/rejection]"
         )
 
-    for batch_start, batch in _feature_batches(domain.features, _SECTION_BATCH):
+    def _build_ac_batch_args(batch_start: int, batch: list[dict]) -> tuple[str, str, str, float, int]:
         ac_from  = batch_start + 1
         ac_to    = batch_start + len(batch)
         scaffold = "\n\n---\n\n".join(_ac_entry(i, f) for i, f in enumerate(batch, ac_from))
-        ac_user  = (
+        relevant_rules = _select_relevant_spec_rules(ctx, features=batch)
+        dynamic_rules = _format_spec_rules_for_prompt(ctx, rules_override=relevant_rules)
+        ac_user_text = (
             f"Write ONLY AC-{ac_from:02d} through AC-{ac_to:02d}.\n"
             f"CRITICAL: Use the EXACT headings \"## AC-XX: [Feature Name]\" as written — "
             f"do NOT rename them.\n"
             f"Do NOT write any other section or repeat previous ACs.\n\n---\n\n{scaffold}"
         )
-        all_parallel_args.append((
-            system, ac_user,
-            f"stage50_ac_batch_{batch_start // _SECTION_BATCH + 1}",
-            0.35, _SECTION_TOKENS,
-        ))
+        ac_user = _join_prompt_blocks(dynamic_rules, ac_user_text)
+        return (
+            system_base,
+            ac_user,
+            f"stage50_ac_batch_{ac_from:02d}_{ac_to:02d}",
+            0.35,
+            _SECTION_TOKENS,
+        )
+
+    for batch_start, batch in _feature_batches(domain.features, _SECTION_BATCH):
+        all_parallel_args.extend(
+            _fit_feature_batch_calls("stage50_ac", batch_start, batch, _build_ac_batch_args)
+        )
 
     # ── Section C: one call per business flow (parallel) ──────────────────────
     bfc    = getattr(ctx, "business_flows", None)
     flows  = bfc.flows if bfc and bfc.flows else []
     for i, flow in enumerate(flows, 1):
         flow_block = _format_single_flow(flow)
-        flow_user  = (
+        flow_rules = _select_relevant_spec_rules(
+            ctx,
+            categories=["WORKFLOW", "AUTHORIZATION", "VALIDATION", "STATE", "BUSINESS_LIMIT"],
+            flow=flow,
+        )
+        dynamic_rules = _format_spec_rules_for_prompt(ctx, rules_override=flow_rules)
+        flow_user_text = (
             f"Write AC for this single business flow ONLY. "
             f"Do NOT write ACs for any other flow or feature.\n\n"
             f"=== BUSINESS FLOW ===\n{flow_block}\n\n"
@@ -582,8 +670,9 @@ Brief description of how acceptance testing should be approached for this system
             f"## AC-FLOW-{i:02d}: {flow.name}\n"
             f"Write Given/When/Then covering the happy path and each listed branch."
         )
+        flow_user = _join_prompt_blocks(dynamic_rules, flow_user_text)
         all_parallel_args.append((
-            system, flow_user,
+            _join_prompt_blocks(system_base, gc_ctx), flow_user,
             f"stage50_ac_flow_{i:02d}",
             0.35, _SECTION_TOKENS,
         ))
@@ -593,7 +682,13 @@ Brief description of how acceptance testing should be approached for this system
     exec_paths = list(getattr(cm, "execution_paths", None) or []) if cm else []
     for i, ep in enumerate(exec_paths, 1):
         ep_block  = _format_single_exec_path(ep)
-        ep_user   = (
+        ep_rules = _select_relevant_spec_rules(
+            ctx,
+            categories=["AUTHORIZATION", "VALIDATION", "STATE", "REFERENTIAL", "BUSINESS_LIMIT"],
+            exec_path=ep,
+        )
+        dynamic_rules = _format_spec_rules_for_prompt(ctx, rules_override=ep_rules)
+        ep_user_text = (
             f"Write AC for this single execution path ONLY. "
             f"Do NOT write ACs for any other path or feature.\n\n"
             f"=== EXECUTION PATH ===\n{ep_block}\n\n"
@@ -601,8 +696,9 @@ Brief description of how acceptance testing should be approached for this system
             f"## AC-PATH-{i:02d}: {ep.get('file', '?')}\n"
             f"Write Given/When/Then derived from the auth guard and branch conditions above."
         )
+        ep_user = _join_prompt_blocks(dynamic_rules, ep_user_text)
         all_parallel_args.append((
-            system, ep_user,
+            _join_prompt_blocks(system_base, gc_ctx), ep_user,
             f"stage50_ac_path_{i:02d}",
             0.35, _SECTION_TOKENS,
         ))
@@ -615,7 +711,7 @@ Brief description of how acceptance testing should be approached for this system
         "Output EXACTLY:\n\n---\n\n## Test Data Requirements\n"
         "What test data is needed to execute these criteria (users, records, files, etc.)."
     )
-    parts.append(_call_section(system, tail_user, "stage50_ac_tail", 0.35, 500))
+    parts.append(_call_section(system_base, tail_user, "stage50_ac_tail", 0.35, 500))
     return "\n\n".join(parts)
 
 
@@ -630,11 +726,20 @@ def _run_userstories_agent(domain: DomainModel, ctx: PipelineContext) -> str:
     tech_stack_block = _build_tech_stack_block(ctx)
     ev_idx = build_evidence_index(ctx, domain)
 
-    spec_block = _format_spec_rules_for_prompt(ctx, categories=["WORKFLOW", "AUTHORIZATION"])
     domain_hdr = _compact_domain_header(domain)
 
+    # Graph-aware context (features/flows) — injected into flow and exec-path calls
+    gc_ctx = ""
+    try:
+        if hasattr(ctx, "graph_query"):
+            _gc = ctx.graph_query("business flows workflows features authorization user stories")
+            if _gc and _gc.strip():
+                gc_ctx = "\n\nGRAPH-AWARE CONTEXT (for feature/flow grounding):\n" + _gc.strip()
+    except Exception:
+        pass
+
     # Lean system prompt — flows/exec_paths go in individual user prompts
-    system = _append_traceability_hints(f"""You are an Agile product owner writing User Stories.
+    system_base = _append_traceability_hints(f"""You are an Agile product owner writing User Stories.
 Format: 'As a [role], I want to [action], so that [benefit]'.
 Include story points (Fibonacci: 1,2,3,5,8,13) and priority (Must/Should/Could/Won't).
 Derive "I want to" and AC from Evidence blocks — use actual routes, fields, and tables.
@@ -649,8 +754,7 @@ Quality rules:
 
 {hints.story_note}{tech_stack_block}
 
-{domain_hdr}
-{spec_block}""")
+{domain_hdr}""")
 
     parts: list[str] = []
 
@@ -669,25 +773,20 @@ Output EXACTLY:
 {all_epics}
 """
 
-    parts.append(_call_section(system, hdr_user, "stage50_us_header", 0.5, 600))
+    parts.append(_call_section(system_base, hdr_user, "stage50_us_header", 0.5, 600))
 
     # ── Section B: epic batches ───────────────────────────────────────────────
-    # story counter must be consistent across batches
-    us_global_idx = [1]
-
-    def _epic_block(f: dict) -> str:
+    def _epic_block(i: int, f: dict) -> str:
         feat_name = f["name"]
         desc      = f.get("description", "")
         pages     = ", ".join(_to_str_list(f.get("pages", []))) or "see domain model"
         tables    = ", ".join(_to_str_list(f.get("tables", []))) or "see domain model"
-        idx       = us_global_idx[0]
-        us_global_idx[0] += 1
-        ev_block  = format_evidence_block(ev_idx.get(feat_name, {}))
+        ev_block  = format_evidence_block(ev_idx.get(feat_name, {}), profile="us")
         ev_str    = f"\n{ev_block}\n" if ev_block else ""
         return (
             f"## Epic: {feat_name}\n\n"
             f"{ev_str}"
-            f"### US-{idx:03d}: [Story title for {feat_name}]\n"
+            f"### US-{i:03d}: [Story title for {feat_name}]\n"
             f"**As a** [role]\n"
             f"**I want to** [action — derive from route/form fields in evidence]\n"
             f"**So that** [benefit]\n\n"
@@ -704,27 +803,49 @@ Output EXACTLY:
     all_us_parallel_args: list[tuple] = []
 
     # ── epic batch calls ───────────────────────────────────────────────────────
-    for batch_start, batch in _feature_batches(domain.features, _SECTION_BATCH):
-        scaffold   = "\n\n---\n\n".join(_epic_block(f) for f in batch)
+    def _build_us_batch_args(batch_start: int, batch: list[dict]) -> tuple[str, str, str, float, int]:
+        scaffold   = "\n\n---\n\n".join(
+            _epic_block(i, f) for i, f in enumerate(batch, batch_start + 1)
+        )
         epic_names = ", ".join(f["name"] for f in batch)
-        epic_user  = (
+        relevant_rules = _select_relevant_spec_rules(
+            ctx,
+            categories=["WORKFLOW", "AUTHORIZATION", "VALIDATION"],
+            features=batch,
+        )
+        dynamic_rules = _format_spec_rules_for_prompt(ctx, rules_override=relevant_rules)
+        epic_user_text = (
             f"Write ONLY the epic detail for: {epic_names}.\n"
             f"CRITICAL: Use EXACT headings \"## Epic: [Feature Name]\" as written — "
             f"do NOT rename them.\n"
             f"Do NOT write any other section or repeat previous epics.\n\n---\n\n{scaffold}"
         )
-        all_us_parallel_args.append((
-            system, epic_user,
-            f"stage50_us_epics_{batch_start // _SECTION_BATCH + 1}",
-            0.5, _SECTION_TOKENS,
-        ))
+        epic_user = _join_prompt_blocks(dynamic_rules, epic_user_text)
+        return (
+            system_base,
+            epic_user,
+            f"stage50_us_epics_{batch_start + 1:02d}_{batch_start + len(batch):02d}",
+            0.5,
+            _SECTION_TOKENS,
+        )
+
+    for batch_start, batch in _feature_batches(domain.features, _SECTION_BATCH):
+        all_us_parallel_args.extend(
+            _fit_feature_batch_calls("stage50_us", batch_start, batch, _build_us_batch_args)
+        )
 
     # ── one call per business flow ─────────────────────────────────────────────
     bfc   = getattr(ctx, "business_flows", None)
     flows = bfc.flows if bfc and bfc.flows else []
     for i, flow in enumerate(flows, 1):
         flow_block = _format_single_flow(flow)
-        flow_user  = (
+        flow_rules = _select_relevant_spec_rules(
+            ctx,
+            categories=["WORKFLOW", "AUTHORIZATION", "VALIDATION"],
+            flow=flow,
+        )
+        dynamic_rules = _format_spec_rules_for_prompt(ctx, rules_override=flow_rules)
+        flow_user_text = (
             f"Write a User Story for this single business flow ONLY. "
             f"Do NOT write stories for any other flow or feature.\n\n"
             f"=== BUSINESS FLOW ===\n{flow_block}\n\n"
@@ -733,8 +854,9 @@ Output EXACTLY:
             f"Write As a/I want to/So that derived from the flow steps above, "
             f"with AC covering the happy path and each branch."
         )
+        flow_user = _join_prompt_blocks(dynamic_rules, flow_user_text)
         all_us_parallel_args.append((
-            system, flow_user,
+            _join_prompt_blocks(system_base, gc_ctx), flow_user,
             f"stage50_us_flow_{i:02d}",
             0.5, _SECTION_TOKENS,
         ))
@@ -744,7 +866,13 @@ Output EXACTLY:
     exec_paths = list(getattr(cm, "execution_paths", None) or []) if cm else []
     for i, ep in enumerate(exec_paths, 1):
         ep_block = _format_single_exec_path(ep)
-        ep_user  = (
+        ep_rules = _select_relevant_spec_rules(
+            ctx,
+            categories=["AUTHORIZATION", "WORKFLOW", "VALIDATION"],
+            exec_path=ep,
+        )
+        dynamic_rules = _format_spec_rules_for_prompt(ctx, rules_override=ep_rules)
+        ep_user_text = (
             f"Write a User Story for this single execution path ONLY. "
             f"Do NOT write stories for any other path or feature.\n\n"
             f"=== EXECUTION PATH ===\n{ep_block}\n\n"
@@ -753,8 +881,9 @@ Output EXACTLY:
             f"Write As a/I want to/So that derived from the branch conditions above, "
             f"with AC covering the auth guard and each branch outcome."
         )
+        ep_user = _join_prompt_blocks(dynamic_rules, ep_user_text)
         all_us_parallel_args.append((
-            system, ep_user,
+            _join_prompt_blocks(system_base, gc_ctx), ep_user,
             f"stage50_us_path_{i:02d}",
             0.5, _SECTION_TOKENS,
         ))
@@ -782,7 +911,7 @@ Markdown table: Story ID | Title | Epic | Priority | Points | Status
 ## Total Story Points
 Sum by priority band (Must Have / Should Have / Could Have / Won't Have)."""
 
-    parts.append(_call_section(system, tail_user, "stage50_us_tail", 0.5, 800))
+    parts.append(_call_section(system_base, tail_user, "stage50_us_tail", 0.5, 800))
     return "\n\n".join(parts)
 
 
@@ -842,6 +971,242 @@ def _feature_batches(features: list, batch_size: int):
         yield i, features[i : i + batch_size]
 
 
+def _section_input_budget(max_tokens: int) -> int:
+    """Available input budget = STAGE5_INPUT_BUDGET minus the call's output reservation."""
+    return max(1024, _STAGE5_INPUT_BUDGET - max_tokens - _PROMPT_SAFETY)
+
+
+def _estimate_tokens(*parts: str) -> int:
+    """
+    Rough token estimate without pulling in a model tokenizer.
+    Good enough for pre-flight prompt budgeting.
+    """
+    total_chars = sum(len(p) for p in parts if p)
+    return max(1, total_chars // 4)
+
+
+def _join_prompt_blocks(*parts: str) -> str:
+    """Join non-empty prompt blocks with blank lines."""
+    return "\n\n".join(p.strip() for p in parts if p and p.strip())
+
+
+def _keyword_set(*values) -> set[str]:
+    """Extract normalized keyword tokens from arbitrary nested values."""
+    out: set[str] = set()
+
+    def _walk(value) -> None:
+        if value is None:
+            return
+        if isinstance(value, dict):
+            for nested in value.values():
+                _walk(nested)
+            return
+        if isinstance(value, (list, tuple, set)):
+            for nested in value:
+                _walk(nested)
+            return
+        text = str(value).replace("/", " ").replace("-", " ").replace(".", " ")
+        for tok in _TOKEN_RE.findall(text.lower()):
+            if len(tok) < 3 or tok in _STOPWORDS or tok.isdigit():
+                continue
+            out.add(tok)
+
+    for value in values:
+        _walk(value)
+    return out
+
+
+def _basename_set(paths: list[str]) -> set[str]:
+    return {
+        Path(p).name.lower()
+        for p in paths
+        if isinstance(p, str) and p.strip()
+    }
+
+
+def _collect_rule_signals(
+    features: list[dict] | None = None,
+    flow = None,
+    exec_path: dict | None = None,
+) -> dict[str, set[str]]:
+    """Collect relevance signals from the current Stage 5 target."""
+    pages: set[str] = set()
+    tables: set[str] = set()
+    files: set[str] = set()
+    contexts: set[str] = set()
+    flow_ids: set[str] = set()
+    keywords: set[str] = set()
+
+    for feat in features or []:
+        pages |= _basename_set(_to_str_list(feat.get("pages", [])))
+        tables |= {t.lower() for t in _to_str_list(feat.get("tables", [])) if t}
+        keywords |= _keyword_set(
+            feat.get("name", ""),
+            feat.get("description", ""),
+            feat.get("business_rules", []),
+            feat.get("workflows", []),
+            feat.get("pages", []),
+            feat.get("tables", []),
+        )
+
+    if flow is not None:
+        flow_ids.add(getattr(flow, "flow_id", "").lower())
+        contexts.add(getattr(flow, "bounded_context", "").lower())
+        keywords |= _keyword_set(
+            getattr(flow, "name", ""),
+            getattr(flow, "actor", ""),
+            getattr(flow, "trigger", ""),
+            getattr(flow, "termination", ""),
+            getattr(flow, "branches", []),
+        )
+        for step in getattr(flow, "steps", []) or []:
+            page = getattr(step, "page", "")
+            if page:
+                pages.add(Path(page).name.lower())
+            keywords |= _keyword_set(
+                page,
+                getattr(step, "action", ""),
+                getattr(step, "http_method", ""),
+                getattr(step, "inputs", []),
+                getattr(step, "outputs", []),
+                getattr(step, "db_ops", []),
+            )
+            for db_op in getattr(step, "db_ops", []) or []:
+                tables |= {tok for tok in _keyword_set(db_op) if tok not in _STOPWORDS}
+
+    if exec_path:
+        file_name = exec_path.get("file", "")
+        if file_name:
+            files.add(Path(file_name).name.lower())
+            pages.add(Path(file_name).name.lower())
+        keywords |= _keyword_set(file_name, exec_path.get("auth_guard"), exec_path.get("branches"))
+        for data_flow in (exec_path.get("data_flows", []) or []):
+            table = data_flow.get("table", "")
+            if table:
+                tables.add(str(table).lower())
+            keywords |= _keyword_set(data_flow.get("field_mapping", {}), data_flow.get("sink", ""))
+
+    return {
+        "pages": pages,
+        "tables": tables,
+        "files": files | pages,
+        "contexts": contexts,
+        "flow_ids": {fid for fid in flow_ids if fid},
+        "keywords": keywords | tables | contexts,
+    }
+
+
+def _score_spec_rule(rule, signals: dict[str, set[str]]) -> float:
+    """Heuristic relevance score for attaching Stage 4.6 rules to a Stage 5 call."""
+    score = float(getattr(rule, "confidence", 0.0) or 0.0)
+    rule_terms = _keyword_set(
+        getattr(rule, "title", ""),
+        getattr(rule, "description", ""),
+        getattr(rule, "given", ""),
+        getattr(rule, "when", ""),
+        getattr(rule, "then", ""),
+        getattr(rule, "tags", []),
+        getattr(rule, "entities", []),
+        getattr(rule, "bounded_context", ""),
+        getattr(rule, "source_files", []),
+    )
+
+    overlap = len(rule_terms & signals["keywords"])
+    score += min(overlap, 8) * 0.5
+
+    rule_entities = {str(e).lower() for e in getattr(rule, "entities", []) if e}
+    score += min(len(rule_entities & signals["tables"]), 3) * 1.5
+
+    rule_files = _basename_set(getattr(rule, "source_files", []))
+    if rule_files & signals["files"]:
+        score += 3.0
+
+    rule_context = str(getattr(rule, "bounded_context", "") or "").lower()
+    if rule_context and rule_context in signals["contexts"]:
+        score += 3.0
+
+    rule_flow_ids = {str(fid).lower() for fid in getattr(rule, "source_flows", []) if fid}
+    if rule_flow_ids & signals["flow_ids"]:
+        score += 4.0
+
+    return score
+
+
+def _select_relevant_spec_rules(
+    ctx: PipelineContext,
+    categories: list[str] | None = None,
+    *,
+    features: list[dict] | None = None,
+    flow = None,
+    exec_path: dict | None = None,
+    limit: int = _RULE_LIMIT,
+):
+    """Choose the most relevant Stage 4.6 rules for a Stage 5 target."""
+    sr_col = getattr(ctx, "spec_rules", None)
+    if not sr_col or not sr_col.rules or limit <= 0:
+        return []
+
+    rules = sr_col.rules
+    if categories:
+        wanted = {c.upper() for c in categories}
+        rules = [r for r in rules if str(getattr(r, "category", "")).upper() in wanted]
+    if not rules:
+        return []
+
+    signals = _collect_rule_signals(features=features, flow=flow, exec_path=exec_path)
+    ranked = [
+        (_score_spec_rule(rule, signals), float(getattr(rule, "confidence", 0.0) or 0.0), rule)
+        for rule in rules
+    ]
+    ranked.sort(key=lambda item: (item[0], item[1], getattr(item[2], "rule_id", "")), reverse=True)
+    selected = [rule for score, _, rule in ranked if score > 0][:limit]
+    if selected:
+        return selected
+    # Fallback: keep the strongest-confidence rules in the requested category.
+    fallback = sorted(
+        rules,
+        key=lambda rule: (
+            float(getattr(rule, "confidence", 0.0) or 0.0),
+            getattr(rule, "rule_id", ""),
+        ),
+        reverse=True,
+    )
+    return fallback[:limit]
+
+
+def _fit_feature_batch_calls(
+    stage_name: str,
+    batch_start: int,
+    batch: list[dict],
+    build_args: Callable[[int, list[dict]], tuple[str, str, str, float, int]],
+) -> list[tuple[str, str, str, float, int]]:
+    """
+    Recursively split a feature batch until its estimated input fits the budget.
+    This preserves evidence accuracy better than trimming away routes/rules.
+    """
+    system, user, label, temperature, max_tokens = build_args(batch_start, batch)
+    est = _estimate_tokens(system, user)
+    budget = _section_input_budget(max_tokens)
+    if est <= budget or len(batch) <= 1:
+        if est > budget:
+            print(
+                f"  [stage5] {stage_name} singleton batch {batch_start + 1}-{batch_start + len(batch)} "
+                f"still exceeds prompt budget ({est} > {budget}); using compact prompt as-is."
+            )
+        return [(system, user, label, temperature, max_tokens)]
+
+    mid = max(1, len(batch) // 2)
+    print(
+        f"  [stage5] {stage_name} prompt {batch_start + 1}-{batch_start + len(batch)} "
+        f"~{est} tok exceeds budget {budget}; splitting {len(batch)} feature(s) into "
+        f"{mid} + {len(batch) - mid}."
+    )
+    return (
+        _fit_feature_batch_calls(stage_name, batch_start, batch[:mid], build_args)
+        + _fit_feature_batch_calls(stage_name, batch_start + mid, batch[mid:], build_args)
+    )
+
+
 def _compact_domain_header(domain: DomainModel) -> str:
     """
     Minimal domain context block for section-level calls.
@@ -865,7 +1230,14 @@ def _compact_domain_header(domain: DomainModel) -> str:
 
 # ─── Helpers ───────────────────────────────────────────────────────────────────
 
-def _format_spec_rules_for_prompt(ctx: PipelineContext, categories: list[str] | None = None) -> str:
+def _format_spec_rules_for_prompt(
+    ctx: PipelineContext,
+    categories: list[str] | None = None,
+    *,
+    rules_override: list | None = None,
+    max_rules_per_category: int = 20,
+    total_limit: int | None = None,
+) -> str:
     """
     Format Stage 4.6 SpecRules as a structured prompt block.
 
@@ -879,11 +1251,14 @@ def _format_spec_rules_for_prompt(ctx: PipelineContext, categories: list[str] | 
     if not sr_col or not sr_col.rules:
         return ""
 
-    rules = sr_col.rules
+    rules = list(rules_override) if rules_override is not None else list(sr_col.rules)
     if categories:
-        rules = [r for r in rules if r.category in categories]
+        wanted = {c.upper() for c in categories}
+        rules = [r for r in rules if str(r.category).upper() in wanted]
     if not rules:
         return ""
+    if total_limit is not None:
+        rules = rules[:total_limit]
 
     lines = [
         f"\n=== MINED BUSINESS RULES — STAGE 4.6 ({len(rules)} rules) ===",
@@ -898,15 +1273,17 @@ def _format_spec_rules_for_prompt(ctx: PipelineContext, categories: list[str] | 
 
     for cat, cat_rules in sorted(by_cat.items()):
         lines.append(f"\n[{cat}]")
-        for rule in cat_rules[:20]:   # cap per category to stay within token budget
+        for rule in cat_rules[:max_rules_per_category]:
             lines.append(f"  {rule.rule_id}  {rule.title}")
             lines.append(f"    Given: {rule.given}")
             lines.append(f"    When:  {rule.when}")
             lines.append(f"    Then:  {rule.then}")
             if rule.entities:
                 lines.append(f"    Entities: {', '.join(rule.entities)}")
-        if len(cat_rules) > 20:
-            lines.append(f"  … and {len(cat_rules) - 20} more {cat} rules")
+        if len(cat_rules) > max_rules_per_category:
+            lines.append(
+                f"  … and {len(cat_rules) - max_rules_per_category} more {cat} rules"
+            )
 
     return "\n".join(lines)
 
@@ -1040,17 +1417,23 @@ def _format_single_flow(f) -> str:
         f"  Terminates : {f.termination}",
         "  Steps:",
     ]
-    for s in f.steps:
+    shown_steps = list(getattr(f, "steps", []) or [])[:_FLOW_STEP_CAP]
+    for s in shown_steps:
         auth = " [AUTH REQUIRED]" if s.auth_required else ""
         meth = f" ({s.http_method})" if s.http_method else ""
         db   = f" → DB: {'; '.join(s.db_ops[:2])}" if s.db_ops else ""
         inp  = f" inputs=[{', '.join(s.inputs)}]" if s.inputs else ""
         out  = f" outputs=[{', '.join(s.outputs[:2])}]" if s.outputs else ""
         lines.append(f"    {s.step_num}. {s.page}{meth}{auth}{db}{inp}{out}")
-        lines.append(f"       {s.action}")
+        lines.append(f"       {str(s.action)[:140]}")
+    if len(getattr(f, "steps", []) or []) > len(shown_steps):
+        lines.append(
+            f"    … {len((getattr(f, 'steps', []) or [])) - len(shown_steps)} more step(s) omitted"
+        )
     if f.branches:
-        lines.append(f"  Branches ({len(f.branches)}):")
-        for b in f.branches:
+        shown_branches = list(f.branches)[:_FLOW_BRANCH_CAP]
+        lines.append(f"  Branches ({len(shown_branches)} of {len(f.branches)} shown):")
+        for b in shown_branches:
             lines.append(
                 f"    • At {b.get('at_page', '?')}: if ({b['condition']}) "
                 f"→ {', '.join(b['alternate'])}"
@@ -1068,13 +1451,13 @@ def _format_single_exec_path(ep: dict) -> str:
             f"  • Auth required: session['{ag.get('key','?')}'] "
             f"(else → {ag.get('redirect','redirect')})"
         )
-    for flow in ep.get("data_flows", []):
+    for flow in (ep.get("data_flows", []) or [])[:_EXEC_DATA_FLOW_CAP]:
         fields = list(flow.get("field_mapping", {}).keys())
         table  = flow.get("table", "?")
         op     = flow.get("sink", "sql")
         if fields:
             lines.append(f"  • Input: [{', '.join(fields)}] → {op} on `{table}`")
-    for b in ep.get("branches", [])[:2]:
+    for b in (ep.get("branches", []) or [])[:_EXEC_BRANCH_CAP]:
         cond      = b.get("condition", "")[:80]
         then_acts = [
             f"{a.get('action','')} {a.get('target') or a.get('key') or a.get('table','')}".strip()

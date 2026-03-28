@@ -67,6 +67,50 @@ _MAX_FORM_FILES  = 3
 _MAX_FIELDS      = 8   # field names per form file
 _MAX_EXEC_PATHS  = 3
 
+_EVIDENCE_PROFILES: dict[str, dict[str, int]] = {
+    "default": {
+        "routes": _MAX_ROUTES,
+        "controllers": _MAX_CONTROLLERS,
+        "sql": _MAX_SQL,
+        "form_files": _MAX_FORM_FILES,
+        "fields": _MAX_FIELDS,
+        "exec_paths": _MAX_EXEC_PATHS,
+    },
+    # BA writers care more about concrete route/table/form evidence than class names.
+    "brd": {
+        "routes": 1,
+        "controllers": 0,
+        "sql": 2,
+        "form_files": 1,
+        "fields": 4,
+        "exec_paths": 0,
+    },
+    "srs": {
+        "routes": 2,
+        "controllers": 0,
+        "sql": 3,
+        "form_files": 2,
+        "fields": 6,
+        "exec_paths": 1,
+    },
+    "ac": {
+        "routes": 2,
+        "controllers": 0,
+        "sql": 2,
+        "form_files": 2,
+        "fields": 6,
+        "exec_paths": 1,
+    },
+    "us": {
+        "routes": 1,
+        "controllers": 0,
+        "sql": 1,
+        "form_files": 1,
+        "fields": 5,
+        "exec_paths": 1,
+    },
+}
+
 # ── Confidence thresholds ──────────────────────────────────────────────────────
 _SCORE_PER_CATEGORY   = 0.2   # each of 5 evidence types = +0.2
 _THRESHOLD_HIGH       = 0.8
@@ -190,7 +234,7 @@ def build_confidence_report(ev_idx: dict[str, dict]) -> list[dict]:
     return rows
 
 
-def format_evidence_block(ev: dict) -> str:
+def format_evidence_block(ev: dict, profile: str = "default") -> str:
     """
     Format a single feature's evidence dict as a concise Markdown block
     suitable for embedding in an LLM prompt scaffold.
@@ -201,28 +245,29 @@ def format_evidence_block(ev: dict) -> str:
     Returns an empty string when no evidence was found for the feature.
     """
     lines: list[str] = []
+    caps = _EVIDENCE_PROFILES.get(profile, _EVIDENCE_PROFILES["default"])
 
     # ── Routes ────────────────────────────────────────────────────────────────
-    for r in ev.get("routes", []):
+    for r in ev.get("routes", [])[:caps["routes"]]:
         method = r.get("method", "?")
         path   = r.get("path",   "?")
         ffile  = Path(r.get("file", "?")).name
         lines.append(f"  - Route: `{method} {path}` [{ffile}]")
 
     # ── Controllers ───────────────────────────────────────────────────────────
-    ctrls = ev.get("controllers", [])
+    ctrls = ev.get("controllers", [])[:caps["controllers"]]
     if ctrls:
         lines.append(f"  - Controller: {', '.join(f'`{c}`' for c in ctrls)}")
 
     # ── SQL queries ───────────────────────────────────────────────────────────
-    for q in ev.get("sql", []):
+    for q in ev.get("sql", [])[:caps["sql"]]:
         op    = q.get("operation", "?")
         table = q.get("table",     "?")
         qfile = Path(q.get("file", "?")).name
         lines.append(f"  - SQL: `{op} {table}` [{qfile}]")
 
     # ── Form fields ───────────────────────────────────────────────────────────
-    for ff in ev.get("form_fields", []):
+    for ff in ev.get("form_fields", [])[:caps["form_files"]]:
         fname  = Path(ff.get("file", "?")).name
         action = ff.get("action", "")
         method = ff.get("method", "")
@@ -230,7 +275,7 @@ def format_evidence_block(ev: dict) -> str:
             f.get("name", "")
             for f in ff.get("fields", [])
             if f.get("name") and f.get("type") not in ("hidden",)
-        ][:_MAX_FIELDS]
+        ][:caps["fields"]]
         visible = [f for f in fields if f]
         # include hidden fields too if no visible ones found
         if not visible:
@@ -238,7 +283,7 @@ def format_evidence_block(ev: dict) -> str:
                 f.get("name", "")
                 for f in ff.get("fields", [])
                 if f.get("name")
-            ][:_MAX_FIELDS]
+            ][:caps["fields"]]
         if visible:
             action_str = f" → {action}" if action else ""
             lines.append(
@@ -247,7 +292,7 @@ def format_evidence_block(ev: dict) -> str:
             )
 
     # ── Execution paths ───────────────────────────────────────────────────────
-    for ep in ev.get("execution_paths", []):
+    for ep in ev.get("execution_paths", [])[:caps["exec_paths"]]:
         efile = Path(ep.get("file", "?")).name
         auth  = ep.get("auth_guard") or {}
         parts = [f"`{efile}`"]
