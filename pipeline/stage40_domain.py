@@ -2644,8 +2644,13 @@ def _gap_fill_pass(
         except Exception:
             round_user_prompt = user_prompt   # fall back to static prompt on error
 
-        raw_d  = _call_part(gap_system, round_user_prompt, MAX_TOKENS_GAP_FILL, call_label,
-                            temperature=0.3)  # gap-fill: higher temp for recall of missed items
+        try:
+            raw_d = _call_part(gap_system, round_user_prompt, MAX_TOKENS_GAP_FILL, call_label,
+                               temperature=0.3)  # gap-fill: higher temp for recall of missed items
+        except Exception as _gf_exc:
+            print(f"  [stage4-gap] ⚠️  Round {gap_round} LLM call failed after retries: "
+                  f"{_gf_exc} — skipping round")
+            continue
         data_d = _parse_partial(raw_d, f"D{gap_round}", debug_dir)
 
         # Filter hallucinated refs from gap-fill response
