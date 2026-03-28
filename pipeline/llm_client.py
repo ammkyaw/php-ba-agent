@@ -719,17 +719,22 @@ def call_llm(
     )
 
 
+def _strip_markdown_fences(text: str) -> str:
+    """Strip opening/closing markdown code fences (e.g. ```json ... ```) from text."""
+    t = text.strip()
+    if t.startswith("```"):
+        t = "\n".join(l for l in t.splitlines() if not l.strip().startswith("```")).strip()
+    return t
+
+
 def _validate_json(text: str) -> tuple[bool, str]:
     """
     Try to parse *text* as JSON.  Returns (True, "") on success or
     (False, error_message) on failure.  Strips markdown fences first.
     """
     import json as _json
-    t = text.strip()
-    if t.startswith("```"):
-        t = "\n".join(l for l in t.splitlines() if not l.strip().startswith("```")).strip()
     try:
-        _json.loads(t)
+        _json.loads(_strip_markdown_fences(text))
         return True, ""
     except _json.JSONDecodeError as exc:
         return False, str(exc)
@@ -744,11 +749,7 @@ def _is_error_diagnostic(text: str) -> bool:
     accepted as a successful correction.
     """
     import json as _json
-    t = text.strip()
-    # Strip markdown fences so fenced {"error": "..."} responses are also detected,
-    # consistent with the fence-stripping in _validate_json.
-    if t.startswith("```"):
-        t = "\n".join(l for l in t.splitlines() if not l.strip().startswith("```")).strip()
+    t = _strip_markdown_fences(text)
     if not t.startswith("{"):
         return False
     try:
