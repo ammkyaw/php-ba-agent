@@ -391,7 +391,7 @@ def _extract_schema_rules(
             col_name = col_name,
             fpath    = tc.get("file", ""),
             nullable = tc.get("nullable", True),
-            unique   = bool(tc.get("unique") or tc.get("foreign")),
+            unique   = bool(tc.get("unique")),
             primary  = bool(tc.get("primary")),
         )
 
@@ -944,7 +944,7 @@ def _extract_source_rules_ts(
     raw: list[dict] = []
     seen_desc: set[str] = set()
 
-    # Collect unique files from execution_paths + all .ts/.tsx source files
+    # Collect unique files from execution_paths
     file_paths: list[str] = list({
         ep.get("file", "") for ep in (cm.execution_paths or []) if ep.get("file")
     })
@@ -1229,7 +1229,7 @@ def run(ctx: PipelineContext) -> None:
         )
     else:
         print("  [stage29] Phase 3: Scanning PHP source files ...")
-        php_root = getattr(ctx, "php_project_path", None) or ctx.project_path
+        php_root = ctx.project_path
         source_rules = _extract_source_rules(
             cm, php_root, ac_file_map, file_to_tables, post_keys
         )
