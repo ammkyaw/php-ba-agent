@@ -1032,7 +1032,18 @@ def _strip_repetition_loop(content: str) -> str:
     # represents genuine degenerate repetition rather than valid JSON structure.
     _WINDOWS = [150, 200, 300, 400]
 
+    # For structured JSON responses, boilerplate repeated key patterns
+    # ("inputs": [], "outputs": "...", "business_rules": []) cause false
+    # positives at small window sizes.  Only apply windows ≥ 300 when the
+    # content looks like JSON — a 300-char identical block in JSON genuinely
+    # means the model has looped on full feature entries.
+    _stripped = content.lstrip()
+    _is_json  = _stripped.startswith("{") or _stripped.startswith("[")
+    _JSON_MIN_WINDOW = 300
+
     for window in _WINDOWS:
+        if _is_json and window < _JSON_MIN_WINDOW:
+            continue   # skip small windows for JSON — false-positive prone
         if len(content) < window * threshold:
             continue            # text too short for this window size
         step = max(1, window // 2)

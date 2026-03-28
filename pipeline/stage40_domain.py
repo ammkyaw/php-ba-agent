@@ -50,6 +50,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 from pathlib import Path
 from typing import Any
 
@@ -421,21 +422,36 @@ def run(ctx: PipelineContext) -> None:
         return _group, _parse_label, _parse_partial(raw, _parse_label, debug_dir)
 
     if _workers > 1 and len(_call_specs) > 1:
-        from concurrent.futures import ThreadPoolExecutor as _TPE, as_completed as _ac
+        from concurrent.futures import ThreadPoolExecutor as _TPE
         print(f"  [stage4] Running {len(_call_specs)} independent LLM call(s) "
               f"in parallel (workers={min(len(_call_specs), _workers)}) ...")
         with _TPE(max_workers=min(len(_call_specs), _workers)) as _pool:
-            _spec_futs = {_pool.submit(_run_stage4_call, spec): spec
-                          for spec in _call_specs}
+            # Submit in _call_specs order so results are always collected in the
+            # same order — _merge_consistency_b dedupes by "first seen wins", so
+            # nondeterministic collection via as_completed() would make feature
+            # content vary across runs.
+            _futs = [_pool.submit(_run_stage4_call, spec) for spec in _call_specs]
+
+            # Collect in submission order.  Gather ALL failures before raising so
+            # the user sees every broken call at once rather than first-fail-fast.
+            # Never substitute {} — a silent empty result silently under-populates
+            # the domain model and cascades into degraded BRD/SRS/AC/User Stories.
             _call_results: list[tuple[str, str, dict]] = []
-            for _fut in _ac(_spec_futs):
-                _spec = _spec_futs[_fut]
+            _failures: list[str] = []
+            for _fut, _spec in zip(_futs, _call_specs):
                 _grp, _lbl = _spec[0], _spec[5]
                 try:
                     _call_results.append(_fut.result())
                 except Exception as _exc:
-                    print(f"  [stage4] ⚠️  Call {_lbl} failed: {_exc} — skipping")
-                    _call_results.append((_grp, _lbl, {}))
+                    print(f"  [stage4] ✗ Call {_lbl} failed: {_exc}")
+                    _failures.append(f"{_lbl}: {_exc}")
+
+            if _failures:
+                raise RuntimeError(
+                    f"[stage4] {len(_failures)} LLM sub-call(s) failed — "
+                    f"Stage 4 cannot produce a reliable domain model:\n"
+                    + "\n".join(f"  • {f}" for f in _failures)
+                )
     else:
         _call_results = [_run_stage4_call(spec) for spec in _call_specs]
 
@@ -485,10 +501,22 @@ def run(ctx: PipelineContext) -> None:
             known_fields=known_fields,
         )
 
+    # ── Static table + field enrichment (no LLM) ──────────────────────────────
+    # Derive table and field membership purely from the code_map data already
+    # collected by Stage 1 parsers.  For every file a feature references in
+    # its 'pages' array, look up which SQL tables / POST fields that file uses
+    # and inject them into the feature's tables/inputs arrays.
+    # This is free (no LLM calls) and typically adds 20-40 pp of table/field
+    # coverage that the LLM missed because it only saw ~25 evidence chunks.
+    _t_added, _f_added = _static_enrich_tables_and_fields(domain_model, cm)
+    if _t_added or _f_added:
+        print(f"  [stage4] Static enrichment: +{_t_added} table ref(s), "
+              f"+{_f_added} field ref(s) derived from code_map")
+
     # ── Post-gap-fill coverage (shows improvement vs initial report) ───────────
     # Store result on ctx so stage58/stage59 can reference final coverage data
     # without re-running the computation.  Also writes coverage_report.json.
-    print(f"  [stage4] Coverage after gap-fill:")
+    print(f"  [stage4] Coverage after gap-fill + static enrichment:")
     ctx.domain_coverage = _compute_coverage(ctx, domain_model, debug_dir)
 
     # ── Save ──────────────────────────────────────────────────────────────────
@@ -1012,26 +1040,38 @@ def _group_uncovered_by_module(
     exec_paths: list[dict],
 ) -> tuple[dict[str, list[str]], list[str]]:
     """
-    Group uncovered file basenames by their module directory.
+    Group uncovered file basenames by their logical module.
+
+    Supports both SugarCRM-style modules/ directories (PHP) and
+    Next.js / TypeScript route-group / feature-directory structure.
+
+    Collision handling: when two files share the same basename (e.g. page.tsx
+    in different route segments), both candidate module names are recorded and
+    the basename is placed in the FIRST module seen — the collision avoidance
+    logic in _build_module_expansion handles cross-module expansion separately.
 
     Returns
     -------
-    module_groups : {module_name: [file1.php, file2.php, ...]}
+    module_groups : {module_name: [file1, file2, ...]}
         Only modules that have at least one uncovered file.
-    flat_remainder : [file.php, ...]
-        Files that are NOT inside a modules/ directory (no module grouping possible).
+    flat_remainder : [file, ...]
+        Files for which no module could be determined.
     """
     from collections import defaultdict
 
-    # Build file-basename → module name map from exec_paths
+    # Build file-basename → module name map from exec_paths.
+    # For collisions (same basename in multiple modules), keep the first module
+    # assigned — gap-fill will retry remaining files in subsequent rounds.
     basename_to_module: dict[str, str] = {}
     for ep in exec_paths:
         f = ep.get("file", "")
         if not f:
             continue
-        mod = _extract_module_name(f)
+        mod = _extract_module_name(f) or _extract_module_name_ts(f)
         if mod:
-            basename_to_module[Path(f).name.lower()] = mod
+            basename = Path(f).name.lower()
+            if basename not in basename_to_module:
+                basename_to_module[basename] = mod
 
     module_groups: dict[str, list[str]] = defaultdict(list)
     flat_remainder: list[str] = []
@@ -1050,14 +1090,15 @@ def _system_gap_fill(quality_score: int, uncovered_pages: list[str],
                      existing_feature_names: list[str],
                      known_tables: list[str] | None = None,
                      known_fields: list[str] | None = None,
-                     module_groups: dict[str, list[str]] | None = None) -> str:
+                     module_groups: dict[str, list[str]] | None = None,
+                     language: str = "php") -> str:
     """Call D — gap-fill features for pages not yet covered by known features.
 
     When *module_groups* is supplied the prompt presents modules (with sample
     filenames) instead of bare filenames — one feature per module covers all
     sibling files through module-expansion and is far more token-efficient.
     """
-    existing_str = ", ".join(f'"{n}"' for n in existing_feature_names[:20])
+    existing_str = ", ".join(f'"{n}"' for n in existing_feature_names)
     grounding_parts: list[str] = []
     if known_tables:
         t_str = ", ".join(known_tables[:100])
@@ -1072,6 +1113,11 @@ def _system_gap_fill(quality_score: int, uncovered_pages: list[str],
         )
     tables_grounding = ("\n" + "\n\n".join(grounding_parts) + "\n") if grounding_parts else ""
 
+    is_php  = language == "php"
+    file_term  = "PHP files" if is_php else "source files"
+    file_ext   = ".php"     if is_php else ""
+    module_dir = "modules/<ModuleName>/" if is_php else "the application"
+
     if module_groups:
         # Module-grouped format: one feature per module
         module_lines = []
@@ -1082,24 +1128,25 @@ def _system_gap_fill(quality_score: int, uncovered_pages: list[str],
         modules_str = "\n".join(module_lines)
 
         coverage_instruction = f"""The following application MODULES are NOT yet covered by any existing feature.
-Each module is a group of PHP files under modules/<ModuleName>/:
+Each module is a group of {file_term} within {module_dir}:
 
 {modules_str}
 
 Existing features already extracted (do NOT duplicate): {existing_str}
 
 Create ONE feature per module (or merge closely related small modules into one feature).
-Each feature's "pages" array MUST include the representative PHP filenames listed above."""
+Each feature's "pages" array MUST include the representative filenames listed above."""
     else:
         pages_str = ", ".join(f'"{p}"' for p in uncovered_pages)
-        coverage_instruction = f"""The following PHP pages are NOT yet covered by any existing feature:
+        coverage_instruction = f"""The following {file_term} are NOT yet covered by any existing feature:
 {pages_str}
 
 Existing features already extracted (do NOT duplicate): {existing_str}
 
-For each uncovered page, determine what business feature it represents.
-Group multiple uncovered pages under one feature if they implement the same business function."""
+For each uncovered file, determine what business feature it represents.
+Group multiple uncovered files under one feature if they implement the same business function."""
 
+    example_file = f"representative_file{file_ext}"
     return f"""{_get_preamble()}
 {_evidence_instruction(quality_score)}{tables_grounding}
 
@@ -1111,7 +1158,7 @@ Output ONLY this JSON (no other fields):
     {{
       "name": "Feature name",
       "description": "What this feature does from a business perspective",
-      "pages": ["representative_file.php"],
+      "pages": ["{example_file}"],
       "tables": ["relevant_table"],
       "inputs": ["field1", "field2"],
       "outputs": "What the user gets after completing this feature",
@@ -2025,6 +2072,155 @@ def _extract_module_name(filepath: str) -> str | None:
     return None
 
 
+# Directories that are pure infrastructure in TypeScript projects
+_TS_INFRA_DIRS: frozenset[str] = frozenset({
+    "src", "app", "pages", "api", "lib", "utils", "helpers", "types",
+    "hooks", "styles", "public", "config", ".", "", "node_modules",
+    "dist", "build", ".next",
+})
+# Generic component sub-folders that don't represent a domain concept
+_TS_GENERIC_COMPONENTS: frozenset[str] = frozenset({
+    "common", "shared", "base", "core", "ui", "layout", "primitives",
+})
+
+
+def _extract_module_name_ts(filepath: str) -> str | None:
+    """
+    Extract a logical module name from a TypeScript / Next.js path.
+
+    Priority
+    --------
+    1. Route groups  : app/(auth)/login/page.tsx     → "auth"
+    2. API segment   : app/api/users/route.ts        → "users_api"
+    3. App segment   : app/dashboard/page.tsx        → "dashboard"
+    4. Feature dir   : src/features/payments/svc.ts  → "payments"
+    5. Component grp : components/UserProfile/Card   → "UserProfile"
+
+    Returns None for infra files (lib/, utils/, hooks/, config/ …).
+    """
+    parts = [p for p in Path(filepath).parts if p not in (".", "..")]
+
+    # Pass 1 — route groups take highest priority
+    for part in parts:
+        m = re.match(r'^\((\w+)\)$', part)
+        if m:
+            return m.group(1)
+
+    # Pass 2 — structural keywords
+    for i, part in enumerate(parts):
+        part_l = part.lower()
+
+        # app/api/<module>/  (avoid dynamic segments [id])
+        if part_l == "api" and i + 1 < len(parts):
+            nxt = parts[i + 1]
+            if not nxt.startswith("[") and nxt.lower() not in _TS_INFRA_DIRS:
+                return f"{nxt}_api"
+
+        # app/<segment>/  – first meaningful segment directly under app/
+        if part_l == "app" and i + 1 < len(parts):
+            nxt = parts[i + 1]
+            if (not re.match(r'^[\[\(]', nxt)
+                    and nxt.lower() not in _TS_INFRA_DIRS
+                    and nxt.lower() != "api"):
+                return nxt
+
+        # src/features/<module>/
+        if part_l == "features" and i + 1 < len(parts):
+            return parts[i + 1]
+
+        # components/<Group>/ or ui/<Group>/
+        if part_l in ("components", "ui") and i + 1 < len(parts):
+            nxt = parts[i + 1]
+            if nxt.lower() not in _TS_GENERIC_COMPONENTS | _TS_INFRA_DIRS:
+                return nxt
+
+    return None
+
+
+def _static_enrich_tables_and_fields(
+    domain_model: "DomainModel",
+    cm: Any,
+) -> tuple[int, int]:
+    """
+    Static (no-LLM) enrichment pass: derive table and field coverage directly
+    from the code_map data that was already collected by Stage 1 parsers.
+
+    Logic
+    -----
+    Tables  — for every file that a feature already references in its 'pages'
+              array, look up which SQL tables that file queries (from
+              cm.sql_queries) and add any missing tables to the feature.
+              Also uses cm.table_columns to add Prisma/ORM model names for
+              TypeScript projects.
+
+    Fields  — same idea: look up which $_POST / input_params fields each
+              covered file uses (from cm.superglobals + cm.input_params) and
+              add them to the feature's 'inputs' array.
+
+    Returns (tables_added, fields_added) counts for logging.
+    """
+    from collections import defaultdict
+
+    # ── Build file-basename → tables index ────────────────────────────────────
+    file_to_tables: dict[str, set[str]] = defaultdict(set)
+    for q in (cm.sql_queries or []):
+        f = q.get("file", "")
+        t = q.get("table", "")
+        if f and t and t.upper() not in ("", "UNKNOWN"):
+            file_to_tables[Path(f).name.lower()].add(t.lower())
+    # Also index table_columns (flat Prisma/TS format)
+    for tc in (cm.table_columns or []):
+        f = tc.get("file", "")
+        t = tc.get("table", "")
+        if f and t:
+            file_to_tables[Path(f).name.lower()].add(t.lower())
+
+    # ── Build file-basename → fields index ────────────────────────────────────
+    _cm_lang = getattr(cm.language, "value", str(cm.language)).lower()
+    _is_ts_cm = _cm_lang in ("typescript", "javascript")
+
+    file_to_fields: dict[str, set[str]] = defaultdict(set)
+    # PHP superglobals — $_POST only (domain inputs); $_GET is usually pagination/filter
+    for s in (cm.superglobals or []):
+        f = s.get("file", "")
+        k = s.get("key", "")
+        if f and k and s.get("var") in ("$_POST", "$_REQUEST"):
+            file_to_fields[Path(f).name.lower()].add(k.lower())
+    # TypeScript / Java input_params — body only; query/route params are infrastructure
+    for ip in (cm.input_params or []):
+        f = ip.get("file", "")
+        k = ip.get("name", "") or ip.get("key", "")
+        if not f or not k:
+            continue
+        if _is_ts_cm and ip.get("source", "body") != "body":
+            continue   # skip req.query.* and req.params.* for TS
+        file_to_fields[Path(f).name.lower()].add(k.lower())
+
+    tables_added = 0
+    fields_added = 0
+
+    for feat in domain_model.features:
+        existing_tables = {t.lower() for t in feat.get("tables", [])}
+        existing_fields = {inp.lower() for inp in feat.get("inputs", [])}
+
+        for page in feat.get("pages", []):
+            basename = Path(page).name.lower()
+
+            for tbl in file_to_tables.get(basename, set()):
+                if tbl not in existing_tables:
+                    feat.setdefault("tables", []).append(tbl)
+                    existing_tables.add(tbl)
+                    tables_added += 1
+
+            for fld in file_to_fields.get(basename, set()):
+                if fld not in existing_fields:
+                    feat.setdefault("inputs", []).append(fld)
+                    existing_fields.add(fld)
+                    fields_added += 1
+
+    return tables_added, fields_added
+
+
 def _build_module_expansion(
     exec_paths: list[dict],
     covered_pages: set[str],
@@ -2048,7 +2244,7 @@ def _build_module_expansion(
         f = ep.get("file", "")
         if not f:
             continue
-        mod = _extract_module_name(f)
+        mod = _extract_module_name(f) or _extract_module_name_ts(f)
         if mod:
             module_files[mod].append(Path(f).name.lower())
         else:
@@ -2153,20 +2349,43 @@ def _compute_coverage(
 
     pages_covered = sorted(set(ep_covered + html_covered))
 
-    # ── Table coverage ────────────────────────────────────────────────────────
-    all_tables = sorted({
+    # ── Table coverage (language-aware) ───────────────────────────────────────
+    _lang = getattr(cm.language, "value", str(cm.language)).lower()
+    _is_ts = _lang in ("typescript", "javascript")
+
+    # SQL tables from queries (all languages)
+    _sql_tables: set[str] = {
         q.get("table", "") for q in (cm.sql_queries or [])
         if q.get("table") and q["table"] not in ("UNKNOWN", "")
-    })
+    }
+    if _is_ts and not _sql_tables:
+        # TypeScript (Prisma/Firebase) — use type_definition model names as entities
+        _sql_tables = {
+            td.get("name", "") for td in (getattr(cm, "type_definitions", None) or [])
+            if td.get("name")
+        }
+    all_tables = sorted(_sql_tables)
     tables_covered   = [t for t in all_tables if t.lower() in covered_tables]
     tables_uncovered = [t for t in all_tables if t.lower() not in covered_tables]
     table_cov        = len(tables_covered) / len(all_tables) if all_tables else 1.0
 
-    # ── Field coverage ────────────────────────────────────────────────────────
-    all_fields = sorted({
+    # ── Field coverage (language-aware) ──────────────────────────────────────
+    # PHP: $_POST fields are domain inputs; $_GET is mostly pagination/filter
+    _php_fields: set[str] = {
         s["key"] for s in (cm.superglobals or [])
-        if s.get("var") == "$_POST" and s.get("key")
-    })
+        if s.get("var") in ("$_POST", "$_REQUEST") and s.get("key")
+    }
+    # TypeScript: only req.body.* fields are domain inputs.
+    # req.query.* (page, limit, cursor, sort, filter) and req.params.* (id, slug)
+    # are infrastructure — they inflate the denominator without being LLM-coverable.
+    _ts_fields: set[str] = {
+        (ip.get("name", "") or ip.get("key", ""))
+        for ip in (cm.input_params or [])
+        if (ip.get("name") or ip.get("key"))
+        and ip.get("source", "body") == "body"
+    }
+    # Merge both so a mixed PHP+TS project gets full coverage
+    all_fields = sorted(_php_fields | _ts_fields)
     fields_covered   = [f for f in all_fields if f.lower() in covered_inputs]
     fields_uncovered = [f for f in all_fields if f.lower() not in covered_inputs]
     field_cov        = len(fields_covered) / len(all_fields) if all_fields else 1.0
@@ -2245,6 +2464,7 @@ def _gap_fill_pass(
     Returns the (possibly enriched) DomainModel.
     """
     cm = ctx.code_map
+    _lang = getattr(cm.language, "value", str(cm.language)).lower()
 
     # Track which modules have already been sent to the LLM so we don't
     # spin indefinitely on modules the model refuses to list page refs for.
@@ -2313,7 +2533,7 @@ def _gap_fill_pass(
             gap_system = _system_gap_fill(
                 quality_score, [], existing_names,
                 known_tables=known_tables, known_fields=known_fields,
-                module_groups=batch_modules,
+                module_groups=batch_modules, language=_lang,
             )
         elif flat_files:
             # ── Flat fallback: non-module files (include/, lib/, etc.) ──────
@@ -2331,13 +2551,36 @@ def _gap_fill_pass(
             gap_system = _system_gap_fill(
                 quality_score, gap_pages, existing_names,
                 known_tables=known_tables, known_fields=known_fields,
+                language=_lang,
             )
         else:
             print(f"  [stage4] No fresh modules or flat files remain — done.")
             break
-        raw_d          = _call_part(gap_system, user_prompt, MAX_TOKENS_GAP_FILL,
-                                    call_label)
-        data_d         = _parse_partial(raw_d, f"D{gap_round}", debug_dir)
+        # ── Per-round targeted evidence ────────────────────────────────────────
+        # Build a fresh user-prompt by querying ChromaDB with module/file names
+        # as search terms.  The static gap_prompt (built before the loop) only
+        # contains the 12 highest-overall chunks; by round 3+ those are rarely
+        # relevant to the specific modules being asked about.
+        if fresh_module_groups:
+            _gap_q = " ".join(list(batch_modules.keys())[:6]) + " business logic features"
+        else:
+            _gap_q = " ".join((gap_pages or [])[:6]) + " business logic features"
+        try:
+            _fresh_chunks = _retrieve_context(
+                ctx,
+                queries           = [(_gap_q, "gap_round")],
+                max_total_chunks  = _PROFILE_MAX_TOTAL_CHUNKS["GAP"],
+                max_context_chars = _PROFILE_MAX_CONTEXT_CHARS["GAP"],
+            )
+            round_user_prompt = (
+                _build_user_prompt(ctx, _fresh_chunks, profile="GAP")
+                if _fresh_chunks else user_prompt
+            )
+        except Exception:
+            round_user_prompt = user_prompt   # fall back to static prompt on error
+
+        raw_d  = _call_part(gap_system, round_user_prompt, MAX_TOKENS_GAP_FILL, call_label)
+        data_d = _parse_partial(raw_d, f"D{gap_round}", debug_dir)
 
         # Filter hallucinated refs from gap-fill response
         if known_pages_lower or known_tables:
@@ -2398,27 +2641,67 @@ def _gap_fill_pass(
 
 def _attempt_json_recovery(text: str) -> dict | None:
     """
-    Try to recover a partial JSON response that was truncated mid-stream.
-    Attempts to close all open brackets/braces to make it valid JSON.
-    Returns parsed dict on success, None on failure.
+    Recover a partial/truncated JSON response.
+
+    Strategy: collect all positions of '}' that are outside string literals,
+    then — starting from the rightmost — try to close the JSON from that point.
+    The first (rightmost) candidate that produces valid JSON is returned.
+
+    This is O(N + K·N) where K ≤ _MAX_CANDIDATES = 30, effectively O(N).
+    String-aware scanning skips { } [ ] characters inside quoted values,
+    which the old naive brace-count approach confused with structural tokens.
     """
-    import re
+    _MAX_CANDIDATES = 30   # try at most this many } positions from the right
 
-    # Find the last complete top-level field by scanning for the deepest
-    # valid truncation point — remove the last incomplete entry
-    # Strategy: strip back to the last complete '},' or '}' at depth 1
     t = text.strip()
+    if not t:
+        return None
 
-    # Remove trailing partial content after last complete array/object close
-    # Walk backwards finding the last valid comma-terminated or closed block
-    for cutpoint in range(len(t), 0, -1):
-        candidate = t[:cutpoint].rstrip().rstrip(",")
-        # Try closing all open structures
-        open_braces   = candidate.count("{") - candidate.count("}")
-        open_brackets = candidate.count("[") - candidate.count("]")
-        if open_braces < 0 or open_brackets < 0:
+    # ── Collect all out-of-string '}' positions (forward scan, O(N)) ─────────
+    close_positions: list[int] = []
+    in_string   = False
+    escape_next = False
+
+    for i, ch in enumerate(t):
+        if escape_next:
+            escape_next = False
             continue
-        closed = candidate + ("]" * open_brackets) + ("}" * open_braces)
+        if ch == "\\" and in_string:
+            escape_next = True
+            continue
+        if ch == '"':
+            in_string = not in_string
+            continue
+        if in_string:
+            continue
+        if ch == "}":
+            close_positions.append(i)
+
+    if not close_positions:
+        return None
+
+    # ── Try candidates from rightmost backwards ───────────────────────────────
+    def _count_open(s: str) -> tuple[int, int]:
+        """String-aware count of unclosed { [ in s. Returns (braces, brackets)."""
+        ob = obr = 0
+        in_s = esc = False
+        for c in s:
+            if esc:        esc = False; continue
+            if c == "\\" and in_s: esc = True; continue
+            if c == '"':   in_s = not in_s; continue
+            if in_s:       continue
+            if   c == "{": ob  += 1
+            elif c == "}": ob  -= 1
+            elif c == "[": obr += 1
+            elif c == "]": obr -= 1
+        return ob, obr
+
+    for pos in reversed(close_positions[-_MAX_CANDIDATES:]):
+        candidate = t[: pos + 1].rstrip().rstrip(",")
+        ob, obr = _count_open(candidate)
+        if ob < 0 or obr < 0:
+            continue
+        closed = candidate + ("]" * obr) + ("}" * ob)
         try:
             return json.loads(closed)
         except json.JSONDecodeError:
