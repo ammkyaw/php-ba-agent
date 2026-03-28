@@ -797,9 +797,8 @@ def _json_correction_call(
         f"(error: {error_msg[:300]}).\n\n"
         "Try again. Produce ONLY the valid JSON requested above."
     )
-    _preview = bad_response[:200].replace("\n", "\\n")
     print(f"  {tag}JSON invalid — cause: {error_msg[:200]}")
-    print(f"  {tag}JSON invalid — response preview: {_preview!r}")
+    print(f"  {tag}JSON invalid — response preview: {bad_response[:200]!r}")
     print(f"  {tag}JSON invalid — requesting correction")
     if provider == "local":
         return _call_local(fix_system, fix_user, max_tokens, temperature, model, json_mode=True)
