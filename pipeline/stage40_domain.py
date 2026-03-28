@@ -73,7 +73,7 @@ class CallSpec(NamedTuple):
 MAX_TOKENS_META     = 4_000   # Call A: domain_name, description, key_entities, bounded_contexts
 MAX_TOKENS_FEATURES = 8_000   # Call B: features list (largest field)
 MAX_TOKENS_ROLES_WF = 8_000   # Call C: user_roles + workflows
-MAX_TOKENS_GAP_FILL = int(os.environ.get("STAGE4_MAX_TOKENS_GAP_FILL", "4000") or "4000")
+MAX_TOKENS_GAP_FILL = int(os.environ.get("STAGE4_MAX_TOKENS_GAP_FILL", "8000") or "8000")
 # ↑ Kept deliberately lower than B/C calls: shorter responses loop less often on
 #   quantised models (qwen3-coder int8), and multiple smaller gap-fill rounds
 #   (MAX_GAP_ROUNDS=20) cover more ground than one large looping call.
