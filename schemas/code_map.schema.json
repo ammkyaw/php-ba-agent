@@ -252,14 +252,16 @@
       "type": "object",
       "description": "An HTTP route registration.",
       "properties": {
-        "method":  { "type": "string", "description": "HTTP method (GET, POST, PUT, DELETE, PATCH, etc)." },
-        "path":    { "type": "string", "description": "Route pattern." },
-        "handler": { "type": "string", "description": "Controller@method or function name." },
-        "file":    { "type": "string" },
-        "line":    { "type": "integer" },
-        "source":  { "type": "string", "description": "Detection method (e.g. laravel_static, annotation, decorator)." }
+        "method":   { "type": "string", "description": "HTTP method (GET, POST, PUT, DELETE, PATCH, etc)." },
+        "path":     { "type": "string", "description": "Route pattern." },
+        "handler":  { "type": "string", "description": "Controller@method or function name. Optional for file-system routers (Next.js App Router, Nuxt) where the handler is implied by the file path." },
+        "file":     { "type": "string" },
+        "line":     { "type": "integer" },
+        "source":   { "type": "string", "description": "Detection method (e.g. laravel_static, annotation, decorator)." },
+        "kind":     { "type": "string", "description": "Route kind (e.g. nextjs_page, nextjs_api, spring, quarkus, vue_router)." },
+        "dir":      { "type": "string", "description": "Directory path for file-system routes (Next.js App Router)." }
       },
-      "required": ["method", "path", "handler"]
+      "required": ["method", "path"]
     },
     "DbSchemaEntry": {
       "type": "object",
@@ -292,14 +294,16 @@
       "type": "object",
       "description": "An import/require/include relationship.",
       "properties": {
-        "source_file": { "type": "string", "description": "File containing the import statement." },
+        "from":        { "type": "string", "description": "File containing the import statement (used by TypeScript and Java parsers)." },
+        "source_file": { "type": "string", "description": "DEPRECATED alias for 'from' — used by PHP parser. Prefer 'from'." },
         "target":      { "type": "string", "description": "Module or file being imported." },
         "symbols":     { "type": "array", "items": { "type": "string" }, "default": [], "description": "Specific named imports." },
         "is_default":  { "type": "boolean", "default": false },
         "is_type":     { "type": "boolean", "default": false, "description": "TypeScript 'import type'." },
+        "kind":        { "type": "string", "description": "Import mechanism (e.g. esm, require, include, use)." },
         "line":        { "type": "integer" }
       },
-      "required": ["source_file", "target"]
+      "required": ["target"]
     },
     "SqlQueryEntry": {
       "type": "object",
