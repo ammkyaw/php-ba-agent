@@ -1,0 +1,378 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/codebase-ba/schemas/code_map.schema.json",
+  "title": "CodeMap",
+  "description": "Universal code-map schema produced by Stage 1 language parsers. Language-neutral representation of a parsed codebase used by all downstream pipeline stages.",
+  "type": "object",
+  "properties": {
+    "_parser": {
+      "type": "string",
+      "description": "Hint for deserialization dispatch — the parser that produced this file.",
+      "enum": ["php", "typescript", "java"],
+      "default": "php"
+    },
+    "language": {
+      "type": "string",
+      "description": "Primary programming language of the analysed project.",
+      "enum": ["php", "typescript", "javascript", "java", "kotlin", "unknown"],
+      "default": "unknown"
+    },
+    "language_version": {
+      "type": ["string", "null"],
+      "description": "Language version string (e.g. '8.1', '20', '17'). Replaces php_version for new parsers.",
+      "default": null
+    },
+    "framework": {
+      "type": "string",
+      "description": "Detected framework.",
+      "enum": [
+        "laravel", "symfony", "codeigniter", "wordpress", "raw_php",
+        "nextjs", "nuxtjs", "angular", "vue", "react", "express", "fastify", "nestjs",
+        "spring_boot", "quarkus", "micronaut",
+        "unknown"
+      ],
+      "default": "unknown"
+    },
+    "classes": {
+      "type": "array",
+      "description": "All class / interface / type definitions found in the project.",
+      "items": { "$ref": "#/$defs/ClassEntry" },
+      "default": []
+    },
+    "routes": {
+      "type": "array",
+      "description": "HTTP route registrations (framework-specific or annotation-based).",
+      "items": { "$ref": "#/$defs/RouteEntry" },
+      "default": []
+    },
+    "models": {
+      "type": "array",
+      "description": "ORM model / entity classes.",
+      "items": { "type": "object" },
+      "default": []
+    },
+    "controllers": {
+      "type": "array",
+      "description": "Controller classes / handler functions.",
+      "items": { "type": "object" },
+      "default": []
+    },
+    "services": {
+      "type": "array",
+      "description": "Service, repository, and other backend classes.",
+      "items": { "type": "object" },
+      "default": []
+    },
+    "db_schema": {
+      "type": "array",
+      "description": "Migration / CREATE TABLE / schema definitions.",
+      "items": { "$ref": "#/$defs/DbSchemaEntry" },
+      "default": []
+    },
+    "config_files": {
+      "type": "array",
+      "description": "List of config file paths found in the project.",
+      "items": { "type": "string" },
+      "default": []
+    },
+    "total_files": {
+      "type": "integer",
+      "description": "Total source files scanned.",
+      "minimum": 0,
+      "default": 0
+    },
+    "total_lines": {
+      "type": "integer",
+      "description": "Total lines of source code.",
+      "minimum": 0,
+      "default": 0
+    },
+    "functions": {
+      "type": "array",
+      "description": "Standalone / exported function definitions.",
+      "items": { "$ref": "#/$defs/FunctionEntry" },
+      "default": []
+    },
+    "imports": {
+      "type": "array",
+      "description": "Import/require/include relationships (language-neutral). Replaces PHP 'includes'.",
+      "items": { "$ref": "#/$defs/ImportEntry" },
+      "default": []
+    },
+    "sql_queries": {
+      "type": "array",
+      "description": "Raw SQL operations with caller, table, and operation type.",
+      "items": { "$ref": "#/$defs/SqlQueryEntry" },
+      "default": []
+    },
+    "call_graph": {
+      "type": "array",
+      "description": "Function/method call edges (caller → callee).",
+      "items": { "$ref": "#/$defs/CallGraphEdge" },
+      "default": []
+    },
+    "form_fields": {
+      "type": "array",
+      "description": "Form elements / API request bodies with field lists.",
+      "items": { "type": "object" },
+      "default": []
+    },
+    "service_deps": {
+      "type": "array",
+      "description": "Constructor DI / injection edges (class → dependency class).",
+      "items": { "$ref": "#/$defs/ServiceDepEntry" },
+      "default": []
+    },
+    "env_vars": {
+      "type": "array",
+      "description": "Environment variable references found in source code.",
+      "items": { "$ref": "#/$defs/EnvVarEntry" },
+      "default": []
+    },
+    "auth_signals": {
+      "type": "array",
+      "description": "Auth checks, middleware, role guards detected.",
+      "items": { "type": "object" },
+      "default": []
+    },
+    "http_endpoints": {
+      "type": "array",
+      "description": "Inferred HTTP entry points with method and handler.",
+      "items": { "$ref": "#/$defs/HttpEndpointEntry" },
+      "default": []
+    },
+    "table_columns": {
+      "type": "array",
+      "description": "Per-table column definitions extracted from schema/migrations.",
+      "items": { "$ref": "#/$defs/TableColumnEntry" },
+      "default": []
+    },
+    "globals": {
+      "type": "array",
+      "description": "Global / module-level variable declarations.",
+      "items": { "type": "object" },
+      "default": []
+    },
+    "execution_paths": {
+      "type": "array",
+      "description": "Static-analysis execution paths (populated by Stage 1.5).",
+      "items": { "type": "object" },
+      "default": []
+    },
+    "components": {
+      "type": "array",
+      "description": "Frontend UI components (Vue/React/Angular SFCs).",
+      "items": { "type": "object" },
+      "default": []
+    },
+    "input_params": {
+      "type": "array",
+      "description": "Request parameters / form inputs / superglobals. Replaces PHP 'superglobals'.",
+      "items": { "type": "object" },
+      "default": []
+    },
+    "type_definitions": {
+      "type": "array",
+      "description": "TypeScript interfaces and type aliases.",
+      "items": { "type": "object" },
+      "default": []
+    },
+    "php_version": {
+      "type": ["string", "null"],
+      "description": "DEPRECATED — use language_version. PHP version string.",
+      "default": null,
+      "deprecated": true
+    },
+    "html_pages": {
+      "type": "array",
+      "description": "PHP files mixing HTML output (PHP-only).",
+      "items": { "type": "string" },
+      "default": []
+    },
+    "includes": {
+      "type": "array",
+      "description": "DEPRECATED — use imports. PHP include/require statements.",
+      "items": { "type": "object" },
+      "default": [],
+      "deprecated": true
+    },
+    "redirects": {
+      "type": "array",
+      "description": "PHP header('Location:…') redirect calls.",
+      "items": { "type": "object" },
+      "default": []
+    },
+    "superglobals": {
+      "type": "array",
+      "description": "DEPRECATED — use input_params. PHP superglobal accesses.",
+      "items": { "type": "object" },
+      "default": [],
+      "deprecated": true
+    }
+  },
+  "required": ["language", "framework", "total_files", "total_lines"],
+  "$defs": {
+    "ClassEntry": {
+      "type": "object",
+      "description": "A class, interface, trait, abstract class, or enum definition.",
+      "properties": {
+        "name":       { "type": "string", "description": "Simple class name." },
+        "fqn":        { "type": "string", "description": "Fully-qualified name (namespace + class)." },
+        "type":       { "type": "string", "description": "Kind: class | interface | trait | abstract_class | enum | type_alias." },
+        "file":       { "type": "string", "description": "Source file path relative to project root." },
+        "line":       { "type": "integer", "description": "Line number where the definition starts." },
+        "methods":    { "type": "array", "items": { "$ref": "#/$defs/MethodEntry" }, "default": [] },
+        "properties": { "type": "array", "items": { "type": "object" }, "default": [] },
+        "docblock":   { "type": ["object", "null"], "default": null },
+        "extends":    { "type": ["string", "null"], "default": null },
+        "implements": { "type": "array", "items": { "type": "string" }, "default": [] },
+        "decorators": { "type": "array", "items": { "type": "string" }, "default": [] },
+        "annotations": { "type": "array", "items": { "type": "string" }, "default": [] }
+      },
+      "required": ["name", "file"]
+    },
+    "MethodEntry": {
+      "type": "object",
+      "description": "A method or function within a class.",
+      "properties": {
+        "name":        { "type": "string" },
+        "visibility":  { "type": "string", "enum": ["public", "protected", "private", "default"] },
+        "return_type": { "type": ["string", "null"] },
+        "params":      { "type": "array", "items": { "type": "object" }, "default": [] },
+        "docblock":    { "type": ["object", "null"], "default": null },
+        "line":        { "type": "integer" },
+        "is_static":   { "type": "boolean", "default": false },
+        "is_abstract": { "type": "boolean", "default": false },
+        "decorators":  { "type": "array", "items": { "type": "string" }, "default": [] },
+        "annotations": { "type": "array", "items": { "type": "string" }, "default": [] }
+      },
+      "required": ["name", "line"]
+    },
+    "RouteEntry": {
+      "type": "object",
+      "description": "An HTTP route registration.",
+      "properties": {
+        "method":  { "type": "string", "description": "HTTP method (GET, POST, PUT, DELETE, PATCH, etc)." },
+        "path":    { "type": "string", "description": "Route pattern." },
+        "handler": { "type": "string", "description": "Controller@method or function name." },
+        "file":    { "type": "string" },
+        "line":    { "type": "integer" },
+        "source":  { "type": "string", "description": "Detection method (e.g. laravel_static, annotation, decorator)." }
+      },
+      "required": ["method", "path", "handler"]
+    },
+    "DbSchemaEntry": {
+      "type": "object",
+      "description": "A migration or CREATE TABLE definition.",
+      "properties": {
+        "operation": { "type": "string", "description": "Schema operation (create, alter, drop)." },
+        "table":     { "type": "string" },
+        "columns":   { "type": "array", "items": { "type": "object" }, "default": [] },
+        "file":      { "type": "string" },
+        "line":      { "type": "integer" }
+      },
+      "required": ["table"]
+    },
+    "FunctionEntry": {
+      "type": "object",
+      "description": "A standalone or exported function.",
+      "properties": {
+        "name":        { "type": "string" },
+        "file":        { "type": "string" },
+        "line":        { "type": "integer" },
+        "params":      { "type": "array", "items": { "type": "object" }, "default": [] },
+        "return_type": { "type": ["string", "null"] },
+        "docblock":    { "type": ["object", "null"], "default": null },
+        "is_exported": { "type": "boolean", "default": false },
+        "is_async":    { "type": "boolean", "default": false }
+      },
+      "required": ["name", "file"]
+    },
+    "ImportEntry": {
+      "type": "object",
+      "description": "An import/require/include relationship.",
+      "properties": {
+        "source_file": { "type": "string", "description": "File containing the import statement." },
+        "target":      { "type": "string", "description": "Module or file being imported." },
+        "symbols":     { "type": "array", "items": { "type": "string" }, "default": [], "description": "Specific named imports." },
+        "is_default":  { "type": "boolean", "default": false },
+        "is_type":     { "type": "boolean", "default": false, "description": "TypeScript 'import type'." },
+        "line":        { "type": "integer" }
+      },
+      "required": ["source_file", "target"]
+    },
+    "SqlQueryEntry": {
+      "type": "object",
+      "description": "A raw SQL operation detected in source code.",
+      "properties": {
+        "operation": { "type": "string", "description": "SQL operation type (SELECT, INSERT, UPDATE, DELETE)." },
+        "table":     { "type": "string" },
+        "file":      { "type": "string" },
+        "line":      { "type": "integer" },
+        "caller":    { "type": "string", "description": "Enclosing function or method name." },
+        "raw_sql":   { "type": "string", "description": "The SQL query string (may be partial)." }
+      },
+      "required": ["operation", "table", "file"]
+    },
+    "CallGraphEdge": {
+      "type": "object",
+      "description": "A function/method call edge in the call graph.",
+      "properties": {
+        "caller":      { "type": "string", "description": "Calling function/method (Class::method or function_name)." },
+        "callee":      { "type": "string", "description": "Called function/method." },
+        "file":        { "type": "string" },
+        "line":        { "type": "integer" },
+        "call_type":   { "type": "string", "description": "static | instance | function | constructor." }
+      },
+      "required": ["caller", "callee"]
+    },
+    "ServiceDepEntry": {
+      "type": "object",
+      "description": "A dependency injection edge.",
+      "properties": {
+        "class":     { "type": "string", "description": "The class receiving the dependency." },
+        "dep_class": { "type": "string", "description": "The injected dependency class." },
+        "dep_param": { "type": "string", "description": "Constructor parameter name." },
+        "file":      { "type": "string" }
+      },
+      "required": ["class", "dep_class"]
+    },
+    "EnvVarEntry": {
+      "type": "object",
+      "description": "An environment variable reference in source code.",
+      "properties": {
+        "name":    { "type": "string", "description": "Environment variable name." },
+        "file":    { "type": "string" },
+        "line":    { "type": "integer" },
+        "default": { "type": ["string", "null"], "description": "Default value if specified." }
+      },
+      "required": ["name", "file"]
+    },
+    "HttpEndpointEntry": {
+      "type": "object",
+      "description": "An inferred HTTP entry point.",
+      "properties": {
+        "method":  { "type": "string" },
+        "path":    { "type": "string" },
+        "handler": { "type": "string" },
+        "file":    { "type": "string" },
+        "source":  { "type": "string", "description": "How the endpoint was detected." }
+      },
+      "required": ["method", "path"]
+    },
+    "TableColumnEntry": {
+      "type": "object",
+      "description": "A column definition for a database table.",
+      "properties": {
+        "table":    { "type": "string" },
+        "column":   { "type": "string" },
+        "type":     { "type": "string" },
+        "nullable": { "type": "boolean", "default": true },
+        "primary":  { "type": "boolean", "default": false },
+        "foreign":  { "type": "boolean", "default": false },
+        "ref_table": { "type": ["string", "null"], "default": null }
+      },
+      "required": ["table", "column"]
+    }
+  }
+}

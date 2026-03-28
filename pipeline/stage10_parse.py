@@ -27,9 +27,13 @@ from pipeline/parsers/php_parser.py so that any stage that did
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 
 from context import CodeMap, Framework, Language, PipelineContext
+
+# Path to the canonical CodeMap JSON Schema (relative to this file)
+_SCHEMA_PATH = Path(__file__).parent.parent / "schemas" / "code_map.schema.json"
 
 # ── Re-export PHP helpers for backward compat ─────────────────────────────────
 from pipeline.parsers.php_parser import (   # noqa: F401
@@ -66,6 +70,9 @@ def run(ctx: PipelineContext) -> None:
     # ── Run parse ─────────────────────────────────────────────────────────────
     code_map = adapter.parse(ctx.project_path, ctx)
     ctx.code_map = code_map
+
+    # ── Validate output against CodeMap JSON Schema ───────────────────────────
+    _validate_code_map_schema(ctx.output_path("code_map.json"))
 
     # ── Summary ───────────────────────────────────────────────────────────────
     print(
@@ -176,3 +183,47 @@ def _reconstruct_from_payload(payload: dict, lang: Language) -> CodeMap:
         redirects        = payload.get("redirects", []),
         superglobals     = payload.get("superglobals", []),
     )
+
+
+# ─── Schema Validation ────────────────────────────────────────────────────────
+
+def _validate_code_map_schema(code_map_path: str) -> None:
+    """
+    Validate the written code_map.json against schemas/code_map.schema.json.
+
+    Uses jsonschema when available; silently skips when the package is not
+    installed (validation is informational, not pipeline-blocking).
+
+    Prints a warning for each violation found — does NOT raise so that a
+    schema mismatch never stops an otherwise-working pipeline run.  Update
+    schemas/code_map.schema.json whenever new fields are added to CodeMap.
+    """
+    if not _SCHEMA_PATH.exists():
+        return  # schema file not present — skip silently
+
+    try:
+        import jsonschema  # optional dependency
+    except ImportError:
+        return  # jsonschema not installed — skip silently
+
+    try:
+        with open(code_map_path, encoding="utf-8") as fh:
+            payload = json.load(fh)
+    except (OSError, json.JSONDecodeError):
+        return  # file unreadable — already handled upstream
+
+    schema = json.loads(_SCHEMA_PATH.read_text(encoding="utf-8"))
+
+    validator = jsonschema.Draft202012Validator(schema)
+    errors = list(validator.iter_errors(payload))
+
+    if not errors:
+        print(f"  [stage10] CodeMap schema validation passed ✓")
+        return
+
+    print(f"  [stage10] ⚠️  CodeMap schema: {len(errors)} violation(s) found:")
+    for err in errors[:5]:          # cap output — don't flood the console
+        path = " → ".join(str(p) for p in err.absolute_path) or "(root)"
+        print(f"           {path}: {err.message}")
+    if len(errors) > 5:
+        print(f"           … and {len(errors) - 5} more (fix schema or parser output)")
