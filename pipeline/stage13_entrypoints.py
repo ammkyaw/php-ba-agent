@@ -45,7 +45,7 @@ import re
 from pathlib import Path
 from typing import Optional
 
-from context import EntryPoint, EntryPointCatalog, Framework, Language, PipelineContext
+from context import CodeMap, EntryPoint, EntryPointCatalog, Framework, Language, PipelineContext
 
 OUTPUT_FILE = "entry_point_catalog.json"
 
@@ -169,7 +169,7 @@ def _detect_all(root: Path, framework: Framework) -> list[EntryPoint]:
 
 # ─── Universal HTTP Entry-Point Pass ───────────────────────────────────────────
 
-def _detect_http_from_routes(code_map) -> list[EntryPoint]:
+def _detect_http_from_routes(code_map: CodeMap) -> list[EntryPoint]:
     """
     Convert CodeMap routes into HTTP EntryPoints.
 
@@ -193,7 +193,6 @@ def _detect_http_from_routes(code_map) -> list[EntryPoint]:
         method  = (r.get("method") or "GET").upper()
         path    = r.get("path") or "/"
         handler = r.get("handler") or ""
-        kind    = r.get("kind") or r.get("source") or "http"
 
         # Build a human-readable name
         path_label = path.rstrip("/") or "/"

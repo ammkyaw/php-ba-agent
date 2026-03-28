@@ -219,5 +219,7 @@ vendor
 .llm/
 .claude/
 .agent/
+.agents/
 analysis_report*
 test_reports/
+kickoff_prompt.md
