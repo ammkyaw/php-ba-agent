@@ -1,6 +1,6 @@
 # `call_llm()` — Formal Interface Specification
 
-> **Source:** [`pipeline/llm_client.py`](file:///Users/aungmaungmaungkyaw/private-projects/reverse-engineering/codebase-ba/pipeline/llm_client.py)
+> **Source:** [`pipeline/llm_client.py`](../pipeline/llm_client.py)
 > **Version:** 2026-03-27
 
 ---
