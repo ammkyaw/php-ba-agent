@@ -2789,10 +2789,17 @@ def _attempt_json_recovery(text: str) -> dict | None:
         ob = obr = 0
         in_string = escape_next = False
         for c in s:
-            if escape_next:        escape_next = False; continue
-            if c == "\\" and in_string: escape_next = True; continue
-            if c == '"':           in_string = not in_string; continue
-            if in_string:          continue
+            if escape_next:
+                escape_next = False
+                continue
+            if c == "\\" and in_string:
+                escape_next = True
+                continue
+            if c == '"':
+                in_string = not in_string
+                continue
+            if in_string:
+                continue
             if   c == "{": ob  += 1
             elif c == "}": ob  -= 1
             elif c == "[": obr += 1
