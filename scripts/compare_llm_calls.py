@@ -59,7 +59,7 @@ def summarize(rows):
         "median_out_per_call": statistics.median(tokens_out),
         "output_tps_median": statistics.median(output_tps) if output_tps else 0.0,
         "output_tps_mean": statistics.mean(output_tps) if output_tps else 0.0,
-        "output_tps_p95": percentile(output_tps, 0.95),
+        "output_tps_p95": percentile(output_tps, 0.95) or 0.0,
         "output_tps_aggregate": output_sum / duration_sum if duration_sum else 0.0,
         "total_tps_aggregate": total_sum / duration_sum if duration_sum else 0.0,
         "seconds_per_1k_output": (duration_sum / output_sum * 1000) if output_sum else math.inf,

@@ -52,9 +52,20 @@ import json
 import os
 import re
 from pathlib import Path
-from typing import Any
+from typing import Any, NamedTuple
 
 from context import DomainModel, PipelineContext
+
+
+class CallSpec(NamedTuple):
+    """Specification for a single stage-4 LLM call."""
+    group:          str        # "A" | "B" | "C"
+    system_prompt:  str
+    user_prompt:    str
+    max_tokens:     int
+    llm_label:      str        # telemetry / logging label
+    parse_label:    str        # key used when parsing the response
+    model_override: str | None
 
 # ── Configuration ──────────────────────────────────────────────────────────────
 # Three focused calls instead of one giant call — each produces a small, bounded
@@ -381,7 +392,7 @@ def run(ctx: PipelineContext) -> None:
             return f"{letter}{mdl_idx+1}.{run+1}"
         return f"{letter}{run+1}"
 
-    _call_specs: list[tuple[str, str, str, int, str, str, str | None]] = []
+    _call_specs: list[CallSpec] = []
     _total_a = _consistency_runs * len(_ensemble_models)
     _total_b = _consistency_runs * len(_ensemble_models)
     for _mi, _mdl in enumerate(_ensemble_models):
@@ -389,31 +400,37 @@ def run(ctx: PipelineContext) -> None:
             _suffix_a = _make_suffix(_mi, _run, _total_a, "A")
             _suffix_b = _make_suffix(_mi, _run, _total_b, "B")
 
-            _call_specs.append((
-                "A", _sys_a, prompt_a, MAX_TOKENS_META,
-                f"stage4-{_suffix_a}", _suffix_a, _mdl,
+            _call_specs.append(CallSpec(
+                group="A", system_prompt=_sys_a, user_prompt=prompt_a,
+                max_tokens=MAX_TOKENS_META,
+                llm_label=f"stage4-{_suffix_a}", parse_label=_suffix_a,
+                model_override=_mdl,
             ))
-            _call_specs.append((
-                "B", _sys_b, prompt_b_core, MAX_TOKENS_FEATURES,
-                f"stage4-{_suffix_b}-core", f"{_suffix_b}-core", _mdl,
+            _call_specs.append(CallSpec(
+                group="B", system_prompt=_sys_b, user_prompt=prompt_b_core,
+                max_tokens=MAX_TOKENS_FEATURES,
+                llm_label=f"stage4-{_suffix_b}-core", parse_label=f"{_suffix_b}-core",
+                model_override=_mdl,
             ))
-            _call_specs.append((
-                "B", _sys_b, prompt_b_ui, MAX_TOKENS_FEATURES,
-                f"stage4-{_suffix_b}-ui", f"{_suffix_b}-ui", _mdl,
+            _call_specs.append(CallSpec(
+                group="B", system_prompt=_sys_b, user_prompt=prompt_b_ui,
+                max_tokens=MAX_TOKENS_FEATURES,
+                llm_label=f"stage4-{_suffix_b}-ui", parse_label=f"{_suffix_b}-ui",
+                model_override=_mdl,
             ))
 
-    _call_specs.append((
-        "C", _sys_c_roles, prompt_c_roles, MAX_TOKENS_ROLES_WF,
-        "stage4-C1", "C1", None,
+    _call_specs.append(CallSpec(
+        group="C", system_prompt=_sys_c_roles, user_prompt=prompt_c_roles,
+        max_tokens=MAX_TOKENS_ROLES_WF,
+        llm_label="stage4-C1", parse_label="C1", model_override=None,
     ))
-    _call_specs.append((
-        "C", _sys_c_workflows, prompt_c_workflows, MAX_TOKENS_ROLES_WF,
-        "stage4-C2", "C2", None,
+    _call_specs.append(CallSpec(
+        group="C", system_prompt=_sys_c_workflows, user_prompt=prompt_c_workflows,
+        max_tokens=MAX_TOKENS_ROLES_WF,
+        llm_label="stage4-C2", parse_label="C2", model_override=None,
     ))
 
-    def _run_stage4_call(
-        args: tuple[str, str, str, int, str, str, str | None],
-    ) -> tuple[str, str, dict]:
+    def _run_stage4_call(args: CallSpec) -> tuple[str, str, dict]:
         _group, _system, _user, _max_tokens, _llm_label, _parse_label, _mdl = args
         raw = _call_part(
             _system,
@@ -442,7 +459,7 @@ def run(ctx: PipelineContext) -> None:
             _call_results: list[tuple[str, str, dict]] = []
             _failures: list[str] = []
             for _fut, _spec in zip(_futs, _call_specs):
-                _grp, _lbl = _spec[0], _spec[5]
+                _grp, _lbl = _spec.group, _spec.parse_label
                 try:
                     _call_results.append(_fut.result())
                 except Exception as _exc:
