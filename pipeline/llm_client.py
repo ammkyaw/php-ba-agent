@@ -955,10 +955,11 @@ def _call_local(
         content = _strip_vllm_think(content)
         content = _strip_repetition_loop(content)
     else:
-        # Ollama / LM Studio / llama.cpp: only strip properly-tagged <think> blocks.
-        content = re.sub(r"<think>.*?</think>", "", content, flags=re.DOTALL).strip()
-        # Also strip unclosed <think> (model hit max_tokens during thinking phase)
-        content = re.sub(r"<think>.*$", "", content, flags=re.DOTALL).strip()
+        # Ollama / LM Studio / llama.cpp: strip both properly-closed <think> blocks
+        # and unclosed <think> tags (model hit max_tokens during thinking phase).
+        # Alternation is left-to-right: non-greedy closed pattern wins when
+        # </think> is present; open-ended pattern handles the unclosed case.
+        content = re.sub(r"<think>.*?</think>|<think>.*$", "", content, flags=re.DOTALL).strip()
 
     if not content:
         raise _NonRetryableError(
@@ -1001,11 +1002,10 @@ def _strip_vllm_think(content: str) -> str:
     discard everything before it.  This covers the "141 lines of raw Thinking
     Process" pattern seen in the Prism vLLM run.
     """
-    # Pattern 1 — closed <think> blocks (non-greedy, DOTALL)
-    content = re.sub(r"<think>.*?</think>", "", content, flags=re.DOTALL).strip()
-
-    # Pattern 2 — unclosed <think> (model hit max_tokens during thinking phase)
-    content = re.sub(r"<think>.*$", "", content, flags=re.DOTALL).strip()
+    # Patterns 1 + 2 combined — closed <think> blocks (non-greedy) and unclosed
+    # <think> tags (model hit max_tokens during thinking phase).  Alternation is
+    # left-to-right: the non-greedy closed pattern wins when </think> is present.
+    content = re.sub(r"<think>.*?</think>|<think>.*$", "", content, flags=re.DOTALL).strip()
 
     if not content:
         return content
