@@ -2458,9 +2458,9 @@ def _compute_coverage(
     # $_SESSION, and $_GET key — inflating the PHP denominator by ~25%.
     _ts_fields: set[str] = (
         {
-            (ip.get("name", "") or ip.get("key", ""))
+            k
             for ip in (cm.input_params or [])
-            if (ip.get("name") or ip.get("key"))
+            if (k := (ip.get("name") or ip.get("key", "")))
             and ip.get("source", "body") == "body"
         }
         if _is_ts else set()
