@@ -27,7 +27,6 @@ from pipeline/parsers/php_parser.py so that any stage that did
 from __future__ import annotations
 
 import json
-import os
 from pathlib import Path
 
 from context import CodeMap, Framework, Language, PipelineContext

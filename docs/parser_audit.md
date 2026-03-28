@@ -1,6 +1,6 @@
 # Parser Contract Audit Report
 
-> **Audited:** 2026-03-27 | **Contract:** [`pipeline/parsers/base.py`](file:///Users/aungmaungmaungkyaw/private-projects/reverse-engineering/codebase-ba/pipeline/parsers/base.py)
+> **Audited:** 2026-03-27 | **Contract:** [`pipeline/parsers/base.py`](../pipeline/parsers/base.py)
 
 ---
 
@@ -16,13 +16,12 @@
 | **Sets `code_map.language_version`** | ✅ composer.json/php-version | ✅ package.json typescript ver | ✅ pom.xml/build.gradle |
 | **Sets `code_map.framework`** | ✅ | ✅ | ✅ |
 | **Writes code_map.json** | ✅ | ✅ | ✅ |
-| **`_parser` hint in JSON** | ⚠️ _Not set_ (implicit "php") | ✅ `"typescript"` | ✅ `"java"` |
+| **`_parser` hint in JSON** | ✅ `"php"` | ✅ `"typescript"` | ✅ `"java"` |
 
-### ⚠️ Minor Finding: PHP `_parser` Hint
+### ✅ PHP `_parser` Hint — Fixed
 
-`php_parser.py` writes the raw parser payload directly to `code_map.json` without adding a `_parser` key. The resume loader in `stage10_parse.py` defaults to `"php"` when the key is missing, so this works correctly but is inconsistent with TS and Java parsers which explicitly set it.
-
-**Recommendation:** Add `payload["_parser"] = "php"` to `PHPParser.parse()` before JSON serialization.
+`php_parser.py` now sets `payload["_parser"] = "php"` before JSON serialisation,
+consistent with the TypeScript and Java parsers.
 
 ---
 

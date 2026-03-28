@@ -88,6 +88,70 @@ TOP_K_PER_QUERY   = 5
 MAX_TOTAL_CHUNKS  = 25    # hard cap on chunks sent to the LLM
 MAX_CONTEXT_CHARS = 20_000  # soft cap on total context character length
 
+
+def _env_int(name: str, default: int) -> int:
+    """Read integer env var with a sane fallback."""
+    return int(os.environ.get(name, str(default)) or str(default))
+
+
+# Stage 4 prompt profiles: each sub-call now gets only the evidence family it
+# actually needs instead of sharing one giant all-sections prompt.
+_RETRIEVAL_PROFILE_QUERIES: dict[str, list[tuple[str, str]]] = {
+    "A": [
+        RETRIEVAL_QUERIES[0],  # auth
+        RETRIEVAL_QUERIES[1],  # data
+        RETRIEVAL_QUERIES[2],  # features
+        RETRIEVAL_QUERIES[5],  # logic
+    ],
+    "B_CORE": [
+        RETRIEVAL_QUERIES[1],  # data
+        RETRIEVAL_QUERIES[2],  # features
+        RETRIEVAL_QUERIES[3],  # forms
+        RETRIEVAL_QUERIES[5],  # logic
+    ],
+    "B_UI": [
+        RETRIEVAL_QUERIES[2],  # features
+        RETRIEVAL_QUERIES[3],  # forms
+        RETRIEVAL_QUERIES[4],  # nav
+        RETRIEVAL_QUERIES[5],  # logic
+    ],
+    "C_ROLES": [
+        RETRIEVAL_QUERIES[0],  # auth
+        RETRIEVAL_QUERIES[2],  # features
+        RETRIEVAL_QUERIES[4],  # nav
+    ],
+    "C_WORKFLOWS": [
+        RETRIEVAL_QUERIES[0],  # auth
+        RETRIEVAL_QUERIES[2],  # features
+        RETRIEVAL_QUERIES[4],  # nav
+        RETRIEVAL_QUERIES[5],  # logic
+    ],
+    "GAP": [
+        RETRIEVAL_QUERIES[2],  # features
+        RETRIEVAL_QUERIES[3],  # forms
+        RETRIEVAL_QUERIES[4],  # nav
+        RETRIEVAL_QUERIES[5],  # logic
+    ],
+}
+
+_PROFILE_MAX_TOTAL_CHUNKS: dict[str, int] = {
+    "A":           _env_int("STAGE4_A_MAX_TOTAL_CHUNKS", 12),
+    "B_CORE":      _env_int("STAGE4_B_CORE_MAX_TOTAL_CHUNKS", 14),
+    "B_UI":        _env_int("STAGE4_B_UI_MAX_TOTAL_CHUNKS", 14),
+    "C_ROLES":     _env_int("STAGE4_C_ROLES_MAX_TOTAL_CHUNKS", 10),
+    "C_WORKFLOWS": _env_int("STAGE4_C_WORKFLOWS_MAX_TOTAL_CHUNKS", 12),
+    "GAP":         _env_int("STAGE4_GAP_MAX_TOTAL_CHUNKS", 12),
+}
+
+_PROFILE_MAX_CONTEXT_CHARS: dict[str, int] = {
+    "A":           _env_int("STAGE4_A_CONTEXT_CHARS", 8_000),
+    "B_CORE":      _env_int("STAGE4_B_CORE_CONTEXT_CHARS", 10_000),
+    "B_UI":        _env_int("STAGE4_B_UI_CONTEXT_CHARS", 10_000),
+    "C_ROLES":     _env_int("STAGE4_C_ROLES_CONTEXT_CHARS", 6_000),
+    "C_WORKFLOWS": _env_int("STAGE4_C_WORKFLOWS_CONTEXT_CHARS", 8_000),
+    "GAP":         _env_int("STAGE4_GAP_CONTEXT_CHARS", 8_000),
+}
+
 # ── Per-section caps inside _build_user_prompt ────────────────────────────────
 # Large codebases (SuiteCRM, etc.) produce thousands of entries per section.
 # These caps keep the prompt within a manageable token budget while still
@@ -137,49 +201,8 @@ def run(ctx: PipelineContext) -> None:
     # ── Pre-flight ────────────────────────────────────────────────────────────
     _assert_prerequisites(ctx)
 
-    print(f"  [stage4] Retrieving codebase context from ChromaDB ...")
-
-    # ── Retrieve chunks ───────────────────────────────────────────────────────
-    chunks = _retrieve_context(ctx)
-    print(f"  [stage4] Retrieved {len(chunks)} unique chunks across "
-          f"{len(RETRIEVAL_QUERIES)} query angles")
-
-    # ── Build shared user prompt (same evidence for all 3 calls) ─────────────
+    print(f"  [stage4] Retrieving targeted codebase context from ChromaDB ...")
     quality_score = _get_quality_score(ctx)
-    user_prompt   = _build_user_prompt(ctx, chunks)
-    print(f"  [stage4] User prompt assembled: {len(user_prompt):,} chars "
-          f"(~{len(user_prompt) // 4:,} tokens)")
-
-    # ── RAG augmentation ──────────────────────────────────────────────────────
-    # When RAG_ENABLED=1, build an FTS5 code chunk index and append the most
-    # relevant snippets to the user prompt.  Particularly useful for large
-    # codebases where the main prompt is already near the context window limit.
-    from pipeline.rag import CodeChunkIndex, is_enabled as _rag_enabled, get_top_k as _rag_top_k
-    if _rag_enabled():
-        _rag_idx = CodeChunkIndex(str(Path(output_path).parent))
-        _rag_idx.build(ctx)
-        _rag_ctx_a = _rag_idx.format_context(
-            "domain entities data models user roles business objects database tables",
-            top_k=_rag_top_k(),
-            header="## RAG: Top relevant code chunks (entities / tables)",
-        )
-        _rag_ctx_b = _rag_idx.format_context(
-            "business features use cases workflows user actions forms authentication",
-            top_k=_rag_top_k(),
-            header="## RAG: Top relevant code chunks (features / workflows)",
-        )
-        _rag_idx.close()
-        if _rag_ctx_a:
-            user_prompt = user_prompt + "\n\n" + _rag_ctx_a
-        print(f"  [stage4] RAG augmentation: +{len(_rag_ctx_a)} chars (entities), "
-              f"+{len(_rag_ctx_b)} chars (features)")
-    else:
-        _rag_ctx_b = ""
-
-    from pipeline.llm_client import get_provider, get_model
-    print(f"  [stage4] LLM: {get_provider()} / {get_model()} | "
-          f"context={len(user_prompt)} chars | quality={quality_score}")
-
     debug_dir = str(Path(output_path).parent)
 
     # ── Build grounding lists from code_map (anti-hallucination) ─────────────
@@ -224,6 +247,101 @@ def run(ctx: PipelineContext) -> None:
     _tables_cap = int(os.environ.get("STAGE4_TABLES_CAP", "40")  or "40")
     known_pages: list[str] = _build_grounding_pages(cm, cap=_pages_cap)
 
+    prompt_profiles = ["A", "B_CORE", "B_UI", "C_ROLES", "C_WORKFLOWS", "GAP"]
+    prompt_chunks: dict[str, list[dict[str, Any]]] = {}
+
+    # ── Parallel retrieval — all 6 profiles are independent ChromaDB reads ────
+    from pipeline.llm_client import get_max_workers as _max_w_early
+    _ret_workers = _max_w_early()
+
+    def _retrieve_profile(profile: str) -> tuple[str, list]:
+        queries = _RETRIEVAL_PROFILE_QUERIES[profile]
+        chunks  = _retrieve_context(
+            ctx,
+            queries          = queries,
+            max_total_chunks = _PROFILE_MAX_TOTAL_CHUNKS[profile],
+            max_context_chars= _PROFILE_MAX_CONTEXT_CHARS[profile],
+        )
+        return profile, chunks
+
+    if _ret_workers > 1 and len(prompt_profiles) > 1:
+        from concurrent.futures import ThreadPoolExecutor as _RetTPE
+        with _RetTPE(max_workers=min(len(prompt_profiles), _ret_workers)) as _ret_pool:
+            _ret_futs = [_ret_pool.submit(_retrieve_profile, p) for p in prompt_profiles]
+            for fut in _ret_futs:
+                _profile, _chunks = fut.result()
+                prompt_chunks[_profile] = _chunks
+    else:
+        for _p in prompt_profiles:
+            _, _chunks = _retrieve_profile(_p)
+            prompt_chunks[_p] = _chunks
+
+    for profile in prompt_profiles:
+        _queries = _RETRIEVAL_PROFILE_QUERIES[profile]
+        print(
+            f"  [stage4]   {profile:<11} {len(prompt_chunks[profile])} chunk(s) "
+            f"across {len(_queries)} query angles"
+        )
+
+    prompt_a = _build_user_prompt(ctx, prompt_chunks["A"], profile="A")
+    prompt_b_core = _build_user_prompt(ctx, prompt_chunks["B_CORE"], profile="B_CORE")
+    prompt_b_ui = _build_user_prompt(ctx, prompt_chunks["B_UI"], profile="B_UI")
+    prompt_c_roles = _build_user_prompt(ctx, prompt_chunks["C_ROLES"], profile="C_ROLES")
+    prompt_c_workflows = _build_user_prompt(ctx, prompt_chunks["C_WORKFLOWS"], profile="C_WORKFLOWS")
+    gap_prompt = _build_user_prompt(ctx, prompt_chunks["GAP"], profile="GAP")
+
+    # ── RAG augmentation ──────────────────────────────────────────────────────
+    # Keep the RAG snippets targeted too; duplicating them onto every prompt
+    # would push us back toward the same max-model-len problem.
+    from pipeline.rag import CodeChunkIndex, is_enabled as _rag_enabled, get_top_k as _rag_top_k
+    if _rag_enabled():
+        _rag_idx = CodeChunkIndex(str(Path(output_path).parent))
+        _rag_idx.build(ctx)
+        _rag_ctx_a = _rag_idx.format_context(
+            "domain entities data models user roles business objects database tables",
+            top_k=_rag_top_k(),
+            header="## RAG: Top relevant code chunks (entities / tables)",
+        )
+        _rag_ctx_features = _rag_idx.format_context(
+            "business features use cases forms pages workflows user actions",
+            top_k=_rag_top_k(),
+            header="## RAG: Top relevant code chunks (features)",
+        )
+        _rag_ctx_workflows = _rag_idx.format_context(
+            "authentication navigation redirects entry points workflows business operations",
+            top_k=_rag_top_k(),
+            header="## RAG: Top relevant code chunks (workflows / auth)",
+        )
+        _rag_idx.close()
+        if _rag_ctx_a:
+            prompt_a += "\n\n" + _rag_ctx_a
+        if _rag_ctx_features:
+            prompt_b_core += "\n\n" + _rag_ctx_features
+            gap_prompt += "\n\n" + _rag_ctx_features
+        if _rag_ctx_workflows:
+            prompt_c_workflows += "\n\n" + _rag_ctx_workflows
+        print(
+            f"  [stage4] RAG augmentation: "
+            f"+{len(_rag_ctx_a)} chars (A), "
+            f"+{len(_rag_ctx_features)} chars (features), "
+            f"+{len(_rag_ctx_workflows)} chars (workflows)"
+        )
+
+    for _name, _prompt in [
+        ("A", prompt_a),
+        ("B_CORE", prompt_b_core),
+        ("B_UI", prompt_b_ui),
+        ("C_ROLES", prompt_c_roles),
+        ("C_WORKFLOWS", prompt_c_workflows),
+        ("GAP", gap_prompt),
+    ]:
+        print(f"  [stage4] Prompt {_name:<11} {len(_prompt):,} chars "
+              f"(~{len(_prompt) // 4:,} tokens)")
+
+    from pipeline.llm_client import get_provider, get_model, get_max_workers as _max_w
+    print(f"  [stage4] LLM: {get_provider()} / {get_model()} | quality={quality_score}")
+    _workers = _max_w()
+
     # ── Self-consistency voting ───────────────────────────────────────────────
     # STAGE4_CONSISTENCY_RUNS=N runs Calls A and B N times independently and
     # merges results by taking the union of entities/features/contexts.
@@ -242,13 +360,15 @@ def run(ctx: PipelineContext) -> None:
     if len(_ensemble_models) > 1:
         print(f"  [stage4] Ensemble mode: {len(_ensemble_models)} models")
 
-    # ── Calls A + B + C (sequential — Ollama processes one request at a time) ───
+    # ── Calls A + B + C (narrow prompts per sub-task) ───────────────────────
     _sys_b = _system_features(quality_score,
                                known_tables=known_tables,
                                known_pages=known_pages,
                                known_fields=known_fields,
                                table_columns=getattr(cm, "table_columns", None) or [])
-    _user_prompt_b = (user_prompt + "\n\n" + _rag_ctx_b) if _rag_ctx_b else user_prompt
+    _sys_a = _system_meta(quality_score)
+    _sys_c_roles = _system_roles_only(quality_score)
+    _sys_c_workflows = _system_workflows_only(quality_score)
 
     def _make_suffix(mdl_idx: int, run: int, total: int, letter: str) -> str:
         if total == 1:
@@ -257,30 +377,88 @@ def run(ctx: PipelineContext) -> None:
             return f"{letter}{mdl_idx+1}.{run+1}"
         return f"{letter}{run+1}"
 
-    _a_results: list[dict] = []
-    _b_results: list[dict] = []
+    _call_specs: list[tuple[str, str, str, int, str, str, str | None]] = []
     _total_a = _consistency_runs * len(_ensemble_models)
     _total_b = _consistency_runs * len(_ensemble_models)
     for _mi, _mdl in enumerate(_ensemble_models):
         for _run in range(_consistency_runs):
-            raw_a = _call_part(_system_meta(quality_score), user_prompt,
-                               MAX_TOKENS_META, f"stage4-{_make_suffix(_mi, _run, _total_a, 'A')}",
-                               model_override=_mdl)
-            _a_results.append(_parse_partial(raw_a, _make_suffix(_mi, _run, _total_a, "A"), debug_dir))
-            raw_b = _call_part(_sys_b, _user_prompt_b,
-                               MAX_TOKENS_FEATURES, f"stage4-{_make_suffix(_mi, _run, _total_b, 'B')}",
-                               model_override=_mdl)
-            _b_results.append(_parse_partial(raw_b, _make_suffix(_mi, _run, _total_b, "B"), debug_dir))
+            _suffix_a = _make_suffix(_mi, _run, _total_a, "A")
+            _suffix_b = _make_suffix(_mi, _run, _total_b, "B")
 
-    raw_c = _call_part(_system_roles_workflows(quality_score), user_prompt,
-                       MAX_TOKENS_ROLES_WF, "stage4-C")
+            _call_specs.append((
+                "A", _sys_a, prompt_a, MAX_TOKENS_META,
+                f"stage4-{_suffix_a}", _suffix_a, _mdl,
+            ))
+            _call_specs.append((
+                "B", _sys_b, prompt_b_core, MAX_TOKENS_FEATURES,
+                f"stage4-{_suffix_b}-core", f"{_suffix_b}-core", _mdl,
+            ))
+            _call_specs.append((
+                "B", _sys_b, prompt_b_ui, MAX_TOKENS_FEATURES,
+                f"stage4-{_suffix_b}-ui", f"{_suffix_b}-ui", _mdl,
+            ))
+
+    _call_specs.append((
+        "C", _sys_c_roles, prompt_c_roles, MAX_TOKENS_ROLES_WF,
+        "stage4-C1", "C1", None,
+    ))
+    _call_specs.append((
+        "C", _sys_c_workflows, prompt_c_workflows, MAX_TOKENS_ROLES_WF,
+        "stage4-C2", "C2", None,
+    ))
+
+    def _run_stage4_call(
+        args: tuple[str, str, str, int, str, str, str | None],
+    ) -> tuple[str, str, dict]:
+        _group, _system, _user, _max_tokens, _llm_label, _parse_label, _mdl = args
+        raw = _call_part(
+            _system,
+            _user,
+            _max_tokens,
+            _llm_label,
+            model_override=_mdl,
+        )
+        return _group, _parse_label, _parse_partial(raw, _parse_label, debug_dir)
+
+    if _workers > 1 and len(_call_specs) > 1:
+        from concurrent.futures import ThreadPoolExecutor as _TPE, as_completed as _ac
+        print(f"  [stage4] Running {len(_call_specs)} independent LLM call(s) "
+              f"in parallel (workers={min(len(_call_specs), _workers)}) ...")
+        with _TPE(max_workers=min(len(_call_specs), _workers)) as _pool:
+            _spec_futs = {_pool.submit(_run_stage4_call, spec): spec
+                          for spec in _call_specs}
+            _call_results: list[tuple[str, str, dict]] = []
+            for _fut in _ac(_spec_futs):
+                _spec = _spec_futs[_fut]
+                _grp, _lbl = _spec[0], _spec[5]
+                try:
+                    _call_results.append(_fut.result())
+                except Exception as _exc:
+                    print(f"  [stage4] ⚠️  Call {_lbl} failed: {_exc} — skipping")
+                    _call_results.append((_grp, _lbl, {}))
+    else:
+        _call_results = [_run_stage4_call(spec) for spec in _call_specs]
+
+    _a_results: list[dict] = []
+    _b_results: list[dict] = []
+    _c_results: dict[str, dict] = {}
+    for _group, _parse_label, _parsed in _call_results:
+        if _group == "A":
+            _a_results.append(_parsed)
+        elif _group == "B":
+            _b_results.append(_parsed)
+        else:
+            _c_results[_parse_label] = _parsed
 
     data_a = _merge_consistency_a(_a_results)
     data_b = _merge_consistency_b(_b_results)
     data_b = _filter_hallucinated_refs(data_b,
                                        known_pages_lower=known_files_all,
                                        known_tables_lower={t.lower() for t in known_tables})
-    data_c = _parse_partial(raw_c, "C", debug_dir)
+    data_c = {
+        **_c_results.get("C1", {}),
+        **_c_results.get("C2", {}),
+    }
 
     # ── Merge all three dicts (A wins on overlaps, B/C fill in their fields) ──
     merged = {**data_a, **data_b, **data_c}
@@ -302,7 +480,7 @@ def run(ctx: PipelineContext) -> None:
             print(f"  [stage4] Gap-fill capped at {MAX_GAP_ROUNDS} rounds "
                   f"(STAGE4_MAX_GAP_ROUNDS={MAX_GAP_ROUNDS})")
         domain_model = _gap_fill_pass(
-            ctx, domain_model, coverage_report, user_prompt, quality_score, debug_dir,
+            ctx, domain_model, coverage_report, gap_prompt, quality_score, debug_dir,
             known_tables=known_tables, known_pages_lower=known_files_all,
             known_fields=known_fields,
         )
@@ -401,17 +579,23 @@ def _merge_consistency_b(results: list[dict]) -> dict:
 
 # ─── Retrieval ─────────────────────────────────────────────────────────────────
 
-def _retrieve_context(ctx: PipelineContext) -> list[dict[str, Any]]:
+def _retrieve_context(
+    ctx: PipelineContext,
+    queries: list[tuple[str, str]] | None = None,
+    max_total_chunks: int = MAX_TOTAL_CHUNKS,
+    max_context_chars: int = MAX_CONTEXT_CHARS,
+) -> list[dict[str, Any]]:
     """
     Fire all retrieval queries against ChromaDB and return a deduplicated,
     ranked list of the most relevant chunks.
     """
     from pipeline.stage30_embed import query_collection
 
+    active_queries = queries or RETRIEVAL_QUERIES
     seen_ids: set[str]      = set()
     scored:   list[tuple]   = []   # (score, chunk_dict)
 
-    for query_text, angle in RETRIEVAL_QUERIES:
+    for query_text, angle in active_queries:
         try:
             results = query_collection(ctx, query_text, n_results=TOP_K_PER_QUERY)
         except Exception as e:
@@ -431,14 +615,14 @@ def _retrieve_context(ctx: PipelineContext) -> list[dict[str, Any]]:
 
     # Sort by relevance descending, take top N
     scored.sort(key=lambda x: x[0], reverse=True)
-    top_chunks = [chunk for _, chunk in scored[:MAX_TOTAL_CHUNKS]]
+    top_chunks = [chunk for _, chunk in scored[:max_total_chunks]]
 
-    # Trim to MAX_CONTEXT_CHARS total
+    # Trim to the per-profile character budget
     total_chars = 0
     trimmed = []
     for chunk in top_chunks:
         chunk_len = len(chunk["text"])
-        if total_chars + chunk_len > MAX_CONTEXT_CHARS:
+        if total_chars + chunk_len > max_context_chars:
             break
         trimmed.append(chunk)
         total_chars += chunk_len
@@ -639,11 +823,27 @@ def _format_schema_grounding(
     nullable + FK) for each table.  Falls back to the flat table-name list
     when column data is absent.
     """
-    # Index column data by table name (lower-cased for case-insensitive match)
+    # Index column data by table name (lower-cased for case-insensitive match).
+    # Two formats:
+    #   Format A — flat TableColumnEntry (Prisma/TS/Java): each entry IS one column
+    #              {"table":"users", "column":"email", "nullable":False, ...}
+    #   Format B — grouped DbSchemaEntry (PHP migrations): entry has a columns list
+    #              {"table":"users", "columns":[{"name":"email", ...}], ...}
     col_index: dict[str, list[dict]] = {}
     for entry in (table_columns or []):
         tname = (entry.get("table") or "").strip().lower()
-        if tname:
+        if not tname:
+            continue
+        if entry.get("column"):
+            # Format A: flat — synthesise a column dict matching Format B shape
+            col_index.setdefault(tname, []).append({
+                "name":     entry["column"],
+                "type":     entry.get("type", ""),
+                "nullable": entry.get("nullable", True),
+                "default":  entry.get("default"),
+            })
+        else:
+            # Format B: grouped — entry carries a columns list
             col_index.setdefault(tname, []).extend(entry.get("columns") or [])
 
     lines: list[str] = [
@@ -694,11 +894,10 @@ def _system_features(
     if known_pages:
         pages_str = ", ".join(known_pages[:250])     # cap to avoid token overflow
         grounding_parts.append(
-            "MANDATORY GROUNDING — ACTUAL PHP PAGE FILES IN THIS CODEBASE:\n"
+            "MANDATORY GROUNDING — ACTUAL SOURCE FILES IN THIS CODEBASE:\n"
             f"{pages_str}\n"
             "You MUST use ONLY filenames from the list above in 'pages' arrays.\n"
-            "Do NOT invent filenames like 'registration.php', 'catalog.php', "
-            "'cart.php', 'checkout.php' unless they actually appear in this list."
+            "Do NOT invent filenames that do not appear in this list."
         )
     if known_fields:
         fields_str = ", ".join(known_fields[:200])   # cap to avoid token overflow
@@ -763,6 +962,49 @@ Output ONLY this JSON (no other fields):
 }}
 
 Now produce the JSON for user_roles and workflows only:"""
+
+
+def _system_roles_only(quality_score: int) -> str:
+    """Call C1 — user roles only."""
+    return f"""{_get_preamble()}
+{_evidence_instruction(quality_score)}
+
+Output ONLY this JSON (no other fields):
+{{
+  "user_roles": [
+    {{
+      "role": "Role name (e.g. Customer, Admin, Staff)",
+      "description": "What this role can do in the system",
+      "entry_points": ["login.php", "registration.php"]
+    }}
+  ]
+}}
+
+Now produce the JSON for user_roles only:"""
+
+
+def _system_workflows_only(quality_score: int) -> str:
+    """Call C2 — workflows only."""
+    return f"""{_get_preamble()}
+{_evidence_instruction(quality_score)}
+
+Output ONLY this JSON (no other fields):
+{{
+  "workflows": [
+    {{
+      "name": "Workflow name (e.g. Rental Booking Flow)",
+      "actor": "Who performs this workflow",
+      "steps": [
+        {{"step": 1, "action": "User navigates to login.php", "page": "login.php"}},
+        {{"step": 2, "action": "User submits credentials", "page": "login.php"}}
+      ],
+      "preconditions": ["User must have an account"],
+      "postconditions": ["Booking is saved in request table"]
+    }}
+  ]
+}}
+
+Now produce the JSON for workflows only:"""
 
 
 def _group_uncovered_by_module(
@@ -902,11 +1144,83 @@ def _rag_sort(items: list, key_fn, relevant_stems: set[str]) -> list:
     return sorted(items, key=lambda x: (0 if Path(key_fn(x)).stem.lower() in relevant_stems else 1))
 
 
-def _build_user_prompt(ctx: PipelineContext, chunks: list[dict]) -> str:
+def _build_user_prompt(
+    ctx: PipelineContext,
+    chunks: list[dict],
+    profile: str = "full",
+) -> str:
     """
     Assemble the user prompt from retrieved chunks, CodeMap metadata,
     and graph summary.
     """
+    profile = (profile or "full").upper()
+    _is_full = profile in {"FULL", "ALL"}
+
+    _include_db_tables     = _is_full or profile in {"B_CORE", "GAP"}
+    _include_ts_types      = _is_full or profile in {"A", "B_CORE", "GAP"}
+    _include_components    = _is_full or profile in {"B_UI", "GAP"}
+    _include_form_inputs   = _is_full or profile in {"B_UI", "GAP", "C_WORKFLOWS"}
+    _include_redirects     = _is_full or profile in {"B_UI", "GAP", "C_WORKFLOWS"}
+    _include_pages         = _is_full or profile in {"B_UI", "GAP", "C_WORKFLOWS"}
+    _include_functions     = _is_full
+    _include_call_graph    = _is_full
+    _include_form_fields   = _is_full or profile in {"B_UI", "GAP", "C_WORKFLOWS"}
+    _include_service_deps  = _is_full
+    _include_env_vars      = _is_full
+    _include_sem_roles     = _is_full or profile in {"A", "C_ROLES", "C_WORKFLOWS"}
+    _include_ext_systems   = _is_full or profile in {"A"}
+    _include_db_schema     = _is_full or profile in {"B_CORE", "GAP"}
+    _include_auth_signals  = _is_full or profile in {"C_ROLES", "C_WORKFLOWS", "GAP"}
+    _include_http_eps      = _is_full or profile in {"B_UI", "GAP", "C_ROLES", "C_WORKFLOWS"}
+    _include_table_cols    = _is_full or profile in {"A", "B_CORE", "GAP"}
+    _include_exec_paths    = _is_full or profile in {"B_UI", "GAP", "C_WORKFLOWS"}
+    _include_modules       = _is_full or profile in {"A"}
+    _include_entities      = _is_full or profile in {"A", "B_CORE", "GAP"}
+    _include_relationships = _is_full or profile in {"A", "B_CORE", "GAP"}
+    _include_rules         = _is_full or profile in {"B_CORE", "GAP", "C_WORKFLOWS"}
+    _include_state         = _is_full or profile in {"B_CORE", "GAP", "C_WORKFLOWS"}
+    _include_graphrag      = _is_full or profile in {"B_CORE", "B_UI", "GAP", "C_ROLES", "C_WORKFLOWS"}
+
+    if profile == "A":
+        _cap_db_tables = min(_CAP_DB_TABLES, 12)
+        _cap_ts_types = min(_CAP_TS_TYPES, 20)
+        _cap_table_cols = min(_CAP_TABLE_COLS, 20)
+        _cap_modules = 25
+        _cap_entities = 20
+        _cap_relationships = 20
+        _cap_type_fields = 10
+        _cap_graphrag_chars = 1_200
+        _cap_table_refs = 4
+    elif profile == "B_CORE":
+        _cap_db_tables = min(_CAP_DB_TABLES, 20)
+        _cap_ts_types = min(_CAP_TS_TYPES, 30)
+        _cap_table_cols = min(_CAP_TABLE_COLS, 30)
+        _cap_modules = 20
+        _cap_entities = 25
+        _cap_relationships = 25
+        _cap_type_fields = 12
+        _cap_graphrag_chars = 1_800
+        _cap_table_refs = 5
+    else:
+        _cap_db_tables = _CAP_DB_TABLES if _is_full else min(_CAP_DB_TABLES, 40)
+        _cap_ts_types = _CAP_TS_TYPES if _is_full else min(_CAP_TS_TYPES, 40)
+        _cap_table_cols = _CAP_TABLE_COLS if _is_full else min(_CAP_TABLE_COLS, 40)
+        _cap_modules = 40 if not _is_full else 999_999
+        _cap_entities = 30 if not _is_full else 999_999
+        _cap_relationships = 40 if not _is_full else 999_999
+        _cap_type_fields = 12 if not _is_full else 999_999
+        _cap_graphrag_chars = 2_000 if not _is_full else 10_000
+        _cap_table_refs = 6 if not _is_full else 999_999
+
+    _cap_components = _CAP_COMPONENTS if _is_full else min(_CAP_COMPONENTS, 40)
+    _cap_form_files = _CAP_FORM_FILES if _is_full else min(_CAP_FORM_FILES, 40)
+    _cap_redirects = _CAP_REDIRECTS if _is_full else min(_CAP_REDIRECTS, 40)
+    _cap_functions = _CAP_FUNCTIONS if _is_full else min(_CAP_FUNCTIONS, 40)
+    _cap_call_graph = _CAP_CALL_GRAPH if _is_full else min(_CAP_CALL_GRAPH, 25)
+    _cap_auth_signals = _CAP_AUTH_SIGNALS if _is_full else min(_CAP_AUTH_SIGNALS, 30)
+    _cap_http_eps = _CAP_HTTP_EPS if _is_full else min(_CAP_HTTP_EPS, 40)
+    _cap_exec_paths = _CAP_EXEC_PATHS if _is_full else min(_CAP_EXEC_PATHS, 20)
+
     parts: list[str] = []
     _rel_stems = _rag_relevant_stems(chunks)   # files surfaced by RAG — prioritised in caps
 
@@ -929,8 +1243,8 @@ def _build_user_prompt(ctx: PipelineContext, chunks: list[dict]) -> str:
         q.get("table", "") for q in cm.sql_queries
         if q.get("table") and q["table"] not in ("UNKNOWN", "")
     })
-    if unique_tables:
-        _shown_tables = unique_tables[:_CAP_DB_TABLES] if _CAP_DB_TABLES > 0 else unique_tables
+    if _include_db_tables and unique_tables:
+        _shown_tables = unique_tables[:_cap_db_tables] if _cap_db_tables > 0 else unique_tables
         _omitted_tbl  = len(unique_tables) - len(_shown_tables)
         parts.append(f"\n=== DATABASE TABLES ({len(unique_tables)} total"
                      + (f", showing {len(_shown_tables)})" if _omitted_tbl else ")"))
@@ -948,9 +1262,18 @@ def _build_user_prompt(ctx: PipelineContext, chunks: list[dict]) -> str:
                           if q.get("table") == table
                           and q.get("operation") in ("CREATE","ALTER","DROP")})
             lines = [f"Table '{table}':"]
-            if ddl:     lines.append(f"  Schema defined in: {', '.join(ddl)}")
-            if writers: lines.append(f"  Written by: {', '.join(writers)}")
-            if readers: lines.append(f"  Read by: {', '.join(readers)}")
+            if ddl:
+                _ddl = ddl[:_cap_table_refs]
+                _suffix = f" ... +{len(ddl) - len(_ddl)} more" if len(ddl) > len(_ddl) else ""
+                lines.append(f"  Schema defined in: {', '.join(_ddl)}{_suffix}")
+            if writers:
+                _writers = writers[:_cap_table_refs]
+                _suffix = f" ... +{len(writers) - len(_writers)} more" if len(writers) > len(_writers) else ""
+                lines.append(f"  Written by: {', '.join(_writers)}{_suffix}")
+            if readers:
+                _readers = readers[:_cap_table_refs]
+                _suffix = f" ... +{len(readers) - len(_readers)} more" if len(readers) > len(_readers) else ""
+                lines.append(f"  Read by: {', '.join(_readers)}{_suffix}")
             parts.append("\n".join(lines))
 
     # ── TypeScript type definitions (interfaces + type aliases) ─────────────
@@ -958,8 +1281,8 @@ def _build_user_prompt(ctx: PipelineContext, chunks: list[dict]) -> str:
     # that have no SQL tables or ORM models.  Always shown when present so the
     # LLM can ground entity names, field names, and relationships.
     _ts_types = getattr(cm, "type_definitions", None) or []
-    if _ts_types:
-        _shown_types = _ts_types[:_CAP_TS_TYPES] if _CAP_TS_TYPES > 0 else _ts_types
+    if _include_ts_types and _ts_types:
+        _shown_types = _ts_types[:_cap_ts_types] if _cap_ts_types > 0 else _ts_types
         _omitted_ty  = len(_ts_types) - len(_shown_types)
         parts.append(
             f"\n=== TYPESCRIPT TYPE DEFINITIONS ({len(_ts_types)} total"
@@ -973,8 +1296,10 @@ def _build_user_prompt(ctx: PipelineContext, chunks: list[dict]) -> str:
             if fields:
                 field_strs = [
                     f"{f['name']}{'?' if f.get('optional') else ''}: {f.get('type','any')}"
-                    for f in fields
+                    for f in fields[:_cap_type_fields]
                 ]
+                if len(fields) > _cap_type_fields:
+                    field_strs.append(f"... +{len(fields) - _cap_type_fields} more")
                 parts.append(f"  {kind} {name}  [{src_f}]")
                 parts.append(f"    fields: {', '.join(field_strs)}")
             else:
@@ -987,7 +1312,7 @@ def _build_user_prompt(ctx: PipelineContext, chunks: list[dict]) -> str:
     # (e.g. SprintPlanningTab, RiskRegisterTab) as separate documented features
     # rather than one undifferentiated "Dashboard" page.
     components = getattr(cm, "components", None) or []
-    if components:
+    if _include_components and components:
         pages    = [c for c in components if c.get("is_page")]
         non_pages = [c for c in components if not c.get("is_page")]
 
@@ -996,7 +1321,7 @@ def _build_user_prompt(ctx: PipelineContext, chunks: list[dict]) -> str:
             c["name"]: c["file"] for c in components if c.get("name") and c.get("file")
         }
 
-        _shown_comps = components[:_CAP_COMPONENTS] if _CAP_COMPONENTS > 0 else components
+        _shown_comps = components[:_cap_components] if _cap_components > 0 else components
         _omit_comp   = len(components) - len(_shown_comps)
 
         parts.append(
@@ -1084,16 +1409,16 @@ def _build_user_prompt(ctx: PipelineContext, chunks: list[dict]) -> str:
             parts.append(f"  … +{_omit_comp} more components omitted (raise STAGE4_CAP_COMPONENTS to include)")
 
     # ── Form inputs summary ───────────────────────────────────────────────────
-    if cm.superglobals:
+    if _include_form_inputs and cm.superglobals:
         parts.append(f"\n=== FORM INPUTS (by page) ===")
         from collections import defaultdict
         sg_by_file: dict[str, list] = defaultdict(list)
         for sg in cm.superglobals:
             sg_by_file[sg["file"]].append(sg)
         _form_files = _rag_sort(list(sg_by_file.items()), lambda x: x[0], _rel_stems)
-        if _CAP_FORM_FILES > 0 and len(_form_files) > _CAP_FORM_FILES:
-            parts.append(f"  (showing {_CAP_FORM_FILES}/{len(_form_files)} files — RAG-prioritised)")
-            _form_files = _form_files[:_CAP_FORM_FILES]
+        if _cap_form_files > 0 and len(_form_files) > _cap_form_files:
+            parts.append(f"  (showing {_cap_form_files}/{len(_form_files)} files — RAG-prioritised)")
+            _form_files = _form_files[:_cap_form_files]
         for filepath, sgs in _form_files:
             filename  = Path(filepath).name
             post_keys = sorted({s["key"] for s in sgs
@@ -1106,12 +1431,12 @@ def _build_user_prompt(ctx: PipelineContext, chunks: list[dict]) -> str:
                 parts.append(f"{filename} SESSION keys: {', '.join(sess_keys)}")
 
     # ── Redirect / navigation summary ────────────────────────────────────────
-    if cm.redirects:
+    if _include_redirects and cm.redirects:
         _redirects = _rag_sort(list(cm.redirects), lambda r: r.get("file", ""), _rel_stems)
         _omit_r = 0
-        if _CAP_REDIRECTS > 0 and len(_redirects) > _CAP_REDIRECTS:
-            _omit_r = len(_redirects) - _CAP_REDIRECTS
-            _redirects = _redirects[:_CAP_REDIRECTS]
+        if _cap_redirects > 0 and len(_redirects) > _cap_redirects:
+            _omit_r = len(_redirects) - _cap_redirects
+            _redirects = _redirects[:_cap_redirects]
         parts.append(f"\n=== NAVIGATION / REDIRECTS"
                      + (f" ({len(cm.redirects)} total, showing {len(_redirects)})" if _omit_r else "") + " ===")
         for r in _redirects:
@@ -1121,17 +1446,17 @@ def _build_user_prompt(ctx: PipelineContext, chunks: list[dict]) -> str:
             parts.append(f"  … +{_omit_r} more redirects omitted")
 
     # ── HTML pages (entry points) ─────────────────────────────────────────────
-    if cm.html_pages:
+    if _include_pages and cm.html_pages:
         parts.append(f"\n=== PAGE ENTRY POINTS ===")
         parts.append(", ".join(Path(p).name for p in sorted(cm.html_pages)))
 
     # ── Functions ─────────────────────────────────────────────────────────────
-    if cm.functions:
+    if _include_functions and cm.functions:
         _fns = cm.functions
         _omit_fn = 0
-        if _CAP_FUNCTIONS > 0 and len(_fns) > _CAP_FUNCTIONS:
-            _omit_fn = len(_fns) - _CAP_FUNCTIONS
-            _fns = _fns[:_CAP_FUNCTIONS]
+        if _cap_functions > 0 and len(_fns) > _cap_functions:
+            _omit_fn = len(_fns) - _cap_functions
+            _fns = _fns[:_cap_functions]
         parts.append(f"\n=== USER-DEFINED FUNCTIONS ({len(cm.functions)} total"
                      + (f", showing {len(_fns)})" if _omit_fn else ")"))
         for fn in _fns:
@@ -1146,7 +1471,7 @@ def _build_user_prompt(ctx: PipelineContext, chunks: list[dict]) -> str:
 
     # ── Call graph ────────────────────────────────────────────────────────────
     call_graph = getattr(cm, "call_graph", None) or []
-    if call_graph:
+    if _include_call_graph and call_graph:
         parts.append(f"\n=== FUNCTION CALL GRAPH ({len(call_graph)} edges) ===")
         # Group by file for readability
         from collections import defaultdict
@@ -1157,9 +1482,9 @@ def _build_user_prompt(ctx: PipelineContext, chunks: list[dict]) -> str:
             )
         _cg_files = _rag_sort(list(by_file.items()), lambda x: x[0], _rel_stems)
         _omit_cg = 0
-        if _CAP_CALL_GRAPH > 0 and len(_cg_files) > _CAP_CALL_GRAPH:
-            _omit_cg = len(_cg_files) - _CAP_CALL_GRAPH
-            _cg_files = _cg_files[:_CAP_CALL_GRAPH]
+        if _cap_call_graph > 0 and len(_cg_files) > _cap_call_graph:
+            _omit_cg = len(_cg_files) - _cap_call_graph
+            _cg_files = _cg_files[:_cap_call_graph]
         for fpath, edges in _cg_files:
             parts.append(f"{Path(fpath).name}: {', '.join(edges[:8])}"
                          + (" ..." if len(edges) > 8 else ""))
@@ -1168,7 +1493,7 @@ def _build_user_prompt(ctx: PipelineContext, chunks: list[dict]) -> str:
 
     # ── Form fields ───────────────────────────────────────────────────────────
     form_fields = getattr(cm, "form_fields", None) or []
-    if form_fields:
+    if _include_form_fields and form_fields:
         parts.append(f"\n=== HTML FORM FIELDS ===")
         for form in form_fields:
             fname  = Path(form.get("file","?")).name
@@ -1179,7 +1504,7 @@ def _build_user_prompt(ctx: PipelineContext, chunks: list[dict]) -> str:
 
     # ── Service dependencies ──────────────────────────────────────────────────
     service_deps = getattr(cm, "service_deps", None) or []
-    if service_deps:
+    if _include_service_deps and service_deps:
         parts.append(f"\n=== SERVICE DEPENDENCIES (DI / Constructor Injection) ===")
         from collections import defaultdict
         deps_by_class: dict = defaultdict(list)
@@ -1190,7 +1515,7 @@ def _build_user_prompt(ctx: PipelineContext, chunks: list[dict]) -> str:
 
     # ── Environment variables ─────────────────────────────────────────────────
     env_vars = getattr(cm, "env_vars", None) or []
-    if env_vars:
+    if _include_env_vars and env_vars:
         parts.append(f"\n=== ENVIRONMENT VARIABLES ===")
         # Group by category prefix (DB_, MAIL_, APP_, etc.)
         from collections import defaultdict
@@ -1209,7 +1534,7 @@ def _build_user_prompt(ctx: PipelineContext, chunks: list[dict]) -> str:
     # grounded user-role names instead of having to guess from file names.
     # Also exposes detected external integrations (Stripe, email, S3, …).
     sr = getattr(ctx, "semantic_roles", None)
-    if sr:
+    if _include_sem_roles and sr:
         biz_actions = [t for t in (sr.actions or [])
                        if t.role == "BUSINESS_ACTION" and t.confidence >= 0.70]
         if biz_actions:
@@ -1226,7 +1551,7 @@ def _build_user_prompt(ctx: PipelineContext, chunks: list[dict]) -> str:
             for _actor, _syms in sorted(_by_actor.items()):
                 parts.append(f"  Actor '{_actor}': {', '.join(_syms[:6])}"
                              + (" …" if len(_syms) > 6 else ""))
-        if sr.external_systems:
+        if _include_ext_systems and sr.external_systems:
             parts.append(f"\n=== EXTERNAL SYSTEM INTEGRATIONS — STAGE 2.7 ===")
             parts.append(
                 "These external systems were detected from env-var keys, class names, "
@@ -1240,7 +1565,7 @@ def _build_user_prompt(ctx: PipelineContext, chunks: list[dict]) -> str:
     # Migration history gives schema-evolution context: which tables were
     # created/altered and with what columns — useful for entity lifecycle.
     db_schema = getattr(cm, "db_schema", None) or []
-    if db_schema:
+    if _include_db_schema and db_schema:
         parts.append(f"\n=== DB SCHEMA / MIGRATIONS ({len(db_schema)} migration(s)) ===")
         parts.append("Use for entity lifecycle, column-level data model, and schema evolution.")
         _seen_mig: set = set()
@@ -1258,7 +1583,7 @@ def _build_user_prompt(ctx: PipelineContext, chunks: list[dict]) -> str:
 
     # ── Auth signals ──────────────────────────────────────────────────────────
     auth_signals = getattr(cm, "auth_signals", None) or []
-    if auth_signals:
+    if _include_auth_signals and auth_signals:
         from collections import Counter as _Counter
         parts.append(f"\n=== AUTHENTICATION & AUTHORISATION SIGNALS ===")
         # PHP parser uses "type"; TypeScript parser uses "kind" — accept both
@@ -1270,7 +1595,7 @@ def _build_user_prompt(ctx: PipelineContext, chunks: list[dict]) -> str:
         seen_pats: set = set()
         _auth_shown = 0
         for sig in auth_signals:
-            if _CAP_AUTH_SIGNALS > 0 and _auth_shown >= _CAP_AUTH_SIGNALS:
+            if _cap_auth_signals > 0 and _auth_shown >= _cap_auth_signals:
                 parts.append(f"  … +{len(auth_signals) - _auth_shown} more signals omitted")
                 break
             pat = sig.get("pattern", "?")
@@ -1284,12 +1609,12 @@ def _build_user_prompt(ctx: PipelineContext, chunks: list[dict]) -> str:
 
     # ── HTTP entry points ─────────────────────────────────────────────────────
     http_endpoints = getattr(cm, "http_endpoints", None) or []
-    if http_endpoints:
+    if _include_http_eps and http_endpoints:
         _eps = http_endpoints
         _omit_ep = 0
-        if _CAP_HTTP_EPS > 0 and len(_eps) > _CAP_HTTP_EPS:
-            _omit_ep = len(_eps) - _CAP_HTTP_EPS
-            _eps = _eps[:_CAP_HTTP_EPS]
+        if _cap_http_eps > 0 and len(_eps) > _cap_http_eps:
+            _omit_ep = len(_eps) - _cap_http_eps
+            _eps = _eps[:_cap_http_eps]
         parts.append(f"\n=== HTTP ENTRY POINTS ({len(http_endpoints)} total"
                      + (f", showing {len(_eps)})" if _omit_ep else ")"))
         for ep in _eps:
@@ -1303,12 +1628,12 @@ def _build_user_prompt(ctx: PipelineContext, chunks: list[dict]) -> str:
 
     # ── Table/column definitions ──────────────────────────────────────────────
     table_columns = getattr(cm, "table_columns", None) or []
-    if table_columns:
+    if _include_table_cols and table_columns:
         _tcols = table_columns
         _omit_tc = 0
-        if _CAP_TABLE_COLS > 0 and len(_tcols) > _CAP_TABLE_COLS:
-            _omit_tc = len(_tcols) - _CAP_TABLE_COLS
-            _tcols = _tcols[:_CAP_TABLE_COLS]
+        if _cap_table_cols > 0 and len(_tcols) > _cap_table_cols:
+            _omit_tc = len(_tcols) - _cap_table_cols
+            _tcols = _tcols[:_cap_table_cols]
         parts.append(f"\n=== DATABASE TABLES & COLUMNS ({len(table_columns)} tables"
                      + (f", showing {len(_tcols)})" if _omit_tc else ")"))
         for tbl in _tcols:
@@ -1324,12 +1649,12 @@ def _build_user_prompt(ctx: PipelineContext, chunks: list[dict]) -> str:
 
     # ── Execution paths (stage15) ────────────────────────────────────────────
     exec_paths = getattr(cm, "execution_paths", None) or []
-    if exec_paths:
+    if _include_exec_paths and exec_paths:
         _exps = _rag_sort(list(exec_paths), lambda ep: ep.get("file", ""), _rel_stems)
         _omit_exp = 0
-        if _CAP_EXEC_PATHS > 0 and len(_exps) > _CAP_EXEC_PATHS:
-            _omit_exp = len(_exps) - _CAP_EXEC_PATHS
-            _exps = _exps[:_CAP_EXEC_PATHS]
+        if _cap_exec_paths > 0 and len(_exps) > _cap_exec_paths:
+            _omit_exp = len(_exps) - _cap_exec_paths
+            _exps = _exps[:_cap_exec_paths]
         parts.append(f"\n=== EXECUTION PATHS & BRANCH ANALYSIS ({len(exec_paths)} files"
                      + (f", showing {len(_exps)})" if _omit_exp else ")"))
         parts.append(
@@ -1400,7 +1725,7 @@ def _build_user_prompt(ctx: PipelineContext, chunks: list[dict]) -> str:
     # Pre-seed the LLM with structurally-detected bounded contexts so it
     # refines evidence-based modules rather than inventing them from scratch.
     detected_modules = _modules_from_graph(ctx)
-    if detected_modules:
+    if _include_modules and detected_modules:
         parts.append(f"\n=== STRUCTURALLY DETECTED MODULES ({len(detected_modules)}) ===")
         parts.append(
             "These modules were detected automatically from directory structure, "
@@ -1408,7 +1733,8 @@ def _build_user_prompt(ctx: PipelineContext, chunks: list[dict]) -> str:
             "for bounded_contexts — rename or merge if the code evidence warrants it, "
             "but do not drop modules that have significant node counts."
         )
-        for mod_id, info in sorted(detected_modules.items()):
+        _mods = list(sorted(detected_modules.items()))[:_cap_modules]
+        for mod_id, info in _mods:
             method  = info.get("method", "unknown")
             q_score = info.get("q_score")
             count   = info.get("node_count", 0)
@@ -1420,13 +1746,15 @@ def _build_user_prompt(ctx: PipelineContext, chunks: list[dict]) -> str:
                 f"  detection={method}{q_str}"
                 f"  ({type_summary})"
             )
+        if len(detected_modules) > len(_mods):
+            parts.append(f"  … +{len(detected_modules) - len(_mods)} more modules omitted")
 
     # ── Action Clusters from Stage 2.8 ───────────────────────────────────────
     # Provide the similarity-based cluster map as an alternative bounded-context
     # seed.  This is especially useful when the Stage 2 graph was built without
     # community detection (no detected_modules) or the graph is absent.
     ac = getattr(ctx, "action_clusters", None)
-    if ac and ac.clusters and not detected_modules:
+    if _include_modules and ac and ac.clusters and not detected_modules:
         parts.append(f"\n=== ACTION CLUSTERS — STAGE 2.8 ({len(ac.clusters)}) ===")
         parts.append(
             "These clusters were computed from shared DB tables, route prefixes, "
@@ -1446,7 +1774,7 @@ def _build_user_prompt(ctx: PipelineContext, chunks: list[dict]) -> str:
 
     # ── Entities from Stage 4.1 ──────────────────────────────────────────────
     ent_col = getattr(ctx, "entities", None)
-    if ent_col and ent_col.entities:
+    if _include_entities and ent_col and ent_col.entities:
         core_ents = [e for e in ent_col.entities if e.is_core and not e.is_system]
         if core_ents:
             parts.append(
@@ -1456,7 +1784,8 @@ def _build_user_prompt(ctx: PipelineContext, chunks: list[dict]) -> str:
                 "These entities were extracted statically from the DB schema. "
                 "Use them as your key_entities and as the basis for bounded_contexts."
             )
-            for ent in core_ents[:30]:
+            _ents = core_ents[:_cap_entities]
+            for ent in _ents:
                 col_names = [c.name for c in ent.columns[:6]]
                 pk_note   = f"  pk={ent.primary_key}" if ent.primary_key else ""
                 pivot_note = "  [pivot]" if ent.is_pivot else ""
@@ -1466,12 +1795,12 @@ def _build_user_prompt(ctx: PipelineContext, chunks: list[dict]) -> str:
                     + (f"  cols=[{', '.join(col_names)}{'…' if len(ent.columns) > 6 else ''}]"
                        if col_names else "")
                 )
-            if len(core_ents) > 30:
-                parts.append(f"  … and {len(core_ents) - 30} more core entities")
+            if len(core_ents) > len(_ents):
+                parts.append(f"  … and {len(core_ents) - len(_ents)} more core entities")
 
     # ── Relationships from Stage 4.2 ─────────────────────────────────────────
     rel_col = getattr(ctx, "relationships", None)
-    if rel_col and rel_col.relationships:
+    if _include_relationships and rel_col and rel_col.relationships:
         high_rel = [r for r in rel_col.relationships if r.confidence >= 0.75]
         if high_rel:
             parts.append(
@@ -1484,21 +1813,22 @@ def _build_user_prompt(ctx: PipelineContext, chunks: list[dict]) -> str:
                 "Use them to define accurate cardinality in bounded_contexts and "
                 "data models.  Do NOT invent relationships that contradict these."
             )
-            for rel in high_rel[:40]:
+            _rels = high_rel[:_cap_relationships]
+            for rel in _rels:
                 parts.append(
                     f"  • {rel.from_entity:<25} {rel.cardinality:<5} {rel.to_entity:<25}"
                     f"  via={rel.via_column or rel.via_table or '?':<20}"
                     f"  [{','.join(rel.signals)}]"
                 )
-            if len(high_rel) > 40:
-                parts.append(f"  … and {len(high_rel) - 40} more")
+            if len(high_rel) > len(_rels):
+                parts.append(f"  … and {len(high_rel) - len(_rels)} more")
 
     # ── Detected Business Rules from Stage 2.9 ───────────────────────────────
     # High-confidence rules (schema-enforced ≥ 0.9, guard-clause ≥ 0.75) are
     # injected as hard constraints.  The LLM must surface these in features,
     # workflows, and key_entities rather than inventing its own constraints.
     inv = getattr(ctx, "invariants", None)
-    if inv and inv.rules:
+    if _include_rules and inv and inv.rules:
         high_conf = [r for r in inv.rules if r.confidence >= 0.75]
         if high_conf:
             parts.append(
@@ -1521,7 +1851,7 @@ def _build_user_prompt(ctx: PipelineContext, chunks: list[dict]) -> str:
 
     # ── State machines (Stage 4.3) ───────────────────────────────────────────
     sm_col = getattr(ctx, "state_machines", None)
-    if sm_col and sm_col.machines:
+    if _include_state and sm_col and sm_col.machines:
         parts.append(
             f"\n=== DETECTED STATE MACHINES — STAGE 4.3 "
             f"({sm_col.total} machine(s)) ==="
@@ -1547,7 +1877,7 @@ def _build_user_prompt(ctx: PipelineContext, chunks: list[dict]) -> str:
     # operations that are not obvious from directory structure alone.
     # Previously computed but never used in LLM prompts — wiring it here
     # prevents the stage38 computation from being wasted.
-    if hasattr(ctx, "graph_query"):
+    if _include_graphrag and hasattr(ctx, "graph_query"):
         _grag_topics = [
             "user roles permissions authentication",
             "business features workflows operations",
@@ -1559,7 +1889,10 @@ def _build_user_prompt(ctx: PipelineContext, chunks: list[dict]) -> str:
             except Exception:
                 _gc = None
             if _gc and _gc.strip():
-                _grag_hits.append(_gc.strip())
+                _gc_txt = _gc.strip()
+                if len(_gc_txt) > _cap_graphrag_chars:
+                    _gc_txt = _gc_txt[:_cap_graphrag_chars].rstrip() + " ..."
+                _grag_hits.append(_gc_txt)
         if _grag_hits:
             parts.append(f"\n=== GRAPH-AWARE SEMANTIC CONTEXT ===")
             parts.append(
@@ -2155,9 +2488,15 @@ def _parse_partial(raw: str, label: str, debug_dir: str | None = None) -> dict:
 
     # ── Handle top-level array (model returned [...] instead of {{...}}) ─────
     # This happens with some local models when asked for a list field.
-    _LABEL_KEY = {"A": None, "B": "features", "C": "user_roles"}
+    _label_upper = label.upper()
+    wrap_key = None
+    if _label_upper.startswith("B") or _label_upper.startswith("D"):
+        wrap_key = "features"
+    elif _label_upper in {"C", "C1", "C_ROLES"}:
+        wrap_key = "user_roles"
+    elif _label_upper in {"C2", "C_WORKFLOWS"}:
+        wrap_key = "workflows"
     if isinstance(data, list):
-        wrap_key = _LABEL_KEY.get(label)
         if wrap_key:
             print(f"  [stage4-{label}] Top-level array — wrapping as '{wrap_key}'.")
             data = {wrap_key: data}

@@ -48,19 +48,19 @@
     "models": {
       "type": "array",
       "description": "ORM model / entity classes.",
-      "items": { "type": "object" },
+      "items": { "$ref": "#/$defs/ClassEntry" },
       "default": []
     },
     "controllers": {
       "type": "array",
       "description": "Controller classes / handler functions.",
-      "items": { "type": "object" },
+      "items": { "$ref": "#/$defs/ClassEntry" },
       "default": []
     },
     "services": {
       "type": "array",
       "description": "Service, repository, and other backend classes.",
-      "items": { "type": "object" },
+      "items": { "$ref": "#/$defs/ClassEntry" },
       "default": []
     },
     "db_schema": {
