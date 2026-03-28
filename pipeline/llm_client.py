@@ -748,6 +748,10 @@ def _is_error_diagnostic(text: str) -> bool:
     accepted as a successful correction.
     """
     t = text.strip()
+    # Strip markdown fences so fenced {"error": "..."} responses are also detected,
+    # consistent with the fence-stripping in _validate_json.
+    if t.startswith("```"):
+        t = "\n".join(l for l in t.splitlines() if not l.strip().startswith("```")).strip()
     if not t.startswith("{"):
         return False
     try:
