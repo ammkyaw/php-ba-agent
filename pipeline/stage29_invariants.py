@@ -333,53 +333,85 @@ def _extract_schema_rules(
     file_to_tables: dict[str, set[str]],
 ) -> list[dict]:
     """
-    table_columns NOT NULL  →  VALIDATION  "X is required"
+    Two formats are supported:
+
+    Format A — flat TableColumnEntry (Prisma / TypeScript / Java parsers):
+        cm.table_columns = [{"table": "users", "column": "email", "nullable": False, ...}, ...]
+        Each dict is ONE column.
+
+    Format B — grouped DbSchemaEntry (PHP migration parsers):
+        cm.db_schema = [{"table": "users", "columns": [{"name": "email", ...}], ...}, ...]
+        Each dict is a table containing a list of column dicts.
+
+    NOT NULL  →  VALIDATION  "X is required"
+    UNIQUE    →  REFERENTIAL "X must be unique"
     Confidence: 1.0 (schema-enforced)
     """
     raw: list[dict] = []
-    seen: set[str] = set()  # (table, col) dedup
+    seen: set[tuple] = set()  # (table, col) dedup
 
+    def _emit_col(table: str, col_name: str, fpath: str,
+                  nullable: bool, unique: bool, primary: bool) -> None:
+        ctx_name = _assign_context(fpath, ac_file_map) if fpath else (table or "General")
+        key = (table.lower(), col_name.lower())
+        if key in seen or col_name.lower() in _SKIP_COLUMNS:
+            return
+        seen.add(key)
+        if not nullable:
+            raw.append({
+                "category":        "VALIDATION",
+                "description":     f"{_humanize(col_name)} is required",
+                "raw_expression":  f"{table}.{col_name} NOT NULL",
+                "entity":          f"{_humanize(table)}.{_humanize(col_name)}",
+                "bounded_context": ctx_name,
+                "source_files":    [fpath] if fpath else [],
+                "confidence":      1.0,
+                "tables":          [table],
+            })
+        if unique and not primary:   # primary key uniqueness is an impl detail
+            raw.append({
+                "category":        "REFERENTIAL",
+                "description":     f"{_humanize(col_name)} must be unique",
+                "raw_expression":  f"{table}.{col_name} UNIQUE",
+                "entity":          f"{_humanize(table)}.{_humanize(col_name)}",
+                "bounded_context": ctx_name,
+                "source_files":    [fpath] if fpath else [],
+                "confidence":      1.0,
+                "tables":          [table],
+            })
+
+    # ── Format A: flat TableColumnEntry (Prisma / TS / Java) ──────────────────
+    # Each entry represents a single column: {table, column, type, nullable, ...}
     for tc in (cm.table_columns or []):
-        table = tc.get("table", "")
-        fpath = tc.get("file", "")
-        ctx_name = _assign_context(fpath, ac_file_map) if fpath else table
+        col_name = tc.get("column", "")
+        if not col_name:
+            continue   # not a flat entry — skip (grouped entries handled below)
+        _emit_col(
+            table    = tc.get("table", ""),
+            col_name = col_name,
+            fpath    = tc.get("file", ""),
+            nullable = tc.get("nullable", True),
+            unique   = bool(tc.get("unique") or tc.get("foreign")),
+            primary  = bool(tc.get("primary")),
+        )
 
-        for col in tc.get("columns", []):
-            col_name = col.get("name", "")
-            if not col_name or col_name.lower() in _SKIP_COLUMNS:
+    # ── Format B: grouped DbSchemaEntry (PHP / SQL migrations) ────────────────
+    # Each entry represents a table with a "columns" list: {table, columns: [...]}
+    for entry in (cm.db_schema or []):
+        table = entry.get("table", "")
+        fpath = entry.get("file", "")
+        for col in entry.get("columns", []):
+            col_name = col.get("name", "") or col.get("column", "")
+            if not col_name:
                 continue
-
-            key = (table.lower(), col_name.lower())
-            if key in seen:
-                continue
-            seen.add(key)
-
-            nullable = col.get("nullable", True)
-            col_type = col.get("type", "").lower()
-
-            if not nullable:
-                raw.append({
-                    "category":       "VALIDATION",
-                    "description":    f"{_humanize(col_name)} is required",
-                    "raw_expression": f"{table}.{col_name} NOT NULL",
-                    "entity":         f"{_humanize(table)}.{_humanize(col_name)}",
-                    "bounded_context": ctx_name,
-                    "source_files":   [fpath] if fpath else [],
-                    "confidence":     1.0,
-                    "tables":         [table],
-                })
-
-            if col.get("unique"):
-                raw.append({
-                    "category":       "REFERENTIAL",
-                    "description":    f"{_humanize(col_name)} must be unique",
-                    "raw_expression": f"{table}.{col_name} UNIQUE",
-                    "entity":         f"{_humanize(table)}.{_humanize(col_name)}",
-                    "bounded_context": ctx_name,
-                    "source_files":   [fpath] if fpath else [],
-                    "confidence":     1.0,
-                    "tables":         [table],
-                })
+            _emit_col(
+                table    = table,
+                col_name = col_name,
+                fpath    = fpath,
+                nullable = col.get("nullable", True),
+                unique   = bool(col.get("unique")),
+                primary  = bool(col.get("primary")),
+            )
 
     return raw[:_MAX_SCHEMA_RULES]
 
@@ -682,7 +714,7 @@ def _extract_sql_rules(
     ACTIVE_RE  = re.compile(r'\bactive\s*=\s*[\'"]?1[\'"]?\b', re.IGNORECASE)
 
     for q in (cm.sql_queries or []):
-        sql   = q.get("sql", "") or ""
+        sql   = q.get("raw_sql", "") or q.get("sql", "") or ""
         table = q.get("table", "")
         fpath = q.get("file", "")
         ctx   = _assign_context(fpath, ac_file_map)
@@ -716,6 +748,303 @@ def _extract_sql_rules(
                     "confidence":      0.6,
                     "tables":          [table] if table else [],
                 })
+
+    return raw
+
+
+# ── TypeScript / JavaScript invariant extractors ─────────────────────────────
+
+# Auth guard patterns in TypeScript execution paths and source files
+_TS_AUTH_PATTERNS = re.compile(
+    r'(?:^|[(\s!])(?:session|user|auth|currentUser|getServerSession|requireAuth'
+    r'|isAuthenticated|isLoggedIn|verifyToken|validateSession)',
+    re.IGNORECASE,
+)
+
+# Zod schema rules: z.string().min(N)  z.number().max(N)  z.string().email() etc.
+_ZOD_MIN    = re.compile(r'\.min\s*\(\s*(\d+)\s*\)')
+_ZOD_MAX    = re.compile(r'\.max\s*\(\s*(\d+)\s*\)')
+_ZOD_EMAIL  = re.compile(r'\.email\s*\(\s*\)')
+_ZOD_URL    = re.compile(r'\.url\s*\(\s*\)')
+_ZOD_ENUM   = re.compile(r'z\.enum\s*\(\s*\[([^\]]+)\]')
+_ZOD_FIELD  = re.compile(
+    r'(\w+)\s*:\s*z\.'             # fieldName: z.
+    r'(string|number|boolean|date|array|object|enum|union|literal)',
+    re.IGNORECASE,
+)
+
+# Role / permission guards
+_TS_ROLE_EXACT = re.compile(
+    r"""(?:role|userRole|permission)\s*[!=]=+\s*['"](\w+)['"]""",
+    re.IGNORECASE,
+)
+_TS_HAS_ROLE  = re.compile(
+    r"""hasRole\s*\(\s*['"](\w+)['"]\s*\)""",
+    re.IGNORECASE,
+)
+
+# State / status comparisons
+_TS_STATUS = re.compile(
+    r"""(?:status|state|phase|stage)\s*[!=]=+\s*['"](\w+)['"]""",
+    re.IGNORECASE,
+)
+
+# Numeric threshold guards
+_TS_NUMERIC = re.compile(r"""(\w+)\s*([<>]=?)\s*(\d+(?:\.\d+)?)""")
+
+# Variables that are infra/loop noise in TypeScript
+_TS_NOISE_VARS = re.compile(
+    r'^(?:i|j|k|n|x|y|z|idx|count|len|size|num|index|offset|limit|page|'
+    r'result|ret|err|error|tmp|temp|res|req|ctx|next|event|e|cb|fn|'
+    r'key|val|item|elem|node|entry|row|col|data|line|char|byte)$',
+    re.IGNORECASE,
+)
+
+
+def _describe_condition_ts(cond: str, entity: str) -> tuple[str | None, str]:
+    """
+    Convert a TypeScript guard condition into (description, category).
+    Returns (None, '') if the condition is not recognisable as a business rule.
+    """
+    c = cond.strip()
+    cl = c.lower()
+
+    # ── AUTHORIZATION: session / auth guards ─────────────────────────────────
+    if re.search(r'!session|session\s*===?\s*null|!user\b|user\s*===?\s*null'
+                 r'|!auth\b|!isAuthenticated|!currentUser', cl):
+        return "User must be authenticated to perform this action", "AUTHORIZATION"
+
+    if re.search(r'!userId\b|userId\s*===?\s*null|!req\.user\b', cl):
+        return "User ID is required", "AUTHORIZATION"
+
+    # Role / permission
+    m = _TS_ROLE_EXACT.search(c)
+    if m:
+        role_val = m.group(1)
+        if role_val.lower() not in _ROUTING_VALUES and len(role_val) >= 3:
+            op = "!==" if "!" in c[:c.index(role_val)] else "==="
+            if "!" in c[:c.index(role_val)]:
+                return f"User must have '{role_val}' role", "AUTHORIZATION"
+            return f"Only users with '{role_val}' role can perform this action", "AUTHORIZATION"
+
+    m = _TS_HAS_ROLE.search(c)
+    if m:
+        return f"User must have '{m.group(1)}' role", "AUTHORIZATION"
+
+    # ── STATE_TRANSITION: status / state comparisons ─────────────────────────
+    m = _TS_STATUS.search(c)
+    if m:
+        val = m.group(1)
+        if len(val) >= 3 and not val.isdigit() and val.lower() not in _ROUTING_VALUES:
+            if "!" in c or "!==" in c:
+                return f"{entity} must not be in '{val}' state", "STATE_TRANSITION"
+            return f"{entity} must be in '{val}' state", "STATE_TRANSITION"
+
+    # ── VALIDATION: type checks ───────────────────────────────────────────────
+    if re.search(r"typeof\s+\w+\s*!==?\s*['\"]string['\"]", c):
+        return f"{entity} must be a string", "VALIDATION"
+    if re.search(r"typeof\s+\w+\s*!==?\s*['\"]number['\"]", c):
+        return f"{entity} must be a number", "VALIDATION"
+    if re.search(r"!?\w+\.trim\(\)\.length|\.length\s*===?\s*0", c):
+        return f"{entity} must not be empty", "VALIDATION"
+
+    # ── BUSINESS_LIMIT: numeric thresholds ────────────────────────────────────
+    m = _TS_NUMERIC.search(c)
+    if m:
+        var, op, num = m.group(1), m.group(2), m.group(3)
+        if not _TS_NOISE_VARS.match(var):
+            n = float(num)
+            if op == ">":
+                return f"{_humanize(var)} must not exceed {num}", "BUSINESS_LIMIT"
+            if op == ">=":
+                return f"{_humanize(var)} must not exceed {int(n)-1}", "BUSINESS_LIMIT"
+            if op == "<":
+                return f"{_humanize(var)} must be at least {num}", "BUSINESS_LIMIT"
+            if op == "<=":
+                return f"{_humanize(var)} must be at least {int(n)+1}", "BUSINESS_LIMIT"
+
+    return None, ""
+
+
+def _extract_branch_rules_ts(
+    cm: Any,
+    ac_file_map: dict[str, str],
+    file_to_tables: dict[str, set[str]],
+) -> list[dict]:
+    """
+    TypeScript execution-path guard clause rules.
+    Confidence: 0.75
+    """
+    raw: list[dict] = []
+    seen_desc: set[str] = set()
+
+    for ep in (cm.execution_paths or []):
+        fpath = ep.get("file", "")
+        if not fpath:
+            continue
+        ctx_name = _assign_context(fpath, ac_file_map)
+        tables   = _file_tables(fpath, file_to_tables)
+        entity   = _humanize(Path(fpath).stem)
+
+        for branch in ep.get("branches", []):
+            cond = branch.get("condition", "").strip()
+            if not cond or len(cond) < 4:
+                continue
+            if not _is_guard_branch(branch):
+                continue
+
+            # Strip outer negation for positive-form parsing
+            effective = cond[1:].strip("()") if cond.startswith("!") else cond
+
+            desc, category = _describe_condition_ts(effective, entity)
+            if not desc:
+                continue
+
+            key = desc.lower()
+            if key in seen_desc:
+                for r in raw:
+                    if r["description"].lower() == key and fpath not in r["source_files"]:
+                        r["source_files"].append(fpath)
+                continue
+            seen_desc.add(key)
+
+            raw.append({
+                "category":        category,
+                "description":     desc,
+                "raw_expression":  cond[:120],
+                "entity":          entity,
+                "bounded_context": ctx_name,
+                "source_files":    [fpath],
+                "confidence":      0.75,
+                "tables":          tables,
+            })
+
+            if len(raw) >= _MAX_BRANCH_RULES:
+                break
+        if len(raw) >= _MAX_BRANCH_RULES:
+            break
+
+    return raw
+
+
+def _extract_source_rules_ts(
+    cm: Any,
+    project_path: str,
+    ac_file_map: dict[str, str],
+    file_to_tables: dict[str, set[str]],
+) -> list[dict]:
+    """
+    Scan TypeScript/JavaScript source files for business-rule patterns:
+      - Zod schema constraints (min/max/email/url/enum)
+      - Auth guards (getServerSession, requireAuth, etc.)
+      - Role checks
+      - State comparisons
+    Confidence: 0.65
+    """
+    raw: list[dict] = []
+    seen_desc: set[str] = set()
+
+    # Collect unique files from execution_paths + all .ts/.tsx source files
+    file_paths: list[str] = list({
+        ep.get("file", "") for ep in (cm.execution_paths or []) if ep.get("file")
+    })
+
+    project_root = Path(project_path)
+
+    for rel_path in file_paths:
+        if _should_skip_file(rel_path):
+            continue
+        full_path = project_root / rel_path
+        if not full_path.is_file():
+            continue
+        try:
+            source = full_path.read_text(encoding="utf-8", errors="ignore")
+        except Exception:
+            continue
+
+        ctx_name = _assign_context(rel_path, ac_file_map)
+        tables   = _file_tables(rel_path, file_to_tables)
+
+        def _add(desc: str, category: str, raw_expr: str, entity: str) -> None:
+            key = desc.lower()
+            if key in seen_desc:
+                for r in raw:
+                    if r["description"].lower() == key and rel_path not in r["source_files"]:
+                        r["source_files"].append(rel_path)
+                return
+            seen_desc.add(key)
+            raw.append({
+                "category":        category,
+                "description":     desc,
+                "raw_expression":  raw_expr[:80],
+                "entity":          entity,
+                "bounded_context": ctx_name,
+                "source_files":    [rel_path],
+                "confidence":      0.65,
+                "tables":          tables,
+            })
+
+        # ── Zod field rules ──────────────────────────────────────────────────
+        for fm in _ZOD_FIELD.finditer(source):
+            field_name = fm.group(1)
+            entity     = _humanize(field_name)
+            field_src  = source[fm.start():fm.start() + 200].split("\n")[0]
+
+            # min / max
+            for mm in _ZOD_MIN.finditer(field_src):
+                _add(f"{entity} must be at least {mm.group(1)} characters",
+                     "VALIDATION", field_src.strip(), entity)
+            for mm in _ZOD_MAX.finditer(field_src):
+                _add(f"{entity} must not exceed {mm.group(1)} characters",
+                     "VALIDATION", field_src.strip(), entity)
+            if _ZOD_EMAIL.search(field_src):
+                _add(f"{entity} must be a valid email address",
+                     "VALIDATION", field_src.strip(), entity)
+            if _ZOD_URL.search(field_src):
+                _add(f"{entity} must be a valid URL",
+                     "VALIDATION", field_src.strip(), entity)
+
+        # ── Zod enum (anywhere in file) ──────────────────────────────────────
+        for em in _ZOD_ENUM.finditer(source):
+            vals = re.findall(r"""['"]([\w\-]+)['"]""", em.group(1))
+            if vals:
+                parent_line = source[max(0, em.start()-80):em.start()].rsplit("\n", 1)[-1]
+                field_m = re.search(r'(\w+)\s*:\s*$', parent_line.strip())
+                entity  = _humanize(field_m.group(1)) if field_m else _humanize(Path(rel_path).stem)
+                enum_vals = ", ".join(f"'{v}'" for v in vals[:6])
+                _add(f"{entity} must be one of: {enum_vals}",
+                     "VALIDATION", em.group(0)[:80], entity)
+
+        # ── Auth guards ───────────────────────────────────────────────────────
+        if re.search(r'getServerSession|requireAuth|withAuth|protectedRoute'
+                     r'|auth\(\)\.protect|checkAuth', source, re.IGNORECASE):
+            stem = _humanize(Path(rel_path).stem)
+            _add(f"User must be authenticated to access {stem}",
+                 "AUTHORIZATION",
+                 "getServerSession / requireAuth / withAuth detected",
+                 stem)
+
+        # ── Role guards in source ─────────────────────────────────────────────
+        for rm in _TS_ROLE_EXACT.finditer(source):
+            role_val = rm.group(1)
+            if len(role_val) >= 3 and role_val.lower() not in _ROUTING_VALUES:
+                line = source[max(0, rm.start()-20):rm.end()+20].split("\n")[0].strip()
+                entity = _humanize(Path(rel_path).stem)
+                _add(f"User must have '{role_val}' role",
+                     "AUTHORIZATION", line[:80], entity)
+
+        # ── State comparisons in source ───────────────────────────────────────
+        for sm in _TS_STATUS.finditer(source):
+            val = sm.group(1)
+            if len(val) >= 3 and not val.isdigit() and val.lower() not in _ROUTING_VALUES:
+                context_src = source[max(0, sm.start()-10):sm.end()+10].split("\n")[0].strip()
+                field_ctx   = re.search(r'(\w+)\.(?:status|state)', context_src)
+                entity      = _humanize(field_ctx.group(1)) if field_ctx else _humanize(Path(rel_path).stem)
+                _add(f"{entity} must be in '{val}' state",
+                     "STATE_TRANSITION", context_src[:80], entity)
+
+        if len(raw) >= _MAX_SOURCE_RULES:
+            break
 
     return raw
 
@@ -864,31 +1193,49 @@ def run(ctx: PipelineContext) -> None:
         if f and t and t.upper() not in ("", "UNKNOWN"):
             file_to_tables[f].add(t.lower())
 
-    # known POST field names (superglobals)
-    post_keys: set[str] = {
-        s["key"].lower()
-        for s in (cm.superglobals or [])
-        if s.get("var") in ("$_POST", "$_GET", "$_REQUEST") and s.get("key")
-    }
+    # Detect language for dispatch
+    lang = getattr(cm.language, "value", str(cm.language)).lower()
+    is_ts  = lang in ("typescript", "javascript")
+    is_php = lang == "php"
 
-    # ── Phase 1: DB schema ────────────────────────────────────────────────────
+    # known POST / request field names (PHP: superglobals; TS: input_params)
+    post_keys: set[str] = set()
+    for s in (cm.superglobals or []):
+        if s.get("var") in ("$_POST", "$_GET", "$_REQUEST") and s.get("key"):
+            post_keys.add(s["key"].lower())
+    for ip in (cm.input_params or []):
+        name = ip.get("name", "") or ip.get("key", "")
+        if name:
+            post_keys.add(name.lower())
+
+    # ── Phase 1: DB schema (language-neutral) ─────────────────────────────────
     print("  [stage29] Phase 1: Extracting schema constraints ...")
     schema_rules = _extract_schema_rules(cm, ac_file_map, file_to_tables)
     print(f"  [stage29]   → {len(schema_rules)} schema rule(s)")
 
-    # ── Phase 2: Execution-path guard clauses ─────────────────────────────────
+    # ── Phase 2: Execution-path guard clauses (language-dispatched) ───────────
     print("  [stage29] Phase 2: Scanning execution-path guard clauses ...")
-    branch_rules = _extract_branch_rules(cm, ac_file_map, file_to_tables, post_keys)
+    if is_ts:
+        branch_rules = _extract_branch_rules_ts(cm, ac_file_map, file_to_tables)
+    else:
+        branch_rules = _extract_branch_rules(cm, ac_file_map, file_to_tables, post_keys)
     print(f"  [stage29]   → {len(branch_rules)} guard-clause rule(s)")
 
-    # ── Phase 3: PHP source scanning ─────────────────────────────────────────
-    print("  [stage29] Phase 3: Scanning PHP source files ...")
-    source_rules = _extract_source_rules(
-        cm, ctx.php_project_path, ac_file_map, file_to_tables, post_keys
-    )
+    # ── Phase 3: Source-file scanning (language-dispatched) ───────────────────
+    if is_ts:
+        print("  [stage29] Phase 3: Scanning TypeScript source files ...")
+        source_rules = _extract_source_rules_ts(
+            cm, ctx.project_path, ac_file_map, file_to_tables
+        )
+    else:
+        print("  [stage29] Phase 3: Scanning PHP source files ...")
+        php_root = getattr(ctx, "php_project_path", None) or ctx.project_path
+        source_rules = _extract_source_rules(
+            cm, php_root, ac_file_map, file_to_tables, post_keys
+        )
     print(f"  [stage29]   → {len(source_rules)} source-scan rule(s)")
 
-    # ── Phase 4: SQL WHERE hints ──────────────────────────────────────────────
+    # ── Phase 4: SQL WHERE hints (language-neutral, field name fixed) ──────────
     print("  [stage29] Phase 4: Mining SQL WHERE constraints ...")
     sql_rules = _extract_sql_rules(cm, ac_file_map)
     print(f"  [stage29]   → {len(sql_rules)} SQL-derived rule(s)")
