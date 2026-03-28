@@ -590,12 +590,11 @@ def call_llm(
     else:
         call_fn = _call_local
 
-    # For vLLM: omit max_tokens so the server uses remaining context space instead
-    # of pre-allocating a fixed KV-cache budget.  This avoids spurious 400 errors
-    # when prompt_tokens + max_tokens exceeds max_model_len even though the model
-    # would naturally stop well before that limit.
-    if provider == "local" and _backend_label == "vllm":
-        max_tokens = -1   # signals _call_local to omit the field from the payload
+    # vLLM note: max_tokens IS sent as-is.  The overflow handler (Phase 1/2
+    # below) will reduce it or truncate the prompt if prompt + max_tokens
+    # exceeds max_model_len.  Previously we omitted max_tokens (-1) to avoid
+    # spurious 400s, but that allowed unbounded outputs (17k+ token repetition
+    # loops) because the model had no stopping budget.
 
     last_exc: Exception | None = None
     delay    = RETRY_BASE_DELAY
@@ -630,8 +629,23 @@ def call_llm(
             if json_mode:
                 ok, err = _validate_json(result)
                 if not ok:
+                    # Trim the bad response before sending it to the correction
+                    # model.  A truncated-repetition-loop response can be 10-40k
+                    # chars; sending the full thing poisons the correction model
+                    # and causes it to loop too.  Keep the first 3 k (enough to
+                    # show structure) and the last 1 k (where the truncation is).
+                    _BAD_HEAD = 3_000
+                    _BAD_TAIL = 1_000
+                    if len(result) > _BAD_HEAD + _BAD_TAIL + 200:
+                        _result_for_corr = (
+                            result[:_BAD_HEAD]
+                            + f"\n… [{len(result) - _BAD_HEAD - _BAD_TAIL} chars omitted] …\n"
+                            + result[-_BAD_TAIL:]
+                        )
+                    else:
+                        _result_for_corr = result
                     corrected = _json_correction_call(
-                        system_prompt, result, err,
+                        system_prompt, _result_for_corr, err,
                         max_tokens, temperature, model, provider, label,
                     )
                     ok2, _ = _validate_json(corrected)
