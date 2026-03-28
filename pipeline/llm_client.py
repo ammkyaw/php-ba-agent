@@ -144,6 +144,7 @@ Usage:
 from __future__ import annotations
 
 import os
+import re
 import socket
 import threading
 import time
@@ -373,6 +374,12 @@ _VLLM_ENABLE_THINKING = (
 #   truncated at the second occurrence (preserving the first clean copy).
 _VLLM_REPETITION_WINDOW    = int(os.environ.get("VLLM_REPETITION_WINDOW",    "200") or "200")
 _VLLM_REPETITION_THRESHOLD = int(os.environ.get("VLLM_REPETITION_THRESHOLD", "3")   or "3")
+
+# Compiled once at module level — used by _strip_vllm_think (pattern 3).
+_DOC_START = re.compile(
+    r"^(#|\{|\[|\||---|```|-\s|\*\s|\d+\.\s)",
+    re.MULTILINE,
+)
 
 
 # ─── Public API ────────────────────────────────────────────────────────────────
@@ -933,10 +940,9 @@ def _call_local(
         content = _strip_repetition_loop(content)
     else:
         # Ollama / LM Studio / llama.cpp: only strip properly-tagged <think> blocks.
-        import re as _re
-        content = _re.sub(r"<think>.*?</think>", "", content, flags=_re.DOTALL).strip()
+        content = re.sub(r"<think>.*?</think>", "", content, flags=re.DOTALL).strip()
         # Also strip unclosed <think> (model hit max_tokens during thinking phase)
-        content = _re.sub(r"<think>.*$", "", content, flags=_re.DOTALL).strip()
+        content = re.sub(r"<think>.*$", "", content, flags=re.DOTALL).strip()
 
     if not content:
         raise _NonRetryableError(
@@ -979,13 +985,11 @@ def _strip_vllm_think(content: str) -> str:
     discard everything before it.  This covers the "141 lines of raw Thinking
     Process" pattern seen in the Prism vLLM run.
     """
-    import re as _re
-
     # Pattern 1 — closed <think> blocks (non-greedy, DOTALL)
-    content = _re.sub(r"<think>.*?</think>", "", content, flags=_re.DOTALL).strip()
+    content = re.sub(r"<think>.*?</think>", "", content, flags=re.DOTALL).strip()
 
     # Pattern 2 — unclosed <think> (model hit max_tokens during thinking phase)
-    content = _re.sub(r"<think>.*$", "", content, flags=_re.DOTALL).strip()
+    content = re.sub(r"<think>.*$", "", content, flags=re.DOTALL).strip()
 
     if not content:
         return content
@@ -993,10 +997,6 @@ def _strip_vllm_think(content: str) -> str:
     # Pattern 3 — raw untagged preamble: strip everything before the first
     # document-like line (# heading, { JSON open, | table, list marker, ---).
     # Only applies when the response doesn't already start with such a marker.
-    _DOC_START = _re.compile(
-        r"^(#|\{|\[|\||---|```|-\s|\*\s|\d+\.\s)",
-        _re.MULTILINE,
-    )
     if not _DOC_START.match(content):
         m = _DOC_START.search(content)
         if m and m.start() > 0:
@@ -1037,7 +1037,7 @@ def _strip_repetition_loop(content: str) -> str:
             continue            # text too short for this window size
         step = max(1, window // 2)
         i = 0
-        while i < len(content) - window:
+        while i <= len(content) - window:
             chunk = content[i : i + window]
             count = content[i:].count(chunk)
             if count >= threshold:
