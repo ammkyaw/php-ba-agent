@@ -67,6 +67,24 @@ Environment variables:
                        Use this with vLLM < 0.4.3 that predates structured-
                        output support.  Default: 0 (use response_format).
                          export VLLM_GUIDED_JSON=1
+    VLLM_REPETITION_PENALTY
+                       Float penalty applied to already-generated tokens to
+                       prevent degenerate repetition loops (e.g. "Wait, I need
+                       to check…" repeating hundreds of times).
+                       1.0 = disabled; default = 1.05 (light nudge).
+                         export VLLM_REPETITION_PENALTY=1.1
+    VLLM_ENABLE_THINKING
+                       "1" to enable chain-of-thought reasoning for Qwen3 /
+                       DeepSeek-R1 models on vLLM (sets chat_template_kwargs
+                       enable_thinking=true per request).  Default: 0 (off).
+                       When disabled, no <think> scratchpad is generated so
+                       there is nothing to leak into the output document.
+                         export VLLM_ENABLE_THINKING=1
+    VLLM_REPETITION_WINDOW / VLLM_REPETITION_THRESHOLD
+                       Post-hoc loop detector: slide a window of WINDOW chars
+                       over the response; if the same block appears ≥ THRESHOLD
+                       times, truncate at the second occurrence.
+                       Defaults: WINDOW=200, THRESHOLD=3.
 
     Response cache (pipeline/llm_cache.py):
     LLM_CACHE_ENABLED  "1"|"true"|"yes" to enable the SQLite exact-match cache
@@ -330,6 +348,31 @@ MAX_RETRIES        = 3          # maximum number of retry attempts after first f
 RETRY_BASE_DELAY   = 5.0        # seconds — first retry waits this long
 RETRY_BACKOFF      = 2.0        # multiplier: 5s → 10s → 20s
 RETRY_MAX_DELAY    = 60.0       # cap so we never wait more than 1 minute
+
+# ── vLLM-specific generation controls ─────────────────────────────────────────
+# VLLM_REPETITION_PENALTY — penalises the model for repeating tokens it has
+#   already generated.  1.0 = disabled; 1.05 is a light nudge that prevents
+#   degenerate "Wait, I need to check..." infinite loops without noticeably
+#   hurting output quality.  Override with VLLM_REPETITION_PENALTY=<float>.
+_VLLM_REPETITION_PENALTY = float(
+    os.environ.get("VLLM_REPETITION_PENALTY", "1.05") or "1.05"
+)
+
+# VLLM_ENABLE_THINKING — Qwen3/DeepSeek-R1 on vLLM expose a per-request
+#   enable_thinking flag via chat_template_kwargs.  Default: disabled (0).
+#   When disabled, the model skips its chain-of-thought scratchpad entirely —
+#   no <think> blocks are generated, so there is nothing to leak or strip.
+#   Set VLLM_ENABLE_THINKING=1 only if you deliberately want CoT reasoning.
+_VLLM_ENABLE_THINKING = (
+    os.environ.get("VLLM_ENABLE_THINKING", "0").strip().lower() in ("1", "true", "yes")
+)
+
+# VLLM_REPETITION_WINDOW / VLLM_REPETITION_THRESHOLD — post-hoc loop detector.
+#   After every vLLM response, slide a window of WINDOW chars across the output.
+#   If the same WINDOW-char block appears ≥ THRESHOLD times, the text is
+#   truncated at the second occurrence (preserving the first clean copy).
+_VLLM_REPETITION_WINDOW    = int(os.environ.get("VLLM_REPETITION_WINDOW",    "200") or "200")
+_VLLM_REPETITION_THRESHOLD = int(os.environ.get("VLLM_REPETITION_THRESHOLD", "3")   or "3")
 
 
 # ─── Public API ────────────────────────────────────────────────────────────────
@@ -788,6 +831,18 @@ def _call_local(
     # uses remaining context space rather than pre-allocating a fixed budget.
     if max_tokens > 0:
         payload["max_tokens"] = max_tokens
+
+    # ── vLLM-specific payload fields ─────────────────────────────────────────
+    if _backend == "vllm":
+        # Repetition penalty — prevents degenerate "Wait, I need to check…"
+        # infinite loops.  1.0 = disabled; we default to 1.05 (light nudge).
+        if _VLLM_REPETITION_PENALTY != 1.0:
+            payload["repetition_penalty"] = _VLLM_REPETITION_PENALTY
+
+        # Qwen3 / DeepSeek-R1 thinking mode — disabled by default so the model
+        # skips its CoT scratchpad entirely (nothing to leak into the document).
+        # Passed via extra_body compatible with vLLM's OpenAI-compat endpoint.
+        payload["chat_template_kwargs"] = {"enable_thinking": _VLLM_ENABLE_THINKING}
     if json_schema is not None:
         # Constrained decoding — grammar-level JSON schema enforcement.
         # vLLM < 0.4.3: use guided_json in the request body (VLLM_GUIDED_JSON=1)
@@ -869,10 +924,19 @@ def _call_local(
     if not content:
         content = message.get("reasoning", "") or ""
 
-    # Strip <think>...</think> blocks that Qwen3 and DeepSeek-R1 prepend to
-    # their final answer — the pipeline only wants the answer, not the scratchpad.
-    import re as _re
-    content = _re.sub(r"<think>.*?</think>", "", content, flags=_re.DOTALL).strip()
+    # ── Post-processing: strip thinking / detect loops ───────────────────────
+    if _backend == "vllm":
+        # Full vLLM-specific pipeline: strip all CoT leakage then detect loops.
+        # Even with enable_thinking=False, some model builds still emit partial
+        # thinking tags — _strip_vllm_think handles all three leakage patterns.
+        content = _strip_vllm_think(content)
+        content = _strip_repetition_loop(content)
+    else:
+        # Ollama / LM Studio / llama.cpp: only strip properly-tagged <think> blocks.
+        import re as _re
+        content = _re.sub(r"<think>.*?</think>", "", content, flags=_re.DOTALL).strip()
+        # Also strip unclosed <think> (model hit max_tokens during thinking phase)
+        content = _re.sub(r"<think>.*$", "", content, flags=_re.DOTALL).strip()
 
     if not content:
         raise _NonRetryableError(
@@ -897,6 +961,93 @@ def _call_local(
 
     # Restore prefill so the caller sees the complete value
     return (prefill + content) if prefill else content
+
+
+# ── vLLM post-processing helpers ───────────────────────────────────────────────
+
+def _strip_vllm_think(content: str) -> str:
+    """
+    Strip chain-of-thought leakage from vLLM responses.
+
+    Three patterns handled in order:
+      1. Properly closed <think>…</think> blocks  (Qwen3 happy path)
+      2. Unclosed <think>… to end-of-string       (model hit max_tokens mid-think)
+      3. Raw untagged thinking preamble            (vLLM leaked scratchpad without tags)
+
+    For pattern 3: if the response does not begin with a document marker
+    (# heading, { JSON, |table, -, *) we scan for the first such marker and
+    discard everything before it.  This covers the "141 lines of raw Thinking
+    Process" pattern seen in the Prism vLLM run.
+    """
+    import re as _re
+
+    # Pattern 1 — closed <think> blocks (non-greedy, DOTALL)
+    content = _re.sub(r"<think>.*?</think>", "", content, flags=_re.DOTALL).strip()
+
+    # Pattern 2 — unclosed <think> (model hit max_tokens during thinking phase)
+    content = _re.sub(r"<think>.*$", "", content, flags=_re.DOTALL).strip()
+
+    if not content:
+        return content
+
+    # Pattern 3 — raw untagged preamble: strip everything before the first
+    # document-like line (# heading, { JSON open, | table, list marker, ---).
+    # Only applies when the response doesn't already start with such a marker.
+    _DOC_START = _re.compile(
+        r"^(#|\{|\[|\||---|```|-\s|\*\s|\d+\.\s)",
+        _re.MULTILINE,
+    )
+    if not _DOC_START.match(content):
+        m = _DOC_START.search(content)
+        if m and m.start() > 0:
+            stripped = content[m.start():]
+            print(
+                f"  [llm_client] ⚠️  vLLM thinking preamble stripped "
+                f"({m.start()} chars before first document marker)."
+            )
+            content = stripped
+
+    return content.strip()
+
+
+def _strip_repetition_loop(content: str) -> str:
+    """
+    Detect and truncate degenerate repetition loops in LLM output.
+
+    Tries multiple window sizes (50 → 400 chars) so it catches both short
+    tight loops (e.g. a 60-char "*Okay, writing.*" pattern) and long
+    paragraph-level loops (the "Wait, I need to check…" block that repeated
+    800+ times in the Prism vLLM SRS run).
+
+    For each window size, slides the window across the response with 50%
+    overlap.  If the same window block appears ≥ _VLLM_REPETITION_THRESHOLD
+    times from that position onward, the text is truncated at the start of
+    the second occurrence — preserving the first clean copy.
+    """
+    threshold = _VLLM_REPETITION_THRESHOLD
+    # Try windows from small to large; stop at first detected loop.
+    # Small windows catch tight repeats; large windows catch paragraph loops.
+    _WINDOWS = [50, 100, 150, 200, 300, 400]
+
+    for window in _WINDOWS:
+        if len(content) < window * threshold:
+            continue            # text too short for this window size
+        step = max(1, window // 2)
+        i = 0
+        while i < len(content) - window:
+            chunk = content[i : i + window]
+            count = content[i:].count(chunk)
+            if count >= threshold:
+                second = content.find(chunk, i + 1)
+                if second > i:
+                    print(
+                        f"  [llm_client] ⚠️  Repetition loop detected "
+                        f"(window={window}, count={count}) — truncating at char {second}."
+                    )
+                    return content[:second].rstrip()
+            i += step
+
+    return content
 
 
 def _call_local_ollama_native(
