@@ -62,7 +62,10 @@ from context import DomainModel, PipelineContext
 MAX_TOKENS_META     = 4_000   # Call A: domain_name, description, key_entities, bounded_contexts
 MAX_TOKENS_FEATURES = 8_000   # Call B: features list (largest field)
 MAX_TOKENS_ROLES_WF = 8_000   # Call C: user_roles + workflows
-MAX_TOKENS_GAP_FILL = 6_000   # Call D: gap-fill features for uncovered pages
+MAX_TOKENS_GAP_FILL = int(os.environ.get("STAGE4_MAX_TOKENS_GAP_FILL", "4000") or "4000")
+# ↑ Kept deliberately lower than B/C calls: shorter responses loop less often on
+#   quantised models (qwen3-coder int8), and multiple smaller gap-fill rounds
+#   (MAX_GAP_ROUNDS=20) cover more ground than one large looping call.
 DOMAIN_FILE      = "domain_model.json"
 COVERAGE_FILE    = "coverage_report.json"
 
@@ -1985,7 +1988,7 @@ def _call_part(system_prompt: str, user_prompt: str,
     # Use prefill only for local models — Claude handles structured output
     # differently and prefill interferes with its extended-thinking mode.
     use_prefill = "{" if get_provider() == "local" else ""
-    return call_llm(
+    raw = call_llm(
         system_prompt  = system_prompt,
         user_prompt    = user_prompt,
         max_tokens     = max_tokens,
@@ -1995,6 +1998,14 @@ def _call_part(system_prompt: str, user_prompt: str,
         prefill        = use_prefill,
         model_override = model_override,
     )
+    # vLLM's OpenAI-compat endpoint returns only the model's *continuation*,
+    # not the prefill text itself.  Re-attach "{" so _parse_partial always
+    # receives a complete JSON document ({"features": [...]} not "features": [...]).
+    # Ollama native echoes the prefill, so we guard with startswith to avoid
+    # double-prepending.
+    if use_prefill and raw and not raw.lstrip().startswith(use_prefill):
+        raw = use_prefill + raw
+    return raw
 
 
 # ─── Hallucination Filter ──────────────────────────────────────────────────────
@@ -2472,7 +2483,9 @@ def _gap_fill_pass(
     # Track which non-module files have already been sent to avoid re-sending.
     attempted_flat: set[str] = set()
     # Allow up to this many consecutive empty/failed LLM rounds before giving up.
-    MAX_CONSECUTIVE_EMPTY = 3
+    # Set higher than 3 so repetition-loop failures on quantised models
+    # (which produce empty dicts) don't abort gap-fill prematurely.
+    MAX_CONSECUTIVE_EMPTY = int(os.environ.get("STAGE4_MAX_CONSECUTIVE_EMPTY", "5") or "5")
     consecutive_empty = 0
 
     for gap_round in range(1, MAX_GAP_ROUNDS + 1):
