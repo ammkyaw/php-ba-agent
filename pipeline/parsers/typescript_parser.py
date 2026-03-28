@@ -598,7 +598,10 @@ def _extract_nextjs_routes(src_file: Path, root: Path, rel: str, routes: list) -
             path = _normalise_path(api_parts)
             path = re.sub(r"\.(ts|tsx|js|jsx)$", "", path)
             # handler = file stem (conventionally the default-export handler fn)
+            # Sanitise dynamic segments so e.g. [id].ts → id, [...slug].ts → catchall_slug
             handler = re.sub(r"\.(ts|tsx|js|jsx)$", "", src_file.name)
+            handler = re.sub(r"\[\.\.\.(\w+)\]", r"catchall_\1", handler)
+            handler = re.sub(r"\[(\w+)\]", r"\1", handler)
             routes.append({"method": "ANY", "path": path, "handler": handler,
                            "file": rel, "kind": "nextjs_pages_api"})
         elif src_file.name in ("page.tsx", "page.ts", "page.jsx", "page.js",
@@ -608,7 +611,7 @@ def _extract_nextjs_routes(src_file: Path, root: Path, rel: str, routes: list) -
             path = _normalise_path(page_parts)
             path = re.sub(r"\.(ts|tsx|js|jsx)$", "", path)
             path = re.sub(r"/index$", "", path)
-            path_stem = (path.rstrip("/").split("/")[-1] or "root")
+            path_stem = (path.rstrip("/").split("/")[-1] or "root").lstrip(":")
             routes.append({"method": "GET", "path": path or "/", "handler": f"{path_stem}_page",
                            "file": rel, "kind": "nextjs_page"})
 
@@ -641,7 +644,7 @@ def _extract_nextjs_routes(src_file: Path, root: Path, rel: str, routes: list) -
             path_parts = parts[idx+1:-1]
             path = _normalise_path(path_parts)
             dir_rel = str(Path(rel).parent).replace("\\", "/")
-            path_stem = (path.rstrip("/").split("/")[-1] or "root")
+            path_stem = (path.rstrip("/").split("/")[-1] or "root").lstrip(":")
             routes.append({"method": "GET", "path": path or "/", "handler": f"{path_stem}_page",
                            "file": rel, "dir": dir_rel, "kind": "nextjs_page"})
 
