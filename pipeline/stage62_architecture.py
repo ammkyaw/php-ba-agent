@@ -108,10 +108,16 @@ def run(ctx: PipelineContext) -> None:
     # ── Build LLM context block ─────────────────────────────────────────────
     context_block = _build_context_block(ctx)
 
+    # ── Build tech stack ground truth (injected at END of prompt) ──────────
+    tech_ground_truth = _build_tech_ground_truth(ctx)
+
     # ── Call LLM ────────────────────────────────────────────────────────────
     raw_response = _call_llm(
         system_prompt=_SYSTEM_PROMPT,
-        user_prompt=_USER_PROMPT_TEMPLATE.format(context_block=context_block),
+        user_prompt=_USER_PROMPT_TEMPLATE.format(
+            context_block=context_block,
+            tech_ground_truth=tech_ground_truth,
+        ),
     )
 
     # ── Parse & validate response ───────────────────────────────────────────
@@ -173,35 +179,119 @@ def _build_context_block(ctx: PipelineContext) -> str:
     return full
 
 
+def _build_tech_ground_truth(ctx: PipelineContext) -> str:
+    """
+    Build a concise tech stack ground truth block from the CodeMap.
+
+    Placed at the END of the user prompt so it always survives context
+    window truncation — the LLM reads the constraint last and cannot
+    ignore it.
+    """
+    cm = ctx.code_map
+    if cm is None:
+        return "No code map available — infer tech stack from the domain model."
+
+    parts: list[str] = []
+    parts.append(f"Detected Language  : {cm.language.value}")
+    parts.append(f"Detected Framework : {cm.framework.value}")
+
+    lang_ver = cm.effective_language_version
+    if lang_ver and lang_ver != "unknown":
+        parts.append(f"Language Version   : {lang_ver}")
+
+    # Database type inference
+    # Bug fix: also match 'firebase', 'supabase', 'redis', 'cassandra', 'couchdb'
+    # so projects using Firebase without explicit 'firestore' calls are detected.
+    _NOSQL_SIGNALS = frozenset({
+        "firestore", "firebase", "mongodb", "dynamodb",
+        "supabase", "redis", "cassandra", "couchdb",
+    })
+    has_sql   = bool(cm.sql_queries or cm.db_schema)
+    has_nosql = any(
+        any(sig in str(s).lower() for sig in _NOSQL_SIGNALS)
+        for s in (cm.services + cm.imports + cm.env_vars)
+    )
+
+    if has_nosql and not has_sql:
+        parts.append("Database Type      : NoSQL (NO SQL, NO relational tables)")
+    elif has_sql and not has_nosql:
+        parts.append(f"Database Type      : SQL/Relational ({len(cm.db_schema)} tables, {len(cm.sql_queries)} queries)")
+    elif has_sql and has_nosql:
+        parts.append("Database Type      : Hybrid (both SQL and NoSQL detected)")
+    else:
+        parts.append("Database Type      : None detected in static analysis")
+
+    # Explicitly note what is NOT present — language-conditional to avoid
+    # printing PHP-specific labels for TypeScript/Java projects.
+    absent: list[str] = []
+    if not cm.sql_queries:
+        absent.append("zero SQL queries")
+    if not cm.db_schema:
+        absent.append("zero relational DB tables")
+    # Only mention PHP-specific artefacts when the project is actually PHP
+    if cm.language.value == "php" and not cm.html_pages:
+        absent.append("zero PHP/HTML pages")
+    if cm.language.value != "php":
+        absent.append("no PHP backend")
+
+    if absent:
+        parts.append(f"NOT present        : {', '.join(absent)}")
+
+    return "\n".join(parts)
+
+
 def _format_code_map(cm: CodeMap) -> str:
+    """Format code map with language-aware labels, skipping empty fields."""
     lines = [
         "## Code Map (Stage 1 Parser Output)",
+        f"- Language      : {cm.language.value}",
         f"- Framework     : {cm.framework.value}",
-        f"- PHP Version   : {cm.php_version or 'unknown'}",
+    ]
+    # Only show language version if known
+    lang_ver = cm.effective_language_version
+    if lang_ver and lang_ver != "unknown":
+        lines.append(f"- Version       : {lang_ver}")
+
+    lines.extend([
         f"- Total Files   : {cm.total_files}",
         f"- Total Lines   : {cm.total_lines}",
-        f"- Controllers   : {len(cm.controllers)}",
-        f"- Models        : {len(cm.models)}",
-        f"- Services      : {len(cm.services)}",
-        f"- Routes        : {len(cm.routes)}",
-        f"- DB Tables     : {len(cm.db_schema)}",
-        f"- HTML Pages    : {len(cm.html_pages)}",
-        f"- SQL Queries   : {len(cm.sql_queries)}",
-        f"- Auth Signals  : {len(cm.auth_signals)}",
+    ])
+
+    # Show counts only when non-zero — prevents misleading the LLM
+    _counts = [
+        ("Handlers/Controllers", len(cm.controllers)),
+        ("Models/Entities",      len(cm.models)),
+        ("Services",             len(cm.services)),
+        ("Routes",               len(cm.routes)),
+        ("Components (UI)",      len(cm.components)),
+        ("Type Definitions",     len(getattr(cm, 'type_definitions', []))),
+        ("Functions",            len(cm.functions)),
+        ("Auth Signals",         len(cm.auth_signals)),
     ]
+    for label, count in _counts:
+        if count > 0:
+            lines.append(f"- {label:20s}: {count}")
+
+    # DB-related fields — only show if actually present
+    if cm.db_schema:
+        lines.append(f"- {'DB Schema':20s}: {len(cm.db_schema)} table(s)")
+        lines.append(
+            "  Tables: "
+            + ", ".join(t.get("table", "?") for t in cm.db_schema[:15])
+        )
+    if cm.sql_queries:
+        lines.append(f"- {'SQL Queries':20s}: {len(cm.sql_queries)}")
+    if cm.html_pages:
+        lines.append(f"- {'HTML Pages':20s}: {len(cm.html_pages)}")
+
     if cm.http_endpoints:
         sample = ", ".join(
             f"{e.get('method','?')} {e.get('path','?')}"
             for e in cm.http_endpoints[:10]
         )
         lines.append(
-            f"- HTTP Endpoints: {sample}"
+            f"- {'HTTP Endpoints':20s}: {sample}"
             + (" …" if len(cm.http_endpoints) > 10 else "")
-        )
-    if cm.db_schema:
-        lines.append(
-            "- DB Schema     : "
-            + ", ".join(t.get("table", "?") for t in cm.db_schema[:15])
         )
     return "\n".join(lines)
 
@@ -643,7 +733,7 @@ def _build_markdown(data: dict[str, Any]) -> str:
 
 _SYSTEM_PROMPT = textwrap.dedent("""\
     You are a senior software architect specialising in reverse-engineering
-    legacy PHP systems into clear, structured architecture documentation.
+    codebases into clear, structured architecture documentation.
 
     Your task is to analyse the provided pipeline artefacts (code map, knowledge
     graph summary, domain model, and business flows) and reconstruct a complete
@@ -652,20 +742,25 @@ _SYSTEM_PROMPT = textwrap.dedent("""\
     Rules:
     - Base ALL conclusions strictly on the provided data. Do not invent components
       or flows that are not evidenced by the inputs.
+    - The "Code Map" section lists the DETECTED language, framework, and tech stack.
+      You MUST use ONLY the technologies listed there. Do NOT add technologies
+      (PHP, SQL, MySQL, PostgreSQL, Laravel, etc.) that are not explicitly present
+      in the Code Map.
+    - If the Code Map shows zero SQL queries, zero DB tables, and a NoSQL database
+      (e.g. Firestore, MongoDB), do NOT include any SQL or relational database
+      components in your output.
     - Use precise, technical language appropriate for a software architect audience.
     - Component types must be one of: "Frontend", "Backend", "Database", "Service",
       "Middleware", "External", "Configuration".
     - Return ONLY a valid JSON object — no preamble, no explanation, no markdown fences.
 
-    PHP legacy risk patterns to watch for and include in risks/recommendations:
-    - Mixed concerns: business logic embedded in view files (PHP + HTML in same file)
-    - Global state: use of $_SESSION, $_GLOBALS, global variables across request lifecycle
-    - Direct SQL: raw mysql_query / mysqli calls instead of ORM or prepared statements
-    - No input sanitisation: missing htmlspecialchars, strip_tags, or parameterised queries
-    - God files: single PHP files handling routing, auth, business logic, and DB access
-    - Missing CSRF protection: POST forms without token validation
-    - Hardcoded credentials or config values in PHP files
-    - Lack of autoloading: manual require/include chains instead of Composer PSR-4
+    Risk patterns to watch for (apply only when evidenced by the Code Map data):
+    - Mixed concerns: business logic embedded in view/template files
+    - Direct database queries without ORM, prepared statements, or SDK abstraction
+    - Missing input sanitisation or validation
+    - Large files handling routing, auth, business logic, and data access together
+    - Missing CSRF or authentication protection on write endpoints
+    - Hardcoded credentials or config values in source files
 """)
 
 _USER_PROMPT_TEMPLATE = textwrap.dedent("""\
@@ -688,7 +783,7 @@ _USER_PROMPT_TEMPLATE = textwrap.dedent("""\
         {{
           "name": "<flow name>",
           "description": "<optional brief description>",
-          "steps": ["<step 1 e.g. 'User submits form → login.php'>", "..."]
+          "steps": ["<step 1 e.g. 'User submits form → handler'>", "..."]
         }}
       ],
 
@@ -720,4 +815,12 @@ _USER_PROMPT_TEMPLATE = textwrap.dedent("""\
     --- PIPELINE ARTEFACTS ---
 
     {context_block}
+
+    --- CRITICAL: TECHNOLOGY GROUND TRUTH ---
+
+    {tech_ground_truth}
+
+    You MUST NOT add any technology, framework, database, or backend language that
+    is not listed above. If zero SQL queries and zero DB tables are reported, there
+    is NO relational database — do not invent one.
 """)
