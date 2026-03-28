@@ -81,10 +81,10 @@ DOMAIN_FILE      = "domain_model.json"
 COVERAGE_FILE    = "coverage_report.json"
 
 # Gap-fill: max modules per module-grouped call (covers ~10× more files than pages)
-GAP_FILL_MAX_MODULES  = 20
-GAP_FILL_TEMPERATURE  = 0.4   # higher temp improves recall of missed items
+GAP_FILL_MAX_MODULES = 20
+GAP_FILL_TEMPERATURE = 0.4   # higher temp improves recall of missed items
 # Gap-fill: max individual files per call (fallback when no module structure)
-GAP_FILL_MAX_PAGES = 100
+GAP_FILL_MAX_PAGES   = 100
 # Gap-fill: maximum number of loop rounds.
 # Override with STAGE4_MAX_GAP_ROUNDS=N (e.g. 5 for speed, 20 for thoroughness).
 # Set STAGE4_SKIP_GAP_FILL=1 to bypass all D-calls (fastest, lower page coverage).

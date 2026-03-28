@@ -54,7 +54,7 @@ from context import PipelineContext, QAResult
 
 QA_REPORT_FILE = "qa_report.md"
 QA_JSON_FILE   = "qa_result.json"
-MAX_TOKENS          = 8192
+MAX_TOKENS           = 8192
 QA_PROSE_TEMPERATURE = 0.3   # review prose: reasoned but not creative
 
 # Characters of each artefact sent to Pass B.
