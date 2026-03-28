@@ -727,10 +727,10 @@ def _is_error_diagnostic(text: str) -> bool:
     if not t.startswith("{"):
         return False
     try:
-        parsed = _json.loads(t)
+        parsed = _json_tel.loads(t)
         # Error diagnostic: a small dict with an "error" key and nothing else meaningful
         return isinstance(parsed, dict) and "error" in parsed and len(parsed) <= 3
-    except _json.JSONDecodeError:
+    except _json_tel.JSONDecodeError:
         return False
 
 
