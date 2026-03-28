@@ -1240,7 +1240,7 @@ def _build_user_prompt(
     _include_auth_signals  = _is_full or profile in {"C_ROLES", "C_WORKFLOWS", "GAP"}
     _include_http_eps      = _is_full or profile in {"B_UI", "GAP", "C_ROLES", "C_WORKFLOWS"}
     _include_table_cols    = _is_full or profile in {"A", "B_CORE", "GAP"}
-    _include_exec_paths    = _is_full or profile in {"B_UI", "GAP", "C_WORKFLOWS"}
+    _include_exec_paths    = _is_full or profile in {"B_CORE", "B_UI", "GAP", "C_WORKFLOWS"}
     _include_modules       = _is_full or profile in {"A"}
     _include_entities      = _is_full or profile in {"A", "B_CORE", "GAP"}
     _include_relationships = _is_full or profile in {"A", "B_CORE", "GAP"}
@@ -2547,11 +2547,15 @@ def _gap_fill_pass(
     cm = ctx.code_map
     _lang = getattr(cm.language, "value", str(cm.language)).lower()
 
-    # Track which modules have already been sent to the LLM so we don't
-    # spin indefinitely on modules the model refuses to list page refs for.
-    attempted_modules: set[str] = set()
-    # Track which non-module files have already been sent to avoid re-sending.
-    attempted_flat: set[str] = set()
+    # Track how many times each module has been sent to the LLM.
+    # Using a count (not a bool) allows ONE retry for modules the model
+    # skipped on the first attempt without producing coverage — the most
+    # common cause of the 15-25% coverage gap on large codebases.
+    # Modules are permanently abandoned after MAX_MODULE_ATTEMPTS attempts.
+    MAX_MODULE_ATTEMPTS = int(os.environ.get("STAGE4_MAX_MODULE_ATTEMPTS", "2") or "2")
+    attempted_modules: dict[str, int] = {}   # module_name → attempt count
+    # Same retry logic for non-module (flat) files.
+    attempted_flat: dict[str, int] = {}      # basename_lower → attempt count
     # Allow up to this many consecutive empty/failed LLM rounds before giving up.
     # Set higher than 3 so repetition-loop failures on quantised models
     # (which produce empty dicts) don't abort gap-fill prematurely.
@@ -2593,10 +2597,12 @@ def _gap_fill_pass(
             uncovered, cm.execution_paths or []
         )
 
-        # Modules not yet attempted this pipeline run
+        # Modules that still have room for another attempt.
+        # First pass: prioritise never-tried modules; second pass: retry
+        # once-tried modules that are still uncovered (model skipped them).
         fresh_module_groups = {
             m: files for m, files in module_groups.items()
-            if m not in attempted_modules
+            if attempted_modules.get(m, 0) < MAX_MODULE_ATTEMPTS
         }
 
         call_label = f"stage4-D{gap_round}"
@@ -2604,8 +2610,14 @@ def _gap_fill_pass(
 
         if fresh_module_groups:
             # ── Module-grouped mode (covers ~10× more files per call) ──────
-            batch_modules = dict(list(fresh_module_groups.items())[:GAP_FILL_MAX_MODULES])
-            attempted_modules.update(batch_modules.keys())
+            # Prefer never-attempted modules first; only fall back to retries
+            # when all fresh modules have had their first attempt.
+            _never_tried = {m: f for m, f in fresh_module_groups.items()
+                            if attempted_modules.get(m, 0) == 0}
+            _batch_src = _never_tried if _never_tried else fresh_module_groups
+            batch_modules = dict(list(_batch_src.items())[:GAP_FILL_MAX_MODULES])
+            for m in batch_modules:
+                attempted_modules[m] = attempted_modules.get(m, 0) + 1
             n_files = sum(len(v) for v in batch_modules.values())
             print(
                 f"  [stage4] Call D{gap_round} — gap-fill "
@@ -2620,12 +2632,14 @@ def _gap_fill_pass(
             )
         elif flat_files:
             # ── Flat fallback: non-module files (include/, lib/, etc.) ──────
-            fresh_flat = [f for f in flat_files if f.lower() not in attempted_flat]
+            fresh_flat = [f for f in flat_files
+                          if attempted_flat.get(f.lower(), 0) < MAX_MODULE_ATTEMPTS]
             gap_pages = fresh_flat[:GAP_FILL_MAX_PAGES]
             if not gap_pages:
                 print(f"  [stage4] All flat files sent in previous rounds — done.")
                 break
-            attempted_flat.update(f.lower() for f in gap_pages)
+            for f in gap_pages:
+                attempted_flat[f.lower()] = attempted_flat.get(f.lower(), 0) + 1
             print(
                 f"  [stage4] Call D{gap_round} — gap-fill "
                 f"{len(gap_pages)}/{len(flat_files)} non-module file(s): "
