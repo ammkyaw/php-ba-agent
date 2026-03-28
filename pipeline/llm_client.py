@@ -635,14 +635,24 @@ def call_llm(
                         max_tokens, temperature, model, provider, label,
                     )
                     ok2, _ = _validate_json(corrected)
-                    if ok2 and _is_error_diagnostic(corrected):
+                    _corr_is_diag = ok2 and _is_error_diagnostic(corrected)
+                    if _corr_is_diag:
                         # Model returned an error-report dict (e.g. {"error":"..."})
                         # instead of the corrected content — treat as correction failure.
                         ok2 = False
                     if ok2:
                         result = corrected
                     else:
-                        print(f"  {tag}JSON correction also invalid — using original")
+                        # Correction failed or returned an error diagnostic.
+                        # Raise so the outer retry loop re-issues the original
+                        # prompt — the model may produce valid JSON on a fresh
+                        # attempt (this is the intentional equivalent of the
+                        # accidental retry that occurred via the old NameError path).
+                        raise ValueError(
+                            f"JSON correction failed "
+                            f"({'error diagnostic' if _corr_is_diag else 'also invalid JSON'}) "
+                            f"— retrying original call"
+                        )
             _cache.put(cache_key, result, label=label)
             return result
 
