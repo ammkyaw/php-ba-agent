@@ -88,6 +88,72 @@ _MAX_SQL_PER_PATH   = 6    # cap SQL nodes per behavior path
 _MAX_SERVICE_DEPTH  = 3    # BFS depth over service_deps
 _MAX_PATHS          = 500  # safety cap on total paths extracted
 
+# HTTP verbs used as handler names by file-system routers (Next.js App Router)
+_FS_HANDLER_VERBS: frozenset[str] = frozenset(
+    {"GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "ANY", "HANDLER"}
+)
+
+
+# ─── SQL helpers (shared between route-loop and exec-path augmentation) ────────
+
+def _collect_sql_ops(files: list[str], file_to_sql: dict) -> list[dict]:
+    """Return deduplicated SQL ops for all *files*, capped at _MAX_SQL_PER_PATH."""
+    sql_seen: set[tuple[str, str]] = set()
+    sql_ops:  list[dict]           = []
+    for fpath in files:
+        for q in file_to_sql.get(fpath, []):
+            op    = (q.get("operation") or "").upper()
+            table = (q.get("table") or "").strip()
+            if not op or table.lower() in _SKIP_TABLES:
+                continue
+            key = (op, table.lower())
+            if key not in sql_seen:
+                sql_seen.add(key)
+                sql_ops.append({"op": op, "table": table, "file": fpath})
+            if len(sql_ops) >= _MAX_SQL_PER_PATH:
+                return sql_ops
+    return sql_ops
+
+
+def _create_sql_nodes(
+    sql_ops:      list[dict],
+    nodes:        dict,
+    edges:        dict,
+    querier_nid:  str,
+    svc_node_map: dict[str, str] | None = None,
+    class_to_file: dict[str, str] | None = None,
+) -> list[str]:
+    """
+    Upsert one SQL node per *sql_ops* entry, wire a *queries* edge from the
+    appropriate querier, and return the list of SQL node ids.
+
+    When *svc_node_map* and *class_to_file* are supplied the querier is resolved
+    per-item: if the SQL file matches a service, that service node is used;
+    otherwise *querier_nid* (the controller/handler node) is the fallback.
+    """
+    sql_node_ids: list[str] = []
+    for sql_item in sql_ops:
+        sql_label = f"{sql_item['op']} {sql_item['table']}"
+        sql_nid   = _node_id("sql", sql_label)
+        _upsert_node(nodes, sql_nid, "sql", sql_label, sql_item["file"], {
+            "operation": sql_item["op"],
+            "table":     sql_item["table"],
+        })
+        sql_node_ids.append(sql_nid)
+
+        # Resolve the querier: service that owns the file, or fall back to ctrl
+        resolved_querier = querier_nid
+        if svc_node_map and class_to_file:
+            sql_fname = Path(sql_item["file"]).name.lower()
+            for dep_short, svc_nid in svc_node_map.items():
+                dep_file = class_to_file.get(dep_short, "")
+                if dep_file and Path(dep_file).name.lower() == sql_fname:
+                    resolved_querier = svc_nid
+                    break
+
+        _upsert_edge(edges, resolved_querier, sql_nid, "queries")
+    return sql_node_ids
+
 
 # ─── Public API ────────────────────────────────────────────────────────────────
 
@@ -117,9 +183,6 @@ def extract(ctx: Any) -> dict:
     nodes:     dict[str, dict] = {}   # id → node dict  (deduplication)
     edges:     dict[tuple, dict] = {} # (src, tgt, type) → edge dict
     paths:     list[dict]      = []
-
-    # HTTP verbs used as handler names by file-system routers (Next.js App Router)
-    _FS_HANDLER_VERBS = frozenset({"GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "ANY", "HANDLER"})
 
     for route in (cm.routes or []):
         method  = (route.get("method") or "").upper()
@@ -189,22 +252,7 @@ def extract(ctx: Any) -> dict:
                     reachable_files.append(dep_file)
 
         # ── Collect SQL ────────────────────────────────────────────────────────
-        sql_seen: set[tuple[str, str]] = set()
-        sql_ops:  list[dict]           = []
-        for fpath in reachable_files:
-            for q in file_to_sql.get(fpath, []):
-                op    = (q.get("operation") or "").upper()
-                table = (q.get("table") or "").strip()
-                if not op or table.lower() in _SKIP_TABLES:
-                    continue
-                key = (op, table.lower())
-                if key not in sql_seen:
-                    sql_seen.add(key)
-                    sql_ops.append({"op": op, "table": table, "file": fpath})
-                if len(sql_ops) >= _MAX_SQL_PER_PATH:
-                    break
-            if len(sql_ops) >= _MAX_SQL_PER_PATH:
-                break
+        sql_ops = _collect_sql_ops(reachable_files, file_to_sql)
 
         # ── Collect first redirect ─────────────────────────────────────────────
         redirect_target = ""
@@ -279,26 +327,10 @@ def extract(ctx: Any) -> dict:
             _upsert_edge(edges, parent_nid, svc_nid, "delegates_to")
 
         # SQL nodes + queries edges
-        sql_node_ids: list[str] = []
-        for sql_item in sql_ops:
-            sql_label = f"{sql_item['op']} {sql_item['table']}"
-            sql_nid   = _node_id("sql", sql_label)
-            _upsert_node(nodes, sql_nid, "sql", sql_label, sql_item["file"], {
-                "operation": sql_item["op"],
-                "table":     sql_item["table"],
-            })
-            sql_node_ids.append(sql_nid)
-
-            # queries edge: the file that owns the SQL points to its class
-            # If the SQL file matches a service, link from that service; else ctrl
-            sql_fname = Path(sql_item["file"]).name.lower()
-            querier_nid = ctrl_node_id  # default
-            for dep_short, svc_nid in svc_node_map.items():
-                dep_file = class_to_file.get(dep_short, "")
-                if dep_file and Path(dep_file).name.lower() == sql_fname:
-                    querier_nid = svc_nid
-                    break
-            _upsert_edge(edges, querier_nid, sql_nid, "queries")
+        sql_node_ids = _create_sql_nodes(
+            sql_ops, nodes, edges, ctrl_node_id,
+            svc_node_map=svc_node_map, class_to_file=class_to_file,
+        )
 
         # Redirect node + redirects_to edge
         redir_node_id = ""
@@ -385,32 +417,10 @@ def extract(ctx: Any) -> dict:
             has_auth_ep = bool(ep.get("auth_guard", {}).get("present"))
 
             # SQL — link any queries whose source file matches this exec_path's file
-            ep_sql: list[dict] = []
-            if ep_file:
-                sql_seen_ep: set[tuple[str, str]] = set()
-                for q in file_to_sql.get(ep_file, []):
-                    op    = (q.get("operation") or "").upper()
-                    table = (q.get("table") or "").strip()
-                    if not op or table.lower() in _SKIP_TABLES:
-                        continue
-                    key = (op, table.lower())
-                    if key not in sql_seen_ep:
-                        sql_seen_ep.add(key)
-                        ep_sql.append({"op": op, "table": table, "file": ep_file})
-                    if len(ep_sql) >= _MAX_SQL_PER_PATH:
-                        break
+            ep_sql = _collect_sql_ops([ep_file] if ep_file else [], file_to_sql)
 
             # SQL nodes + queries edges for exec_path
-            ep_sql_node_ids: list[str] = []
-            for sql_item in ep_sql:
-                sql_label = f"{sql_item['op']} {sql_item['table']}"
-                sql_nid   = _node_id("sql", sql_label)
-                _upsert_node(nodes, sql_nid, "sql", sql_label, sql_item["file"], {
-                    "operation": sql_item["op"],
-                    "table":     sql_item["table"],
-                })
-                ep_sql_node_ids.append(sql_nid)
-                _upsert_edge(edges, handler_nid, sql_nid, "queries")
+            ep_sql_node_ids = _create_sql_nodes(ep_sql, nodes, edges, handler_nid)
 
             # Dynamic confidence — same scoring function as the route loop
             ep_confidence = _path_confidence(
