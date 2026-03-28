@@ -352,11 +352,23 @@ RETRY_MAX_DELAY    = 60.0       # cap so we never wait more than 1 minute
 
 # ── vLLM-specific generation controls ─────────────────────────────────────────
 # VLLM_REPETITION_PENALTY — penalises the model for repeating tokens it has
-#   already generated.  1.0 = disabled; 1.05 is a light nudge that prevents
-#   degenerate "Wait, I need to check..." infinite loops without noticeably
-#   hurting output quality.  Override with VLLM_REPETITION_PENALTY=<float>.
+#   already generated.  1.0 = disabled.  Raised to 1.10 (from 1.05) because
+#   quantised coder-variant models (qwen3-coder-30b-int8) loop aggressively
+#   on structured JSON output even with a light nudge.  1.10 is still safe
+#   for general text; go to 1.15 only if loops persist.
+#   Override with VLLM_REPETITION_PENALTY=<float>.
 _VLLM_REPETITION_PENALTY = float(
-    os.environ.get("VLLM_REPETITION_PENALTY", "1.05") or "1.05"
+    os.environ.get("VLLM_REPETITION_PENALTY", "1.10") or "1.10"
+)
+
+# VLLM_FREQUENCY_PENALTY — complementary to repetition_penalty.
+#   Reduces log-probability of tokens proportional to how many times they
+#   have already appeared (OpenAI definition).  0.0 = disabled; 0.1 is a
+#   light nudge that further discourages verbatim repetition of key blocks
+#   without affecting the first occurrence.
+#   Override with VLLM_FREQUENCY_PENALTY=<float>.
+_VLLM_FREQUENCY_PENALTY = float(
+    os.environ.get("VLLM_FREQUENCY_PENALTY", "0.1") or "0.1"
 )
 
 # VLLM_ENABLE_THINKING — Qwen3/DeepSeek-R1 on vLLM expose a per-request
@@ -841,10 +853,14 @@ def _call_local(
 
     # ── vLLM-specific payload fields ─────────────────────────────────────────
     if _backend == "vllm":
-        # Repetition penalty — prevents degenerate "Wait, I need to check…"
-        # infinite loops.  1.0 = disabled; we default to 1.05 (light nudge).
+        # Repetition penalty — prevents degenerate infinite loops.
+        # 1.0 = disabled; default 1.10 (stronger nudge for quantised coder models).
         if _VLLM_REPETITION_PENALTY != 1.0:
             payload["repetition_penalty"] = _VLLM_REPETITION_PENALTY
+        # Frequency penalty — complementary: reduces tokens proportional to
+        # how often they have already appeared.  0.0 = disabled; default 0.1.
+        if _VLLM_FREQUENCY_PENALTY != 0.0:
+            payload["frequency_penalty"] = _VLLM_FREQUENCY_PENALTY
 
         # Qwen3 / DeepSeek-R1 thinking mode — disabled by default so the model
         # skips its CoT scratchpad entirely (nothing to leak into the document).
