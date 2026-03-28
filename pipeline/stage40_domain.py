@@ -81,8 +81,8 @@ DOMAIN_FILE      = "domain_model.json"
 COVERAGE_FILE    = "coverage_report.json"
 
 # Gap-fill: max modules per module-grouped call (covers ~10× more files than pages)
-GAP_FILL_MAX_MODULES  = 30
-GAP_FILL_TEMPERATURE  = 0.3   # higher temp improves recall of missed items
+GAP_FILL_MAX_MODULES  = 20
+GAP_FILL_TEMPERATURE  = 0.4   # higher temp improves recall of missed items
 # Gap-fill: max individual files per call (fallback when no module structure)
 GAP_FILL_MAX_PAGES = 100
 # Gap-fill: maximum number of loop rounds.
@@ -2167,6 +2167,19 @@ def _extract_module_name_ts(filepath: str) -> str | None:
     return None
 
 
+def _coerce_feature_item_to_str(v: object) -> str:
+    """Coerce a feature list item to a plain string.
+
+    The LLM sometimes returns dicts like {"name": "email", "type": "string"}
+    instead of bare strings.  Extract the most useful key so the item is
+    still usable for dedup / coverage matching.
+    """
+    if isinstance(v, dict):
+        return str(v.get("name") or v.get("key") or v.get("field")
+                   or next(iter(v.values()), ""))
+    return str(v)
+
+
 def _static_enrich_tables_and_fields(
     domain_model: "DomainModel",
     cm: Any,
@@ -2249,20 +2262,9 @@ def _static_enrich_tables_and_fields(
     tables_added = 0
     fields_added = 0
 
-    def _str_val(v: object) -> str:
-        """Coerce a feature list item to a plain string.
-
-        The LLM sometimes returns dicts like {"name": "email", "type": "string"}
-        instead of bare strings.  Extract the most useful key so the item is
-        still usable for dedup / coverage matching.
-        """
-        if isinstance(v, dict):
-            return str(v.get("name") or v.get("key") or v.get("field") or next(iter(v.values()), ""))
-        return str(v)
-
     for feat in domain_model.features:
-        existing_tables = {_str_val(t).lower() for t in feat.get("tables", [])}
-        existing_fields = {_str_val(inp).lower() for inp in feat.get("inputs", [])}
+        existing_tables = {_coerce_feature_item_to_str(t).lower() for t in feat.get("tables", [])}
+        existing_fields = {_coerce_feature_item_to_str(inp).lower() for inp in feat.get("inputs", [])}
 
         # Collect explicit page basenames, then expand to module siblings
         explicit_basenames: set[str] = {
@@ -2369,20 +2371,14 @@ def _compute_coverage(
     covered_pages  : set[str] = set()
     covered_tables : set[str] = set()
     covered_inputs : set[str] = set()
-    def _sv(v: object) -> str:
-        """Coerce a feature list item (str or dict) to a plain string."""
-        if isinstance(v, dict):
-            return str(v.get("name") or v.get("key") or v.get("field")
-                       or next(iter(v.values()), ""))
-        return str(v)
 
     for feat in domain_model.features:
         for p in feat.get("pages", []):
-            covered_pages.add(Path(_sv(p)).name.lower())
+            covered_pages.add(Path(_coerce_feature_item_to_str(p)).name.lower())
         for t in feat.get("tables", []):
-            covered_tables.add(_sv(t).lower())
+            covered_tables.add(_coerce_feature_item_to_str(t).lower())
         for inp in feat.get("inputs", []):
-            covered_inputs.add(_sv(inp).lower())
+            covered_inputs.add(_coerce_feature_item_to_str(inp).lower())
 
     # ── Module-expanded coverage set ──────────────────────────────────────────
     # If any file in a module dir is explicitly covered, all sibling files in
