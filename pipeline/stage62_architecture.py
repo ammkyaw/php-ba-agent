@@ -463,16 +463,22 @@ def _validate_schema(data: dict[str, Any]) -> None:
     """
     Validate the parsed architecture dict has the expected top-level keys
     and types.  Raises ValueError with a clear message on the first violation.
+
+    Hard-required keys (overview, components, data_flows) must be present —
+    without them the document is not useful.
+
+    Soft-required keys (sequence_flows, integration_points,
+    technology_observations) are auto-filled with empty defaults when absent.
+    This handles truncated responses where the model ran out of tokens before
+    reaching the later sections of the JSON.
     """
-    required: dict[str, type] = {
-        "overview":                dict | str,
-        "components":              list,
-        "data_flows":              list,
-        "sequence_flows":          list,
-        "integration_points":      list,
-        "technology_observations": dict,
+    # Hard-required: missing = pipeline error
+    hard_required: dict[str, type] = {
+        "overview":   dict | str,
+        "components": list,
+        "data_flows": list,
     }
-    for key, expected in required.items():
+    for key, expected in hard_required.items():
         if key not in data:
             raise ValueError(f"[{STAGE_NAME}] LLM JSON missing required key: '{key}'")
         if not isinstance(data[key], expected):
@@ -480,6 +486,20 @@ def _validate_schema(data: dict[str, Any]) -> None:
                 f"[{STAGE_NAME}] Key '{key}' expected {expected}, "
                 f"got {type(data[key]).__name__}"
             )
+
+    # Soft-required: missing = warn + fill with safe default
+    soft_defaults: dict[str, Any] = {
+        "sequence_flows":          [],
+        "integration_points":      [],
+        "technology_observations": {},
+    }
+    for key, default in soft_defaults.items():
+        if key not in data:
+            print(f"  [{STAGE_NAME}] ⚠️  Missing '{key}' in LLM response — using empty default.")
+            data[key] = default
+        elif not isinstance(data[key], type(default)):
+            print(f"  [{STAGE_NAME}] ⚠️  '{key}' wrong type — resetting to empty default.")
+            data[key] = default
 
     # Component shape
     for i, comp in enumerate(data["components"]):
