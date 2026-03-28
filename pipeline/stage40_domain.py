@@ -2714,12 +2714,12 @@ def _attempt_json_recovery(text: str) -> dict | None:
     def _count_open(s: str) -> tuple[int, int]:
         """String-aware count of unclosed { [ in s. Returns (braces, brackets)."""
         ob = obr = 0
-        in_s = esc = False
+        in_string = escape_next = False
         for c in s:
-            if esc:        esc = False; continue
-            if c == "\\" and in_s: esc = True; continue
-            if c == '"':   in_s = not in_s; continue
-            if in_s:       continue
+            if escape_next:        escape_next = False; continue
+            if c == "\\" and in_string: escape_next = True; continue
+            if c == '"':           in_string = not in_string; continue
+            if in_string:          continue
             if   c == "{": ob  += 1
             elif c == "}": ob  -= 1
             elif c == "[": obr += 1

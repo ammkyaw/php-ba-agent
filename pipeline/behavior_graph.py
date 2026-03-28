@@ -131,6 +131,16 @@ def _create_sql_nodes(
     per-item: if the SQL file matches a service, that service node is used;
     otherwise *querier_nid* (the controller/handler node) is the fallback.
     """
+    # Pre-build filename → svc_nid index so each sql_item resolution is O(1)
+    # instead of re-scanning svc_node_map and re-constructing Path objects
+    # for every SQL item.
+    file_to_svc: dict[str, str] = {}
+    if svc_node_map and class_to_file:
+        for dep_short, svc_nid in svc_node_map.items():
+            dep_file = class_to_file.get(dep_short, "")
+            if dep_file:
+                file_to_svc[Path(dep_file).name.lower()] = svc_nid
+
     sql_node_ids: list[str] = []
     for sql_item in sql_ops:
         sql_label = f"{sql_item['op']} {sql_item['table']}"
@@ -142,15 +152,9 @@ def _create_sql_nodes(
         sql_node_ids.append(sql_nid)
 
         # Resolve the querier: service that owns the file, or fall back to ctrl
-        resolved_querier = querier_nid
-        if svc_node_map and class_to_file:
-            sql_fname = Path(sql_item["file"]).name.lower()
-            for dep_short, svc_nid in svc_node_map.items():
-                dep_file = class_to_file.get(dep_short, "")
-                if dep_file and Path(dep_file).name.lower() == sql_fname:
-                    resolved_querier = svc_nid
-                    break
-
+        resolved_querier = file_to_svc.get(
+            Path(sql_item["file"]).name.lower(), querier_nid
+        )
         _upsert_edge(edges, resolved_querier, sql_nid, "queries")
     return sql_node_ids
 
