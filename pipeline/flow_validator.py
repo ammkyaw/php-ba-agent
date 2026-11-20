@@ -1447,6 +1447,8 @@ def _build_known_files(cm: Any) -> set[str]:
         cm.routes or [],
         cm.controllers or [],
         cm.services or [],
+        cm.classes or [],
+        cm.functions or [],
         cm.form_fields or [],
         cm.sql_queries or [],
         cm.redirects or [],
