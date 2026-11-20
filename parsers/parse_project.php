@@ -132,6 +132,7 @@ try {
 // ─── Shared Result Buckets ────────────────────────────────────────────────────
 
 $result = [
+    'language'     => 'php',
     'php_version'  => $phpVersionStr,
     'framework'    => 'unknown',
     'total_files'  => 0,
