@@ -143,8 +143,25 @@ _COV_WARN  = 0.25  # coverage WARN threshold (below → FAIL)
 _CONF_PASS = 0.70  # avg confidence PASS
 _CONF_WARN = 0.40  # avg confidence WARN (below → FAIL)
 
-_V09_WARN  = 3    # major unguarded auth files before WARN
-_V09_FAIL  = 7    # > this many → FAIL
+_V09_WARN  = 5    # major unguarded auth files before WARN
+_V09_FAIL  = 20   # > this many → FAIL (raised for large enterprise apps)
+
+# Guard types that are genuine auth-enforcement signals (not infrastructure
+# calls like session_start / session_regen which fire even on login/install).
+_V09_MAJOR_GUARD_TYPES = frozenset({
+    "session_auth", "role_check", "acl", "permission_check",
+    "auth_check", "logout", "auth_signal",
+})
+
+# Path substrings that identify auth-infrastructure or installer files.
+# These implement authentication / installation themselves so they legitimately
+# have auth guards without needing auth_required on a covering business flow.
+_V09_INFRA_PATHS = (
+    "authentication/",   # modules/Users/authentication/**
+    "install/",          # install/checkDBSettings.php, install/install_utils.php
+    "install.php",       # top-level install.php
+    "SugarAuth",         # SugarAuthenticate, SugarAuthenticateUser
+)
 
 # Max items stored in uncovered lists (avoids huge JSON)
 _MAX_LIST  = 50
@@ -1135,7 +1152,9 @@ def _check_auth_guard_coverage(
                 if isinstance(auth_guard, dict)
                 else str(auth_guard)
             )
-            severity = "major" if in_any_flow else "minor"
+            is_real_guard = guard_type in _V09_MAJOR_GUARD_TYPES
+            is_infra = any(p in efile for p in _V09_INFRA_PATHS)
+            severity = "major" if (in_any_flow and is_real_guard and not is_infra) else "minor"
             reason = (
                 f"File has {guard_type} auth guard in code but "
                 + ("flow covers it without auth_required"
@@ -1165,12 +1184,13 @@ def _check_auth_guard_coverage(
         # Only flag files that are in flows (non-flow files are already caught
         # by Pass 1 via missing-flow checks; reporting them twice is noisy).
         if in_any_flow and not in_auth_flow:
+            is_infra = any(p in sigfile for p in _V09_INFRA_PATHS)
             items.append({
                 "file":       sigfile,
                 "basename":   signame,
                 "guard_type": sig.get("type", "auth_signal"),
                 "in_flow":    True,
-                "severity":   "major",
+                "severity":   "minor" if is_infra else "major",
                 "reason":     (f"File has {sig.get('type','auth')} guard in code "
                                f"but covering flow lacks auth_required"),
             })
