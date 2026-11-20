@@ -849,12 +849,42 @@ def _check_route_coverage(
 
 # ─── V-06: Database Write Operation Coverage ──────────────────────────────────
 
+def _build_reverse_include_map(cm: Any) -> dict[str, set[str]]:
+    """
+    Build a map  basename(target) → {basename(including_file)}  from the
+    code-map's include/import list.  Used by V-06 to give credit for SQL
+    writes in helper files that are included by a flow-covered file.
+    """
+    rev: dict[str, set[str]] = {}
+    for inc in (getattr(cm, "includes", None) or
+                getattr(cm, "imports",  None) or []):
+        tgt = inc.get("target", "")
+        src = inc.get("file", "") or inc.get("source_file", "") or inc.get("from", "")
+        if not tgt or not src or tgt == "(dynamic)":
+            continue
+        tgt_name = Path(tgt).name.lower()
+        src_name = Path(src).name.lower()
+        if tgt_name and src_name:
+            rev.setdefault(tgt_name, set()).add(src_name)
+    return rev
+
+
 def _check_db_write_coverage(
     cm:            Any,
     flow_pages:    set[str],
     flow_evidence: set[str],
 ) -> dict:
-    """% of SQL write ops (INSERT/UPDATE/DELETE/REPLACE) covered by flows."""
+    """% of SQL write ops (INSERT/UPDATE/DELETE/REPLACE) covered by flows.
+
+    A write is counted as covered when:
+      1. Direct — the source file basename is in flow_pages or flow_evidence.
+      2. Indirect (1-hop include) — a file that includes the source file is in
+         flow_pages or flow_evidence.  This handles helper/model files that
+         contain SQL but are only reached through an included controller.
+    """
+    covered_set = flow_pages | flow_evidence
+    rev_inc     = _build_reverse_include_map(cm)
+
     seen: set[tuple[str, str]] = set()
     covered_count   = 0
     uncovered: list[dict] = []
@@ -875,10 +905,12 @@ def _check_db_write_coverage(
             continue
         seen.add(key)
 
-        # A DB write is covered if its source file appears in flow step pages
-        # OR in flow evidence_files (covers MVC apps where controllers are in
-        # evidence_files but not necessarily in step.page).
-        if qname and (qname in flow_pages or qname in flow_evidence):
+        # Direct: source file in a flow
+        direct   = qname and qname in covered_set
+        # Indirect: any file that includes this one is in a flow
+        indirect = not direct and bool(rev_inc.get(qname, set()) & covered_set)
+
+        if direct or indirect:
             covered_count += 1
         else:
             sev = "critical" if op == "DELETE" else "major"
