@@ -345,12 +345,12 @@
       "type": "object",
       "description": "An environment variable reference in source code.",
       "properties": {
-        "name":    { "type": "string", "description": "Environment variable name." },
+        "key":     { "type": "string", "description": "Environment variable name." },
         "file":    { "type": "string" },
         "line":    { "type": "integer" },
         "default": { "type": ["string", "null"], "description": "Default value if specified." }
       },
-      "required": ["name", "file"]
+      "required": ["key", "file"]
     },
     "HttpEndpointEntry": {
       "type": "object",
