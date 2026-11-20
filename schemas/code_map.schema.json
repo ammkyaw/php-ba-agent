@@ -372,14 +372,16 @@
       "description": "A column definition for a database table.",
       "properties": {
         "table":    { "type": "string" },
-        "column":   { "type": "string" },
+        "column":   { "type": "string", "description": "Column name — present in flat per-column format (TS/Java/Prisma)." },
+        "columns":  { "type": "array", "items": { "type": "object" }, "description": "Column list — present in per-table format (PHP/migration)." },
+        "source":   { "type": "string", "description": "Detection source: migration | orm | ddl." },
         "type":     { "type": "string" },
         "nullable": { "type": "boolean", "default": true },
         "primary":  { "type": "boolean", "default": false },
         "foreign":  { "type": "boolean", "default": false },
         "ref_table": { "type": ["string", "null"], "default": null }
       },
-      "required": ["table", "column"]
+      "required": ["table"]
     }
   }
 }
