@@ -1622,10 +1622,14 @@ def _build_user_prompt(
                      + (f", showing {len(_fns)})" if _omit_fn else ")"))
         for fn in _fns:
             params = [p["name"] for p in fn.get("params", [])]
-            doc    = (fn.get("docblock") or {}).get("summary", "")
+            db     = fn.get("docblock") or {}
+            doc    = db.get("summary", "")
+            doc_ret = db.get("return") or ""
             line   = f"  {fn['name']}({', '.join(params)})"
             if doc:
                 line += f" — {doc}"
+            if doc_ret and doc_ret.strip() != (fn.get("return_type") or "").strip():
+                line += f" [returns: {doc_ret}]"
             parts.append(line)
         if _omit_fn:
             parts.append(f"  … +{_omit_fn} more functions omitted")
