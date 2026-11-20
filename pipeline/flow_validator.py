@@ -1184,14 +1184,16 @@ def _check_auth_guard_coverage(
         # Only flag files that are in flows (non-flow files are already caught
         # by Pass 1 via missing-flow checks; reporting them twice is noisy).
         if in_any_flow and not in_auth_flow:
-            is_infra = any(p in sigfile for p in _V09_INFRA_PATHS)
+            sig_type     = sig.get("type", "auth_signal")
+            is_real_guard = sig_type in _V09_MAJOR_GUARD_TYPES
+            is_infra      = any(p in sigfile for p in _V09_INFRA_PATHS)
             items.append({
                 "file":       sigfile,
                 "basename":   signame,
-                "guard_type": sig.get("type", "auth_signal"),
+                "guard_type": sig_type,
                 "in_flow":    True,
-                "severity":   "minor" if is_infra else "major",
-                "reason":     (f"File has {sig.get('type','auth')} guard in code "
+                "severity":   "minor" if (is_infra or not is_real_guard) else "major",
+                "reason":     (f"File has {sig_type} guard in code "
                                f"but covering flow lacks auth_required"),
             })
 
