@@ -66,11 +66,99 @@ class CallSpec(NamedTuple):
     llm_label:      str        # telemetry / logging label
     parse_label:    str        # key used when parsing the response
     model_override: str | None
+    json_schema:    dict | None = None  # constrained-decoding schema (vLLM / Ollama)
+
+# ── JSON schemas for constrained decoding (vLLM / Ollama ≥0.4.6) ───────────────
+# Passing these to the server enforces grammar-level JSON structure so the model
+# cannot produce invalid JSON, eliminating all correction-call overhead.
+
+_INTERNAL_THOUGHTS_PROP: dict = {
+    "_internal_thoughts": {
+        "type": "string",
+        "description": "Think step-by-step about the codebase evidence here before producing output.",
+    },
+}
+
+_FEATURE_ITEM_SCHEMA: dict = {
+    "type": "object",
+    "properties": {
+        "name":           {"type": "string"},
+        "description":    {"type": "string"},
+        "pages":          {"type": "array", "items": {"type": "string"}},
+        "tables":         {"type": "array", "items": {"type": "string"}},
+        "inputs":         {"type": "array", "items": {"type": "string"}},
+        "outputs":        {"type": "string"},
+        "business_rules": {"type": "array", "items": {"type": "string"}},
+    },
+    "required": ["name", "description", "pages", "tables", "inputs",
+                 "outputs", "business_rules"],
+}
+
+_SCHEMA_B: dict = {
+    "type": "object",
+    "properties": {
+        **_INTERNAL_THOUGHTS_PROP,
+        "features": {"type": "array", "items": _FEATURE_ITEM_SCHEMA},
+    },
+    "required": ["_internal_thoughts", "features"],
+}
+
+_SCHEMA_A: dict = {
+    "type": "object",
+    "properties": {
+        **_INTERNAL_THOUGHTS_PROP,
+        "domain_name":      {"type": "string"},
+        "description":      {"type": "string"},
+        "key_entities":     {"type": "array", "items": {"type": "string"}},
+        "bounded_contexts": {"type": "array", "items": {"type": "string"}},
+    },
+    "required": ["_internal_thoughts", "domain_name", "description",
+                 "key_entities", "bounded_contexts"],
+}
+
+_SCHEMA_C_ROLES: dict = {
+    "type": "object",
+    "properties": {
+        **_INTERNAL_THOUGHTS_PROP,
+        "user_roles": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "role":        {"type": "string"},
+                    "description": {"type": "string"},
+                    "permissions": {"type": "array", "items": {"type": "string"}},
+                },
+                "required": ["role", "description"],
+            },
+        },
+    },
+    "required": ["_internal_thoughts", "user_roles"],
+}
+
+_SCHEMA_C_WORKFLOWS: dict = {
+    "type": "object",
+    "properties": {
+        **_INTERNAL_THOUGHTS_PROP,
+        "workflows": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "name":  {"type": "string"},
+                    "steps": {"type": "array", "items": {"type": "string"}},
+                },
+                "required": ["name", "steps"],
+            },
+        },
+    },
+    "required": ["_internal_thoughts", "workflows"],
+}
 
 # ── Configuration ──────────────────────────────────────────────────────────────
 # Three focused calls instead of one giant call — each produces a small, bounded
 # JSON so local models (Qwen, Mistral, etc.) never hit output-token limits.
-MAX_TOKENS_META     = 4_000   # Call A: domain_name, description, key_entities, bounded_contexts
+MAX_TOKENS_META     = 6_000   # Call A: _internal_thoughts + domain_name, description, key_entities, bounded_contexts
 MAX_TOKENS_FEATURES = 8_000   # Call B: features list (largest field)
 MAX_TOKENS_ROLES_WF = 8_000   # Call C: user_roles + workflows
 MAX_TOKENS_GAP_FILL = int(os.environ.get("STAGE4_MAX_TOKENS_GAP_FILL", "8000") or "8000")
@@ -405,40 +493,43 @@ def run(ctx: PipelineContext) -> None:
                 group="A", system_prompt=_sys_a, user_prompt=prompt_a,
                 max_tokens=MAX_TOKENS_META,
                 llm_label=f"stage4-{_suffix_a}", parse_label=_suffix_a,
-                model_override=_mdl,
+                model_override=_mdl, json_schema=_SCHEMA_A,
             ))
             _call_specs.append(CallSpec(
                 group="B", system_prompt=_sys_b, user_prompt=prompt_b_core,
                 max_tokens=MAX_TOKENS_FEATURES,
                 llm_label=f"stage4-{_suffix_b}-core", parse_label=f"{_suffix_b}-core",
-                model_override=_mdl,
+                model_override=_mdl, json_schema=_SCHEMA_B,
             ))
             _call_specs.append(CallSpec(
                 group="B", system_prompt=_sys_b, user_prompt=prompt_b_ui,
                 max_tokens=MAX_TOKENS_FEATURES,
                 llm_label=f"stage4-{_suffix_b}-ui", parse_label=f"{_suffix_b}-ui",
-                model_override=_mdl,
+                model_override=_mdl, json_schema=_SCHEMA_B,
             ))
 
     _call_specs.append(CallSpec(
         group="C", system_prompt=_sys_c_roles, user_prompt=prompt_c_roles,
         max_tokens=MAX_TOKENS_ROLES_WF,
         llm_label="stage4-C1", parse_label="C1", model_override=None,
+        json_schema=_SCHEMA_C_ROLES,
     ))
     _call_specs.append(CallSpec(
         group="C", system_prompt=_sys_c_workflows, user_prompt=prompt_c_workflows,
         max_tokens=MAX_TOKENS_ROLES_WF,
         llm_label="stage4-C2", parse_label="C2", model_override=None,
+        json_schema=_SCHEMA_C_WORKFLOWS,
     ))
 
     def _run_stage4_call(args: CallSpec) -> tuple[str, str, dict]:
-        _group, _system, _user, _max_tokens, _llm_label, _parse_label, _mdl = args
+        _group, _system, _user, _max_tokens, _llm_label, _parse_label, _mdl, _schema = args
         raw = _call_part(
             _system,
             _user,
             _max_tokens,
             _llm_label,
             model_override=_mdl,
+            json_schema=_schema,
         )
         return _group, _parse_label, _parse_partial(raw, _parse_label, debug_dir)
 
@@ -616,6 +707,8 @@ def _merge_consistency_b(results: list[dict]) -> dict:
     merged_features: list[dict] = []
     for r in results:
         for f in (r.get("features") or []):
+            if not isinstance(f, dict):
+                continue
             key = (f.get("name") or "").strip().lower()
             if key and key not in seen_names:
                 seen_names.add(key)
@@ -1990,23 +2083,16 @@ def _build_user_prompt(
 def _call_part(system_prompt: str, user_prompt: str,
                max_tokens: int, label: str,
                model_override: str | None = None,
-               temperature: float = 0.2) -> str:
+               temperature: float = 0.2,
+               json_schema: dict | None = None) -> str:
     """Call the configured LLM and return the raw response string.
 
-    json_mode=True forces local models (Ollama etc.) to output valid JSON:
-      - OpenAI-compat path:   response_format={"type":"json_object"}
-      - Ollama native path:   format="json"  (top-level payload field)
-
-    prefill="{" is a secondary safety net for thinking models (Qwen3,
-    DeepSeek-R1): the assistant turn starts with "{" so the model cannot
-    emit any preamble or markdown fence before the JSON object.
-    On Claude the prefill is sent as a partial assistant message; on local
-    models it is appended to the messages array the same way.
+    json_mode=True is always set.  When json_schema is provided it is passed
+    to the server for grammar-level constrained decoding (vLLM guided_json /
+    response_format.json_schema), making invalid JSON literally impossible.
+    Falls back to plain json_mode when json_schema is None.
     """
-    from pipeline.llm_client import call_llm, get_provider
-    # Use prefill only for local models — Claude handles structured output
-    # differently and prefill interferes with its extended-thinking mode.
-    use_prefill = "{" if get_provider() == "local" else ""
+    from pipeline.llm_client import call_llm
     raw = call_llm(
         system_prompt  = system_prompt,
         user_prompt    = user_prompt,
@@ -2014,16 +2100,9 @@ def _call_part(system_prompt: str, user_prompt: str,
         temperature    = temperature,
         label          = label,
         json_mode      = True,
-        prefill        = use_prefill,
+        json_schema    = json_schema,
         model_override = model_override,
     )
-    # vLLM's OpenAI-compat endpoint returns only the model's *continuation*,
-    # not the prefill text itself.  Re-attach "{" so _parse_partial always
-    # receives a complete JSON document ({"features": [...]} not "features": [...]).
-    # Ollama native echoes the prefill, so we guard with startswith to avoid
-    # double-prepending.
-    if use_prefill and raw and not raw.lstrip().startswith(use_prefill):
-        raw = use_prefill + raw
     return raw
 
 
@@ -2165,6 +2244,35 @@ def _extract_module_name_ts(filepath: str) -> str | None:
                 return nxt
 
     return None
+
+
+def _is_valid_feature_name(name: str) -> bool:
+    """
+    Return False for feature names that are model thinking / commentary leaked
+    into a JSON string value instead of a real BA feature name.
+
+    Heuristics (any one failing → invalid):
+      - Name must be ≤ 150 chars  (real names are short titles)
+      - Must not start with punctuation that signals JSON/code artefacts
+      - Must not contain newlines (multi-line = reasoning block)
+      - Must not look like a comment or placeholder
+    """
+    if not name or not name.strip():
+        return False
+    n = name.strip()
+    if len(n) > 150:
+        return False
+    if n[0] in (',', '"', '/', '*', '#', '-', '`'):
+        return False
+    if '\n' in n:
+        return False
+    _commentary_markers = ("//", "/*", "placeholder", "wait,", "let me",
+                           "actually,", "however,", "i will", "i need to",
+                           "looking at", "re-read", "the evidence")
+    _nl = n.lower()
+    if any(_nl.startswith(m) for m in _commentary_markers):
+        return False
+    return True
 
 
 def _coerce_feature_item_to_str(v: object) -> str:
@@ -2675,7 +2783,7 @@ def _gap_fill_pass(
 
         try:
             raw_d = _call_part(gap_system, round_user_prompt, MAX_TOKENS_GAP_FILL, call_label,
-                               temperature=GAP_FILL_TEMPERATURE)
+                               temperature=GAP_FILL_TEMPERATURE, json_schema=_SCHEMA_B)
         except Exception as _gf_exc:
             print(f"  [stage4-gap] ⚠️  Round {gap_round} LLM call failed after retries: "
                   f"{_gf_exc} — skipping round")
@@ -2708,11 +2816,13 @@ def _gap_fill_pass(
 
         consecutive_empty = 0  # reset on any successful response
 
-        # Merge — skip duplicates by name (case-insensitive)
+        # Merge — skip duplicates by name (case-insensitive) and leaked thinking
         existing_lower = {f["name"].lower() for f in domain_model.features}
         added: list[str] = []
         for feat in new_features:
             if isinstance(feat, dict) and feat.get("name"):
+                if not _is_valid_feature_name(feat["name"]):
+                    continue
                 if feat["name"].lower() not in existing_lower:
                     domain_model.features.append(feat)
                     existing_lower.add(feat["name"].lower())
@@ -2834,7 +2944,8 @@ def _parse_partial(raw: str, label: str, debug_dir: str | None = None) -> dict:
         except Exception:
             pass  # never let debug I/O crash the pipeline
 
-    text = raw.strip()
+    from pipeline.llm_client import _normalize_llm_json
+    text = _normalize_llm_json(raw.strip())
 
     # Strip markdown / prose — find the outermost { or [ block
     if not text.startswith("{") and not text.startswith("["):
@@ -2888,8 +2999,23 @@ def _parse_partial(raw: str, label: str, debug_dir: str | None = None) -> dict:
         wrap_key = "workflows"
     if isinstance(data, list):
         if wrap_key:
+            # Coerce non-dict items — without prefill the model sometimes
+            # returns a bare list of strings instead of feature objects.
+            # Convert strings to minimal stubs so the feature name survives
+            # into later stages; silently drop anything else (int, None, etc.).
+            coerced: list[dict] = []
+            salvaged = 0
+            for item in data:
+                if isinstance(item, dict):
+                    coerced.append(item)
+                elif isinstance(item, str) and item.strip():
+                    coerced.append({"name": item.strip(), "pages": [], "tables": [], "inputs": []})
+                    salvaged += 1
+            if salvaged:
+                print(f"  [stage4-{label}] Salvaged {salvaged} string item(s) as name-only stubs in '{wrap_key}'.")
+            dict_items = coerced
             print(f"  [stage4-{label}] Top-level array — wrapping as '{wrap_key}'.")
-            data = {wrap_key: data}
+            data = {wrap_key: dict_items}
         else:
             print(f"  [stage4-{label}] ⚠️  Unexpected top-level array — discarding.")
             return {}

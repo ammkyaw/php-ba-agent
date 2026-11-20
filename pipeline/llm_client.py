@@ -625,10 +625,23 @@ def call_llm(
                 _tok_str = f"~{len(result.split()):,} words"  # fallback if provider didn't report
             print(f"  {tag}done in {_elapsed:.1f}s  ({_tok_str})")
             _record_telemetry(label, model, _elapsed, _in, _out)
-            # ── JSON validation + single correction retry ──────────────────
+            # ── JSON validation + structural repair + correction retry ────
             if json_mode:
                 ok, err = _validate_json(result)
                 if not ok:
+                    # Step 1: try structural closure (handles repetition-loop
+                    # truncations cheaply — no LLM round-trip required).
+                    _closed = _try_close_truncated_json(
+                        _normalize_llm_json(_strip_markdown_fences(result))
+                    )
+                    ok_closed, _ = _validate_json(_closed)
+                    if ok_closed:
+                        print(f"  {tag}Truncated JSON repaired by structural closure.")
+                        result = _closed
+                        ok = True
+
+                if not ok:
+                    # Step 2: fall back to LLM correction call.
                     # Trim the bad response before sending it to the correction
                     # model.  A truncated-repetition-loop response can be 10-40k
                     # chars; sending the full thing poisons the correction model
@@ -727,14 +740,129 @@ def _strip_markdown_fences(text: str) -> str:
     return t
 
 
+def _fix_string_newlines(text: str) -> str:
+    """
+    Replace literal newlines/tabs inside JSON string values with their
+    escape sequences.  JSON forbids bare control characters inside strings;
+    models often emit them in long description fields, causing
+    "Expecting ',' delimiter" parse errors.
+
+    Uses a single-pass character scanner so it only touches characters that
+    are actually inside a quoted string — safe for arbitrary JSON structure.
+    """
+    out: list[str] = []
+    in_string   = False
+    escape_next = False
+    for ch in text:
+        if escape_next:
+            out.append(ch)
+            escape_next = False
+            continue
+        if ch == "\\" and in_string:
+            out.append(ch)
+            escape_next = True
+            continue
+        if ch == '"':
+            in_string = not in_string
+            out.append(ch)
+            continue
+        if in_string:
+            if ch == "\n":
+                out.append("\\n")
+                continue
+            if ch == "\r":
+                out.append("\\r")
+                continue
+            if ch == "\t":
+                out.append("\\t")
+                continue
+        out.append(ch)
+    return "".join(out)
+
+
+def _normalize_llm_json(text: str) -> str:
+    """
+    Fix common LLM JSON artifacts so json.loads can parse the result:
+      - Literal newlines/tabs inside strings  → escaped (\\n / \\t)
+      - Trailing commas before } or ]         → removed
+      - Python None / True / False            → JSON null / true / false
+    """
+    text = _fix_string_newlines(text)
+    text = re.sub(r",(\s*[}\]])", r"\1", text)
+    text = re.sub(r"\bNone\b",  "null",  text)
+    text = re.sub(r"\bTrue\b",  "true",  text)
+    text = re.sub(r"\bFalse\b", "false", text)
+    return text
+
+
+def _try_close_truncated_json(text: str) -> str:
+    """
+    Attempt to repair JSON that was truncated mid-stream (e.g. after a
+    repetition-loop truncation).  Scans the text to find unclosed strings,
+    arrays, and objects, then appends the minimum closing tokens needed to
+    produce a parseable document.
+
+    Returns the (possibly repaired) text.  Caller should still validate with
+    _validate_json — this is best-effort, not guaranteed.
+    """
+    import json as _json
+
+    # Already valid — nothing to do
+    try:
+        _json.loads(text)
+        return text
+    except _json.JSONDecodeError:
+        pass
+
+    out: list[str] = []
+    in_string   = False
+    escape_next = False
+    depth_stack: list[str] = []   # '{' or '['
+
+    for ch in text:
+        out.append(ch)
+        if escape_next:
+            escape_next = False
+            continue
+        if ch == "\\" and in_string:
+            escape_next = True
+            continue
+        if ch == '"':
+            in_string = not in_string
+            continue
+        if in_string:
+            continue
+        if ch == "{":
+            depth_stack.append("}")
+        elif ch == "[":
+            depth_stack.append("]")
+        elif ch in ("]", "}"):
+            if depth_stack and depth_stack[-1] == ch:
+                depth_stack.pop()
+
+    # Close any unterminated string first, then strip trailing comma
+    result = "".join(out)
+    if in_string:
+        result += '"'
+    result = re.sub(r",(\s*)$", r"\1", result.rstrip())
+
+    # Close open containers in reverse order
+    for closer in reversed(depth_stack):
+        result += closer
+
+    return result
+
+
 def _validate_json(text: str) -> tuple[bool, str]:
     """
     Try to parse *text* as JSON.  Returns (True, "") on success or
-    (False, error_message) on failure.  Strips markdown fences first.
+    (False, error_message) on failure.  Normalises common LLM artifacts
+    (trailing commas, Python literals) before parsing so minor issues don't
+    trigger a full correction call.
     """
     import json as _json
     try:
-        _json.loads(_strip_markdown_fences(text))
+        _json.loads(_normalize_llm_json(_strip_markdown_fences(text)))
         return True, ""
     except _json.JSONDecodeError as exc:
         return False, str(exc)
@@ -942,7 +1070,7 @@ def _call_local(
         else:
             payload["response_format"] = {
                 "type": "json_schema",
-                "json_schema": {"name": "response", "strict": True, "schema": json_schema},
+                "json_schema": {"name": "response", "schema": json_schema},
             }
     elif json_mode:
         # JSON-object mode — valid JSON output without a fixed schema.
@@ -1046,7 +1174,10 @@ def _call_local(
     )
 
     # Restore prefill so the caller sees the complete value
-    return (prefill + content) if prefill else content
+    if prefill:
+        # Prevent "{" + "{\n" resulting in "{{\n"
+        return content if content.lstrip().startswith(prefill) else (prefill + content)
+    return content
 
 
 # ── vLLM post-processing helpers ───────────────────────────────────────────────
