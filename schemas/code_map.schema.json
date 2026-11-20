@@ -354,15 +354,18 @@
     },
     "HttpEndpointEntry": {
       "type": "object",
-      "description": "An inferred HTTP entry point.",
+      "description": "An inferred HTTP entry point (signal-based) or explicit route.",
       "properties": {
-        "method":  { "type": "string" },
-        "path":    { "type": "string" },
-        "handler": { "type": "string" },
-        "file":    { "type": "string" },
-        "source":  { "type": "string", "description": "How the endpoint was detected." }
+        "method":   { "type": ["string", "null"], "description": "Single HTTP verb for explicit routes." },
+        "path":     { "type": ["string", "null"], "description": "URL pattern for explicit routes." },
+        "handler":  { "type": ["string", "null"] },
+        "file":     { "type": "string" },
+        "source":   { "type": "string", "description": "How the endpoint was detected." },
+        "type":     { "type": "string", "description": "Endpoint kind: api | page | form_handler | form_processor | controller_method." },
+        "accepts":  { "type": "array", "items": { "type": "string" }, "description": "HTTP methods accepted (signal-detected endpoints)." },
+        "produces": { "type": "string", "description": "Response type: json | html | redirect | mixed." }
       },
-      "required": ["method", "path"]
+      "required": ["file"]
     },
     "TableColumnEntry": {
       "type": "object",
