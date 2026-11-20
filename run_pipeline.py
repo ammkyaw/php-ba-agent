@@ -58,6 +58,7 @@ from pathlib import Path
 from typing import Optional
 
 from context import PipelineContext, StageStatus
+from pipeline.llm_client import set_telemetry_path, write_telemetry_summary
 
 # Stage imports (each is a self-contained module)
 from pipeline.stage00_validate     import run as stage0
@@ -215,6 +216,13 @@ async def run_pipeline(ctx: PipelineContext, until: Optional[str] = None, force:
     except Exception as _rev_exc:
         print(f"  [review_report] Warning: could not generate review report: {_rev_exc}")
 
+    # Write LLM call telemetry summary grouped by stage
+    try:
+        write_telemetry_summary(ctx.output_path("llm_summary.json"))
+        print(f"  [telemetry] LLM call summary written → llm_summary.json")
+    except Exception as _tel_exc:
+        print(f"  [telemetry] Warning: could not write telemetry summary: {_tel_exc}")
+
     print("\nPipeline complete! Outputs:", ctx.output_dir)
 
 
@@ -257,6 +265,8 @@ def main() -> None:
             sys.exit(1)
         ctx = PipelineContext.load(str(context_file))
         print(f"Resuming run: {ctx.run_id}")
+
+    set_telemetry_path(ctx.output_path("llm_calls.jsonl"))
 
     for arg_name, arg_val in [("--until", args.until), ("--force", args.force)]:
         if arg_val and arg_val not in valid_names:

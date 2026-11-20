@@ -88,6 +88,76 @@ _MAX_SQL_PER_PATH   = 6    # cap SQL nodes per behavior path
 _MAX_SERVICE_DEPTH  = 3    # BFS depth over service_deps
 _MAX_PATHS          = 500  # safety cap on total paths extracted
 
+# HTTP verbs used as handler names by file-system routers (Next.js App Router)
+_FS_HANDLER_VERBS: frozenset[str] = frozenset(
+    {"GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "ANY", "HANDLER"}
+)
+
+
+# ─── SQL helpers (shared between route-loop and exec-path augmentation) ────────
+
+def _collect_sql_ops(files: list[str], file_to_sql: dict) -> list[dict]:
+    """Return deduplicated SQL ops for all *files*, capped at _MAX_SQL_PER_PATH."""
+    sql_seen: set[tuple[str, str]] = set()
+    sql_ops:  list[dict]           = []
+    for fpath in files:
+        for q in file_to_sql.get(fpath, []):
+            op    = (q.get("operation") or "").upper()
+            table = (q.get("table") or "").strip()
+            if not op or table.lower() in _SKIP_TABLES:
+                continue
+            key = (op, table.lower())
+            if key not in sql_seen:
+                sql_seen.add(key)
+                sql_ops.append({"op": op, "table": table, "file": fpath})
+            if len(sql_ops) >= _MAX_SQL_PER_PATH:
+                return sql_ops
+    return sql_ops
+
+
+def _create_sql_nodes(
+    sql_ops:      list[dict],
+    nodes:        dict,
+    edges:        dict,
+    querier_nid:  str,
+    svc_node_map: dict[str, str] | None = None,
+    class_to_file: dict[str, str] | None = None,
+) -> list[str]:
+    """
+    Upsert one SQL node per *sql_ops* entry, wire a *queries* edge from the
+    appropriate querier, and return the list of SQL node ids.
+
+    When *svc_node_map* and *class_to_file* are supplied the querier is resolved
+    per-item: if the SQL file matches a service, that service node is used;
+    otherwise *querier_nid* (the controller/handler node) is the fallback.
+    """
+    # Pre-build filename → svc_nid index so each sql_item resolution is O(1)
+    # instead of re-scanning svc_node_map and re-constructing Path objects
+    # for every SQL item.
+    file_to_svc: dict[str, str] = {}
+    if svc_node_map and class_to_file:
+        for dep_short, svc_nid in svc_node_map.items():
+            dep_file = class_to_file.get(dep_short, "")
+            if dep_file:
+                file_to_svc[Path(dep_file).name.lower()] = svc_nid
+
+    sql_node_ids: list[str] = []
+    for sql_item in sql_ops:
+        sql_label = f"{sql_item['op']} {sql_item['table']}"
+        sql_nid   = _node_id("sql", sql_label)
+        _upsert_node(nodes, sql_nid, "sql", sql_label, sql_item["file"], {
+            "operation": sql_item["op"],
+            "table":     sql_item["table"],
+        })
+        sql_node_ids.append(sql_nid)
+
+        # Resolve the querier: service that owns the file, or fall back to ctrl
+        resolved_querier = file_to_svc.get(
+            Path(sql_item["file"]).name.lower(), querier_nid
+        )
+        _upsert_edge(edges, resolved_querier, sql_nid, "queries")
+    return sql_node_ids
+
 
 # ─── Public API ────────────────────────────────────────────────────────────────
 
@@ -147,6 +217,21 @@ def extract(ctx: Any) -> dict:
 
         ctrl_file = fqn_to_file.get(ctrl_fqn) or class_to_file.get(ctrl_short, "")
 
+        # ── File-system router fallback (Next.js / Nuxt / SvelteKit) ──────────
+        # When the handler is an HTTP verb ("GET") or a file-derived name that
+        # doesn't resolve to an OOP class, use the route's source file directly
+        # as the handler file. This prevents all file-system routes from being
+        # dropped by the "no ctrl_file and no sql_ops" skip guard below.
+        if not ctrl_file and route.get("file"):
+            ctrl_file = route["file"]
+            route_fp  = Path(ctrl_file)
+            if ctrl_short.upper() in _FS_HANDLER_VERBS:
+                # e.g. "GET" → use parent dir name as the logical component name
+                ctrl_short    = route_fp.parent.name or route_fp.stem
+                ctrl_fqn      = ctrl_file          # file path as unique identity
+                action_method = handler             # keep "GET"/"POST" as the action
+            # else: handler is already a descriptive name ("dashboard_page") — keep it
+
         # ── Transitive BFS over service_deps ──────────────────────────────────
         visited: set[str] = {ctrl_short}
         queue: deque[tuple[str, int, str]] = deque([(ctrl_short, 0, "")])
@@ -171,22 +256,7 @@ def extract(ctx: Any) -> dict:
                     reachable_files.append(dep_file)
 
         # ── Collect SQL ────────────────────────────────────────────────────────
-        sql_seen: set[tuple[str, str]] = set()
-        sql_ops:  list[dict]           = []
-        for fpath in reachable_files:
-            for q in file_to_sql.get(fpath, []):
-                op    = (q.get("operation") or "").upper()
-                table = (q.get("table") or "").strip()
-                if not op or table.lower() in _SKIP_TABLES:
-                    continue
-                key = (op, table.lower())
-                if key not in sql_seen:
-                    sql_seen.add(key)
-                    sql_ops.append({"op": op, "table": table, "file": fpath})
-                if len(sql_ops) >= _MAX_SQL_PER_PATH:
-                    break
-            if len(sql_ops) >= _MAX_SQL_PER_PATH:
-                break
+        sql_ops = _collect_sql_ops(reachable_files, file_to_sql)
 
         # ── Collect first redirect ─────────────────────────────────────────────
         redirect_target = ""
@@ -261,26 +331,10 @@ def extract(ctx: Any) -> dict:
             _upsert_edge(edges, parent_nid, svc_nid, "delegates_to")
 
         # SQL nodes + queries edges
-        sql_node_ids: list[str] = []
-        for sql_item in sql_ops:
-            sql_label = f"{sql_item['op']} {sql_item['table']}"
-            sql_nid   = _node_id("sql", sql_label)
-            _upsert_node(nodes, sql_nid, "sql", sql_label, sql_item["file"], {
-                "operation": sql_item["op"],
-                "table":     sql_item["table"],
-            })
-            sql_node_ids.append(sql_nid)
-
-            # queries edge: the file that owns the SQL points to its class
-            # If the SQL file matches a service, link from that service; else ctrl
-            sql_fname = Path(sql_item["file"]).name.lower()
-            querier_nid = ctrl_node_id  # default
-            for dep_short, svc_nid in svc_node_map.items():
-                dep_file = class_to_file.get(dep_short, "")
-                if dep_file and Path(dep_file).name.lower() == sql_fname:
-                    querier_nid = svc_nid
-                    break
-            _upsert_edge(edges, querier_nid, sql_nid, "queries")
+        sql_node_ids = _create_sql_nodes(
+            sql_ops, nodes, edges, ctrl_node_id,
+            svc_node_map=svc_node_map, class_to_file=class_to_file,
+        )
 
         # Redirect node + redirects_to edge
         redir_node_id = ""
@@ -321,6 +375,85 @@ def extract(ctx: Any) -> dict:
 
         if len(paths) >= _MAX_PATHS:
             break
+
+    # ── Execution-path augmentation (Next.js / React / Firebase apps) ────────────
+    # Always merge stage15 execution_paths into the graph — not just as a fallback.
+    # Route-loop paths win for identical (method, path) pairs (OOP resolution is
+    # richer); exec_paths fill in every other handler that the OOP route loop
+    # couldn't trace (page components, Firebase hooks, API utilities, etc.).
+    exec_paths = getattr(cm, "execution_paths", None) or getattr(ctx, "execution_paths", None) or []
+    if exec_paths:
+        # Build a set of (method, path) already covered by the route loop
+        route_loop_keys: set[tuple[str, str]] = {
+            (p["route_method"].upper(), p["route_path"]) for p in paths
+        }
+
+        for ep in exec_paths:
+            if len(paths) >= _MAX_PATHS:
+                break
+            handler   = ep.get("handler") or ep.get("name") or ""
+            ep_file   = ep.get("file") or ""
+            ep_method = (ep.get("http_method") or "CLIENT").upper()
+            ep_route  = ep.get("route") or ""
+            if not handler:
+                continue
+
+            # Skip if a higher-quality route-loop path already covers this endpoint
+            if (ep_method, ep_route) in route_loop_keys:
+                continue
+
+            path_id = f"path_{len(paths)+1:03d}"
+
+            # Route node — use the page path or the handler as the label
+            route_label  = ep_route or f"[{ep_file}]"
+            route_nid    = _node_id("route", f"{ep_method}:{route_label}")
+            _upsert_node(nodes, route_nid, "route",
+                         f"{ep_method} {route_label}", ep_file,
+                         {"method": ep_method, "path": route_label})
+
+            # Handler node — the client function itself
+            handler_nid = _node_id("controller", f"{ep_file}::{handler}")
+            _upsert_node(nodes, handler_nid, "controller", handler, ep_file,
+                         {"fqn": ep_file, "short": handler, "method": handler})
+            _upsert_edge(edges, route_nid, handler_nid, "handles")
+
+            # Auth
+            has_auth_ep = bool(ep.get("auth_guard", {}).get("present"))
+
+            # SQL — link any queries whose source file matches this exec_path's file
+            ep_sql = _collect_sql_ops([ep_file] if ep_file else [], file_to_sql)
+
+            # SQL nodes + queries edges for exec_path
+            ep_sql_node_ids = _create_sql_nodes(ep_sql, nodes, edges, handler_nid)
+
+            # Dynamic confidence — same scoring function as the route loop
+            ep_confidence = _path_confidence(
+                has_ctrl_file = bool(ep_file),
+                has_services  = False,       # no constructor DI in file-system routing
+                has_sql       = bool(ep_sql),
+                n_sql_tables  = len({s["table"].lower() for s in ep_sql}),
+                has_redirect  = False,
+                has_auth      = has_auth_ep,
+            )
+
+            ep_node_ids = [route_nid, handler_nid] + ep_sql_node_ids
+
+            paths.append({
+                "path_id":         path_id,
+                "entry_node":      route_nid,
+                "node_ids":        ep_node_ids,
+                "confidence":      ep_confidence,
+                "route_method":    ep_method,
+                "route_path":      route_label,
+                "handler":         handler,
+                "controller_file": ep_file,
+                "sql_ops":         ep_sql,
+                "sql_tables":      [s["table"] for s in ep_sql],
+                "redirect":        "",
+                "has_auth":        has_auth_ep,
+                "middleware":      [],
+                "reachable_files": [ep_file] if ep_file else [],
+            })
 
     # ── Summary ────────────────────────────────────────────────────────────────
     nodes_list = list(nodes.values())

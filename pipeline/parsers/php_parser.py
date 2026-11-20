@@ -118,6 +118,10 @@ class PHPParser(LanguageParser):
 
         code_map = _build_code_map(payload, php_version)
 
+        # Tag parser so stage10 resume loader can dispatch correctly
+        # (consistent with TypeScript and Java parsers that set this explicitly)
+        payload["_parser"] = "php"
+
         # Persist raw payload
         Path(output_path).parent.mkdir(parents=True, exist_ok=True)
         with open(output_path, "w", encoding="utf-8") as fh:

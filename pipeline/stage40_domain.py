@@ -50,25 +50,129 @@ from __future__ import annotations
 
 import json
 import os
+import re
 from pathlib import Path
-from typing import Any
+from typing import Any, NamedTuple
 
 from context import DomainModel, PipelineContext
+
+
+class CallSpec(NamedTuple):
+    """Specification for a single stage-4 LLM call."""
+    group:          str        # "A" | "B" | "C"
+    system_prompt:  str
+    user_prompt:    str
+    max_tokens:     int
+    llm_label:      str        # telemetry / logging label
+    parse_label:    str        # key used when parsing the response
+    model_override: str | None
+    json_schema:    dict | None = None  # constrained-decoding schema (vLLM / Ollama)
+
+# ── JSON schemas for constrained decoding (vLLM / Ollama ≥0.4.6) ───────────────
+# Passing these to the server enforces grammar-level JSON structure so the model
+# cannot produce invalid JSON, eliminating all correction-call overhead.
+
+_INTERNAL_THOUGHTS_PROP: dict = {
+    "_internal_thoughts": {
+        "type": "string",
+        "description": "Think step-by-step about the codebase evidence here before producing output.",
+    },
+}
+
+_FEATURE_ITEM_SCHEMA: dict = {
+    "type": "object",
+    "properties": {
+        "name":           {"type": "string"},
+        "description":    {"type": "string"},
+        "pages":          {"type": "array", "items": {"type": "string"}},
+        "tables":         {"type": "array", "items": {"type": "string"}},
+        "inputs":         {"type": "array", "items": {"type": "string"}},
+        "outputs":        {"type": "string"},
+        "business_rules": {"type": "array", "items": {"type": "string"}},
+    },
+    "required": ["name", "description", "pages", "tables", "inputs",
+                 "outputs", "business_rules"],
+}
+
+_SCHEMA_B: dict = {
+    "type": "object",
+    "properties": {
+        **_INTERNAL_THOUGHTS_PROP,
+        "features": {"type": "array", "items": _FEATURE_ITEM_SCHEMA},
+    },
+    "required": ["_internal_thoughts", "features"],
+}
+
+_SCHEMA_A: dict = {
+    "type": "object",
+    "properties": {
+        **_INTERNAL_THOUGHTS_PROP,
+        "domain_name":      {"type": "string"},
+        "description":      {"type": "string"},
+        "key_entities":     {"type": "array", "items": {"type": "string"}},
+        "bounded_contexts": {"type": "array", "items": {"type": "string"}},
+    },
+    "required": ["_internal_thoughts", "domain_name", "description",
+                 "key_entities", "bounded_contexts"],
+}
+
+_SCHEMA_C_ROLES: dict = {
+    "type": "object",
+    "properties": {
+        **_INTERNAL_THOUGHTS_PROP,
+        "user_roles": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "role":        {"type": "string"},
+                    "description": {"type": "string"},
+                    "permissions": {"type": "array", "items": {"type": "string"}},
+                },
+                "required": ["role", "description"],
+            },
+        },
+    },
+    "required": ["_internal_thoughts", "user_roles"],
+}
+
+_SCHEMA_C_WORKFLOWS: dict = {
+    "type": "object",
+    "properties": {
+        **_INTERNAL_THOUGHTS_PROP,
+        "workflows": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "name":  {"type": "string"},
+                    "steps": {"type": "array", "items": {"type": "string"}},
+                },
+                "required": ["name", "steps"],
+            },
+        },
+    },
+    "required": ["_internal_thoughts", "workflows"],
+}
 
 # ── Configuration ──────────────────────────────────────────────────────────────
 # Three focused calls instead of one giant call — each produces a small, bounded
 # JSON so local models (Qwen, Mistral, etc.) never hit output-token limits.
-MAX_TOKENS_META     = 4_000   # Call A: domain_name, description, key_entities, bounded_contexts
+MAX_TOKENS_META     = 6_000   # Call A: _internal_thoughts + domain_name, description, key_entities, bounded_contexts
 MAX_TOKENS_FEATURES = 8_000   # Call B: features list (largest field)
 MAX_TOKENS_ROLES_WF = 8_000   # Call C: user_roles + workflows
-MAX_TOKENS_GAP_FILL = 6_000   # Call D: gap-fill features for uncovered pages
+MAX_TOKENS_GAP_FILL = int(os.environ.get("STAGE4_MAX_TOKENS_GAP_FILL", "8000") or "8000")
+# ↑ Kept deliberately lower than B/C calls: shorter responses loop less often on
+#   quantised models (qwen3-coder int8), and multiple smaller gap-fill rounds
+#   (MAX_GAP_ROUNDS=20) cover more ground than one large looping call.
 DOMAIN_FILE      = "domain_model.json"
 COVERAGE_FILE    = "coverage_report.json"
 
 # Gap-fill: max modules per module-grouped call (covers ~10× more files than pages)
-GAP_FILL_MAX_MODULES = 30
+GAP_FILL_MAX_MODULES = 20
+GAP_FILL_TEMPERATURE = 0.4   # higher temp improves recall of missed items
 # Gap-fill: max individual files per call (fallback when no module structure)
-GAP_FILL_MAX_PAGES = 100
+GAP_FILL_MAX_PAGES   = 100
 # Gap-fill: maximum number of loop rounds.
 # Override with STAGE4_MAX_GAP_ROUNDS=N (e.g. 5 for speed, 20 for thoroughness).
 # Set STAGE4_SKIP_GAP_FILL=1 to bypass all D-calls (fastest, lower page coverage).
@@ -88,6 +192,70 @@ TOP_K_PER_QUERY   = 5
 MAX_TOTAL_CHUNKS  = 25    # hard cap on chunks sent to the LLM
 MAX_CONTEXT_CHARS = 20_000  # soft cap on total context character length
 
+
+def _env_int(name: str, default: int) -> int:
+    """Read integer env var with a sane fallback."""
+    return int(os.environ.get(name, str(default)) or str(default))
+
+
+# Stage 4 prompt profiles: each sub-call now gets only the evidence family it
+# actually needs instead of sharing one giant all-sections prompt.
+_RETRIEVAL_PROFILE_QUERIES: dict[str, list[tuple[str, str]]] = {
+    "A": [
+        RETRIEVAL_QUERIES[0],  # auth
+        RETRIEVAL_QUERIES[1],  # data
+        RETRIEVAL_QUERIES[2],  # features
+        RETRIEVAL_QUERIES[5],  # logic
+    ],
+    "B_CORE": [
+        RETRIEVAL_QUERIES[1],  # data
+        RETRIEVAL_QUERIES[2],  # features
+        RETRIEVAL_QUERIES[3],  # forms
+        RETRIEVAL_QUERIES[5],  # logic
+    ],
+    "B_UI": [
+        RETRIEVAL_QUERIES[2],  # features
+        RETRIEVAL_QUERIES[3],  # forms
+        RETRIEVAL_QUERIES[4],  # nav
+        RETRIEVAL_QUERIES[5],  # logic
+    ],
+    "C_ROLES": [
+        RETRIEVAL_QUERIES[0],  # auth
+        RETRIEVAL_QUERIES[2],  # features
+        RETRIEVAL_QUERIES[4],  # nav
+    ],
+    "C_WORKFLOWS": [
+        RETRIEVAL_QUERIES[0],  # auth
+        RETRIEVAL_QUERIES[2],  # features
+        RETRIEVAL_QUERIES[4],  # nav
+        RETRIEVAL_QUERIES[5],  # logic
+    ],
+    "GAP": [
+        RETRIEVAL_QUERIES[2],  # features
+        RETRIEVAL_QUERIES[3],  # forms
+        RETRIEVAL_QUERIES[4],  # nav
+        RETRIEVAL_QUERIES[5],  # logic
+    ],
+}
+
+_PROFILE_MAX_TOTAL_CHUNKS: dict[str, int] = {
+    "A":           _env_int("STAGE4_A_MAX_TOTAL_CHUNKS", 12),
+    "B_CORE":      _env_int("STAGE4_B_CORE_MAX_TOTAL_CHUNKS", 14),
+    "B_UI":        _env_int("STAGE4_B_UI_MAX_TOTAL_CHUNKS", 14),
+    "C_ROLES":     _env_int("STAGE4_C_ROLES_MAX_TOTAL_CHUNKS", 10),
+    "C_WORKFLOWS": _env_int("STAGE4_C_WORKFLOWS_MAX_TOTAL_CHUNKS", 12),
+    "GAP":         _env_int("STAGE4_GAP_MAX_TOTAL_CHUNKS", 12),
+}
+
+_PROFILE_MAX_CONTEXT_CHARS: dict[str, int] = {
+    "A":           _env_int("STAGE4_A_CONTEXT_CHARS", 8_000),
+    "B_CORE":      _env_int("STAGE4_B_CORE_CONTEXT_CHARS", 10_000),
+    "B_UI":        _env_int("STAGE4_B_UI_CONTEXT_CHARS", 10_000),
+    "C_ROLES":     _env_int("STAGE4_C_ROLES_CONTEXT_CHARS", 6_000),
+    "C_WORKFLOWS": _env_int("STAGE4_C_WORKFLOWS_CONTEXT_CHARS", 8_000),
+    "GAP":         _env_int("STAGE4_GAP_CONTEXT_CHARS", 8_000),
+}
+
 # ── Per-section caps inside _build_user_prompt ────────────────────────────────
 # Large codebases (SuiteCRM, etc.) produce thousands of entries per section.
 # These caps keep the prompt within a manageable token budget while still
@@ -97,11 +265,13 @@ _CAP_EXEC_PATHS    = int(os.environ.get("STAGE4_CAP_EXEC_PATHS",    "40")  or "4
 _CAP_HTTP_EPS      = int(os.environ.get("STAGE4_CAP_HTTP_EPS",      "80")  or "80")
 _CAP_TABLE_COLS    = int(os.environ.get("STAGE4_CAP_TABLE_COLS",     "60")  or "60")
 _CAP_DB_TABLES     = int(os.environ.get("STAGE4_CAP_DB_TABLES",      "60")  or "60")
+_CAP_TS_TYPES      = int(os.environ.get("STAGE4_CAP_TS_TYPES",       "60")  or "60")
 _CAP_FUNCTIONS     = int(os.environ.get("STAGE4_CAP_FUNCTIONS",      "80")  or "80")
 _CAP_CALL_GRAPH    = int(os.environ.get("STAGE4_CAP_CALL_GRAPH",     "40")  or "40")
 _CAP_FORM_FILES    = int(os.environ.get("STAGE4_CAP_FORM_FILES",     "60")  or "60")
 _CAP_REDIRECTS     = int(os.environ.get("STAGE4_CAP_REDIRECTS",      "60")  or "60")
 _CAP_AUTH_SIGNALS  = int(os.environ.get("STAGE4_CAP_AUTH_SIGNALS",   "40")  or "40")
+_CAP_COMPONENTS    = int(os.environ.get("STAGE4_CAP_COMPONENTS",     "60")  or "60")
 
 
 
@@ -135,49 +305,8 @@ def run(ctx: PipelineContext) -> None:
     # ── Pre-flight ────────────────────────────────────────────────────────────
     _assert_prerequisites(ctx)
 
-    print(f"  [stage4] Retrieving codebase context from ChromaDB ...")
-
-    # ── Retrieve chunks ───────────────────────────────────────────────────────
-    chunks = _retrieve_context(ctx)
-    print(f"  [stage4] Retrieved {len(chunks)} unique chunks across "
-          f"{len(RETRIEVAL_QUERIES)} query angles")
-
-    # ── Build shared user prompt (same evidence for all 3 calls) ─────────────
+    print(f"  [stage4] Retrieving targeted codebase context from ChromaDB ...")
     quality_score = _get_quality_score(ctx)
-    user_prompt   = _build_user_prompt(ctx, chunks)
-    print(f"  [stage4] User prompt assembled: {len(user_prompt):,} chars "
-          f"(~{len(user_prompt) // 4:,} tokens)")
-
-    # ── RAG augmentation ──────────────────────────────────────────────────────
-    # When RAG_ENABLED=1, build an FTS5 code chunk index and append the most
-    # relevant snippets to the user prompt.  Particularly useful for large
-    # codebases where the main prompt is already near the context window limit.
-    from pipeline.rag import CodeChunkIndex, is_enabled as _rag_enabled, get_top_k as _rag_top_k
-    if _rag_enabled():
-        _rag_idx = CodeChunkIndex(str(Path(output_path).parent))
-        _rag_idx.build(ctx)
-        _rag_ctx_a = _rag_idx.format_context(
-            "domain entities data models user roles business objects database tables",
-            top_k=_rag_top_k(),
-            header="## RAG: Top relevant code chunks (entities / tables)",
-        )
-        _rag_ctx_b = _rag_idx.format_context(
-            "business features use cases workflows user actions forms authentication",
-            top_k=_rag_top_k(),
-            header="## RAG: Top relevant code chunks (features / workflows)",
-        )
-        _rag_idx.close()
-        if _rag_ctx_a:
-            user_prompt = user_prompt + "\n\n" + _rag_ctx_a
-        print(f"  [stage4] RAG augmentation: +{len(_rag_ctx_a)} chars (entities), "
-              f"+{len(_rag_ctx_b)} chars (features)")
-    else:
-        _rag_ctx_b = ""
-
-    from pipeline.llm_client import get_provider, get_model
-    print(f"  [stage4] LLM: {get_provider()} / {get_model()} | "
-          f"context={len(user_prompt)} chars | quality={quality_score}")
-
     debug_dir = str(Path(output_path).parent)
 
     # ── Build grounding lists from code_map (anti-hallucination) ─────────────
@@ -186,6 +315,17 @@ def run(ctx: PipelineContext) -> None:
         q.get("table", "") for q in (cm.sql_queries or [])
         if q.get("table") and q["table"] not in ("UNKNOWN", "")
     })
+
+    # For TypeScript / serverless projects without SQL, treat type definition
+    # names as the entity vocabulary — equivalent role to known_tables.
+    known_type_names: list[str] = sorted({
+        td.get("name", "") for td in (getattr(cm, "type_definitions", None) or [])
+        if td.get("name")
+    })
+    # Merge into known_tables so _format_schema_grounding and anti-hallucination
+    # filters accept both SQL table names and TS type names as valid entities.
+    if known_type_names and not known_tables:
+        known_tables = known_type_names
 
     # POST field names — used to ground 'inputs' arrays in features so the
     # LLM doesn't hallucinate form fields that don't exist in the codebase.
@@ -211,6 +351,101 @@ def run(ctx: PipelineContext) -> None:
     _tables_cap = int(os.environ.get("STAGE4_TABLES_CAP", "40")  or "40")
     known_pages: list[str] = _build_grounding_pages(cm, cap=_pages_cap)
 
+    prompt_profiles = ["A", "B_CORE", "B_UI", "C_ROLES", "C_WORKFLOWS", "GAP"]
+    prompt_chunks: dict[str, list[dict[str, Any]]] = {}
+
+    # ── Parallel retrieval — all 6 profiles are independent ChromaDB reads ────
+    from pipeline.llm_client import get_max_workers as _max_w_early
+    _ret_workers = _max_w_early()
+
+    def _retrieve_profile(profile: str) -> tuple[str, list]:
+        queries = _RETRIEVAL_PROFILE_QUERIES[profile]
+        chunks  = _retrieve_context(
+            ctx,
+            queries          = queries,
+            max_total_chunks = _PROFILE_MAX_TOTAL_CHUNKS[profile],
+            max_context_chars= _PROFILE_MAX_CONTEXT_CHARS[profile],
+        )
+        return profile, chunks
+
+    if _ret_workers > 1 and len(prompt_profiles) > 1:
+        from concurrent.futures import ThreadPoolExecutor as _RetTPE
+        with _RetTPE(max_workers=min(len(prompt_profiles), _ret_workers)) as _ret_pool:
+            _ret_futs = [_ret_pool.submit(_retrieve_profile, p) for p in prompt_profiles]
+            for fut in _ret_futs:
+                _profile, _chunks = fut.result()
+                prompt_chunks[_profile] = _chunks
+    else:
+        for _p in prompt_profiles:
+            _, _chunks = _retrieve_profile(_p)
+            prompt_chunks[_p] = _chunks
+
+    for profile in prompt_profiles:
+        _queries = _RETRIEVAL_PROFILE_QUERIES[profile]
+        print(
+            f"  [stage4]   {profile:<11} {len(prompt_chunks[profile])} chunk(s) "
+            f"across {len(_queries)} query angles"
+        )
+
+    prompt_a = _build_user_prompt(ctx, prompt_chunks["A"], profile="A")
+    prompt_b_core = _build_user_prompt(ctx, prompt_chunks["B_CORE"], profile="B_CORE")
+    prompt_b_ui = _build_user_prompt(ctx, prompt_chunks["B_UI"], profile="B_UI")
+    prompt_c_roles = _build_user_prompt(ctx, prompt_chunks["C_ROLES"], profile="C_ROLES")
+    prompt_c_workflows = _build_user_prompt(ctx, prompt_chunks["C_WORKFLOWS"], profile="C_WORKFLOWS")
+    gap_prompt = _build_user_prompt(ctx, prompt_chunks["GAP"], profile="GAP")
+
+    # ── RAG augmentation ──────────────────────────────────────────────────────
+    # Keep the RAG snippets targeted too; duplicating them onto every prompt
+    # would push us back toward the same max-model-len problem.
+    from pipeline.rag import CodeChunkIndex, is_enabled as _rag_enabled, get_top_k as _rag_top_k
+    if _rag_enabled():
+        _rag_idx = CodeChunkIndex(str(Path(output_path).parent))
+        _rag_idx.build(ctx)
+        _rag_ctx_a = _rag_idx.format_context(
+            "domain entities data models user roles business objects database tables",
+            top_k=_rag_top_k(),
+            header="## RAG: Top relevant code chunks (entities / tables)",
+        )
+        _rag_ctx_features = _rag_idx.format_context(
+            "business features use cases forms pages workflows user actions",
+            top_k=_rag_top_k(),
+            header="## RAG: Top relevant code chunks (features)",
+        )
+        _rag_ctx_workflows = _rag_idx.format_context(
+            "authentication navigation redirects entry points workflows business operations",
+            top_k=_rag_top_k(),
+            header="## RAG: Top relevant code chunks (workflows / auth)",
+        )
+        _rag_idx.close()
+        if _rag_ctx_a:
+            prompt_a += "\n\n" + _rag_ctx_a
+        if _rag_ctx_features:
+            prompt_b_core += "\n\n" + _rag_ctx_features
+            gap_prompt += "\n\n" + _rag_ctx_features
+        if _rag_ctx_workflows:
+            prompt_c_workflows += "\n\n" + _rag_ctx_workflows
+        print(
+            f"  [stage4] RAG augmentation: "
+            f"+{len(_rag_ctx_a)} chars (A), "
+            f"+{len(_rag_ctx_features)} chars (features), "
+            f"+{len(_rag_ctx_workflows)} chars (workflows)"
+        )
+
+    for _name, _prompt in [
+        ("A", prompt_a),
+        ("B_CORE", prompt_b_core),
+        ("B_UI", prompt_b_ui),
+        ("C_ROLES", prompt_c_roles),
+        ("C_WORKFLOWS", prompt_c_workflows),
+        ("GAP", gap_prompt),
+    ]:
+        print(f"  [stage4] Prompt {_name:<11} {len(_prompt):,} chars "
+              f"(~{len(_prompt) // 4:,} tokens)")
+
+    from pipeline.llm_client import get_provider, get_model, get_max_workers as _max_w
+    print(f"  [stage4] LLM: {get_provider()} / {get_model()} | quality={quality_score}")
+    _workers = _max_w()
+
     # ── Self-consistency voting ───────────────────────────────────────────────
     # STAGE4_CONSISTENCY_RUNS=N runs Calls A and B N times independently and
     # merges results by taking the union of entities/features/contexts.
@@ -229,13 +464,15 @@ def run(ctx: PipelineContext) -> None:
     if len(_ensemble_models) > 1:
         print(f"  [stage4] Ensemble mode: {len(_ensemble_models)} models")
 
-    # ── Calls A + B + C (sequential — Ollama processes one request at a time) ───
+    # ── Calls A + B + C (narrow prompts per sub-task) ───────────────────────
     _sys_b = _system_features(quality_score,
                                known_tables=known_tables,
                                known_pages=known_pages,
                                known_fields=known_fields,
                                table_columns=getattr(cm, "table_columns", None) or [])
-    _user_prompt_b = (user_prompt + "\n\n" + _rag_ctx_b) if _rag_ctx_b else user_prompt
+    _sys_a = _system_meta(quality_score)
+    _sys_c_roles = _system_roles_only(quality_score)
+    _sys_c_workflows = _system_workflows_only(quality_score)
 
     def _make_suffix(mdl_idx: int, run: int, total: int, letter: str) -> str:
         if total == 1:
@@ -244,30 +481,112 @@ def run(ctx: PipelineContext) -> None:
             return f"{letter}{mdl_idx+1}.{run+1}"
         return f"{letter}{run+1}"
 
-    _a_results: list[dict] = []
-    _b_results: list[dict] = []
+    _call_specs: list[CallSpec] = []
     _total_a = _consistency_runs * len(_ensemble_models)
     _total_b = _consistency_runs * len(_ensemble_models)
     for _mi, _mdl in enumerate(_ensemble_models):
         for _run in range(_consistency_runs):
-            raw_a = _call_part(_system_meta(quality_score), user_prompt,
-                               MAX_TOKENS_META, f"stage4-{_make_suffix(_mi, _run, _total_a, 'A')}",
-                               model_override=_mdl)
-            _a_results.append(_parse_partial(raw_a, _make_suffix(_mi, _run, _total_a, "A"), debug_dir))
-            raw_b = _call_part(_sys_b, _user_prompt_b,
-                               MAX_TOKENS_FEATURES, f"stage4-{_make_suffix(_mi, _run, _total_b, 'B')}",
-                               model_override=_mdl)
-            _b_results.append(_parse_partial(raw_b, _make_suffix(_mi, _run, _total_b, "B"), debug_dir))
+            _suffix_a = _make_suffix(_mi, _run, _total_a, "A")
+            _suffix_b = _make_suffix(_mi, _run, _total_b, "B")
 
-    raw_c = _call_part(_system_roles_workflows(quality_score), user_prompt,
-                       MAX_TOKENS_ROLES_WF, "stage4-C")
+            _call_specs.append(CallSpec(
+                group="A", system_prompt=_sys_a, user_prompt=prompt_a,
+                max_tokens=MAX_TOKENS_META,
+                llm_label=f"stage4-{_suffix_a}", parse_label=_suffix_a,
+                model_override=_mdl, json_schema=_SCHEMA_A,
+            ))
+            _call_specs.append(CallSpec(
+                group="B", system_prompt=_sys_b, user_prompt=prompt_b_core,
+                max_tokens=MAX_TOKENS_FEATURES,
+                llm_label=f"stage4-{_suffix_b}-core", parse_label=f"{_suffix_b}-core",
+                model_override=_mdl, json_schema=_SCHEMA_B,
+            ))
+            _call_specs.append(CallSpec(
+                group="B", system_prompt=_sys_b, user_prompt=prompt_b_ui,
+                max_tokens=MAX_TOKENS_FEATURES,
+                llm_label=f"stage4-{_suffix_b}-ui", parse_label=f"{_suffix_b}-ui",
+                model_override=_mdl, json_schema=_SCHEMA_B,
+            ))
+
+    _call_specs.append(CallSpec(
+        group="C", system_prompt=_sys_c_roles, user_prompt=prompt_c_roles,
+        max_tokens=MAX_TOKENS_ROLES_WF,
+        llm_label="stage4-C1", parse_label="C1", model_override=None,
+        json_schema=_SCHEMA_C_ROLES,
+    ))
+    _call_specs.append(CallSpec(
+        group="C", system_prompt=_sys_c_workflows, user_prompt=prompt_c_workflows,
+        max_tokens=MAX_TOKENS_ROLES_WF,
+        llm_label="stage4-C2", parse_label="C2", model_override=None,
+        json_schema=_SCHEMA_C_WORKFLOWS,
+    ))
+
+    def _run_stage4_call(args: CallSpec) -> tuple[str, str, dict]:
+        _group, _system, _user, _max_tokens, _llm_label, _parse_label, _mdl, _schema = args
+        raw = _call_part(
+            _system,
+            _user,
+            _max_tokens,
+            _llm_label,
+            model_override=_mdl,
+            json_schema=_schema,
+        )
+        return _group, _parse_label, _parse_partial(raw, _parse_label, debug_dir)
+
+    if _workers > 1 and len(_call_specs) > 1:
+        from concurrent.futures import ThreadPoolExecutor as _TPE
+        print(f"  [stage4] Running {len(_call_specs)} independent LLM call(s) "
+              f"in parallel (workers={min(len(_call_specs), _workers)}) ...")
+        with _TPE(max_workers=min(len(_call_specs), _workers)) as _pool:
+            # Submit in _call_specs order so results are always collected in the
+            # same order — _merge_consistency_b dedupes by "first seen wins", so
+            # nondeterministic collection via as_completed() would make feature
+            # content vary across runs.
+            _futs = [_pool.submit(_run_stage4_call, spec) for spec in _call_specs]
+
+            # Collect in submission order.  Gather ALL failures before raising so
+            # the user sees every broken call at once rather than first-fail-fast.
+            # Never substitute {} — a silent empty result silently under-populates
+            # the domain model and cascades into degraded BRD/SRS/AC/User Stories.
+            _call_results: list[tuple[str, str, dict]] = []
+            _failures: list[str] = []
+            for _fut, _spec in zip(_futs, _call_specs):
+                _grp, _lbl = _spec.group, _spec.parse_label
+                try:
+                    _call_results.append(_fut.result())
+                except Exception as _exc:
+                    print(f"  [stage4] ✗ Call {_lbl} failed: {_exc}")
+                    _failures.append(f"{_lbl}: {_exc}")
+
+            if _failures:
+                raise RuntimeError(
+                    f"[stage4] {len(_failures)} LLM sub-call(s) failed — "
+                    f"Stage 4 cannot produce a reliable domain model:\n"
+                    + "\n".join(f"  • {f}" for f in _failures)
+                )
+    else:
+        _call_results = [_run_stage4_call(spec) for spec in _call_specs]
+
+    _a_results: list[dict] = []
+    _b_results: list[dict] = []
+    _c_results: dict[str, dict] = {}
+    for _group, _parse_label, _parsed in _call_results:
+        if _group == "A":
+            _a_results.append(_parsed)
+        elif _group == "B":
+            _b_results.append(_parsed)
+        else:
+            _c_results[_parse_label] = _parsed
 
     data_a = _merge_consistency_a(_a_results)
     data_b = _merge_consistency_b(_b_results)
     data_b = _filter_hallucinated_refs(data_b,
                                        known_pages_lower=known_files_all,
                                        known_tables_lower={t.lower() for t in known_tables})
-    data_c = _parse_partial(raw_c, "C", debug_dir)
+    data_c = {
+        **_c_results.get("C1", {}),
+        **_c_results.get("C2", {}),
+    }
 
     # ── Merge all three dicts (A wins on overlaps, B/C fill in their fields) ──
     merged = {**data_a, **data_b, **data_c}
@@ -289,15 +608,27 @@ def run(ctx: PipelineContext) -> None:
             print(f"  [stage4] Gap-fill capped at {MAX_GAP_ROUNDS} rounds "
                   f"(STAGE4_MAX_GAP_ROUNDS={MAX_GAP_ROUNDS})")
         domain_model = _gap_fill_pass(
-            ctx, domain_model, coverage_report, user_prompt, quality_score, debug_dir,
+            ctx, domain_model, coverage_report, gap_prompt, quality_score, debug_dir,
             known_tables=known_tables, known_pages_lower=known_files_all,
             known_fields=known_fields,
         )
 
+    # ── Static table + field enrichment (no LLM) ──────────────────────────────
+    # Derive table and field membership purely from the code_map data already
+    # collected by Stage 1 parsers.  For every file a feature references in
+    # its 'pages' array, look up which SQL tables / POST fields that file uses
+    # and inject them into the feature's tables/inputs arrays.
+    # This is free (no LLM calls) and typically adds 20-40 pp of table/field
+    # coverage that the LLM missed because it only saw ~25 evidence chunks.
+    _t_added, _f_added = _static_enrich_tables_and_fields(domain_model, cm)
+    if _t_added or _f_added:
+        print(f"  [stage4] Static enrichment: +{_t_added} table ref(s), "
+              f"+{_f_added} field ref(s) derived from code_map")
+
     # ── Post-gap-fill coverage (shows improvement vs initial report) ───────────
     # Store result on ctx so stage58/stage59 can reference final coverage data
     # without re-running the computation.  Also writes coverage_report.json.
-    print(f"  [stage4] Coverage after gap-fill:")
+    print(f"  [stage4] Coverage after gap-fill + static enrichment:")
     ctx.domain_coverage = _compute_coverage(ctx, domain_model, debug_dir)
 
     # ── Save ──────────────────────────────────────────────────────────────────
@@ -376,6 +707,8 @@ def _merge_consistency_b(results: list[dict]) -> dict:
     merged_features: list[dict] = []
     for r in results:
         for f in (r.get("features") or []):
+            if not isinstance(f, dict):
+                continue
             key = (f.get("name") or "").strip().lower()
             if key and key not in seen_names:
                 seen_names.add(key)
@@ -388,17 +721,23 @@ def _merge_consistency_b(results: list[dict]) -> dict:
 
 # ─── Retrieval ─────────────────────────────────────────────────────────────────
 
-def _retrieve_context(ctx: PipelineContext) -> list[dict[str, Any]]:
+def _retrieve_context(
+    ctx: PipelineContext,
+    queries: list[tuple[str, str]] | None = None,
+    max_total_chunks: int = MAX_TOTAL_CHUNKS,
+    max_context_chars: int = MAX_CONTEXT_CHARS,
+) -> list[dict[str, Any]]:
     """
     Fire all retrieval queries against ChromaDB and return a deduplicated,
     ranked list of the most relevant chunks.
     """
     from pipeline.stage30_embed import query_collection
 
+    active_queries = queries or RETRIEVAL_QUERIES
     seen_ids: set[str]      = set()
     scored:   list[tuple]   = []   # (score, chunk_dict)
 
-    for query_text, angle in RETRIEVAL_QUERIES:
+    for query_text, angle in active_queries:
         try:
             results = query_collection(ctx, query_text, n_results=TOP_K_PER_QUERY)
         except Exception as e:
@@ -418,14 +757,14 @@ def _retrieve_context(ctx: PipelineContext) -> list[dict[str, Any]]:
 
     # Sort by relevance descending, take top N
     scored.sort(key=lambda x: x[0], reverse=True)
-    top_chunks = [chunk for _, chunk in scored[:MAX_TOTAL_CHUNKS]]
+    top_chunks = [chunk for _, chunk in scored[:max_total_chunks]]
 
-    # Trim to MAX_CONTEXT_CHARS total
+    # Trim to the per-profile character budget
     total_chars = 0
     trimmed = []
     for chunk in top_chunks:
         chunk_len = len(chunk["text"])
-        if total_chars + chunk_len > MAX_CONTEXT_CHARS:
+        if total_chars + chunk_len > max_context_chars:
             break
         trimmed.append(chunk)
         total_chars += chunk_len
@@ -626,11 +965,27 @@ def _format_schema_grounding(
     nullable + FK) for each table.  Falls back to the flat table-name list
     when column data is absent.
     """
-    # Index column data by table name (lower-cased for case-insensitive match)
+    # Index column data by table name (lower-cased for case-insensitive match).
+    # Two formats:
+    #   Format A — flat TableColumnEntry (Prisma/TS/Java): each entry IS one column
+    #              {"table":"users", "column":"email", "nullable":False, ...}
+    #   Format B — grouped DbSchemaEntry (PHP migrations): entry has a columns list
+    #              {"table":"users", "columns":[{"name":"email", ...}], ...}
     col_index: dict[str, list[dict]] = {}
     for entry in (table_columns or []):
         tname = (entry.get("table") or "").strip().lower()
-        if tname:
+        if not tname:
+            continue
+        if entry.get("column"):
+            # Format A: flat — synthesise a column dict matching Format B shape
+            col_index.setdefault(tname, []).append({
+                "name":     entry["column"],
+                "type":     entry.get("type", ""),
+                "nullable": entry.get("nullable", True),
+                "default":  entry.get("default"),
+            })
+        else:
+            # Format B: grouped — entry carries a columns list
             col_index.setdefault(tname, []).extend(entry.get("columns") or [])
 
     lines: list[str] = [
@@ -681,11 +1036,10 @@ def _system_features(
     if known_pages:
         pages_str = ", ".join(known_pages[:250])     # cap to avoid token overflow
         grounding_parts.append(
-            "MANDATORY GROUNDING — ACTUAL PHP PAGE FILES IN THIS CODEBASE:\n"
+            "MANDATORY GROUNDING — ACTUAL SOURCE FILES IN THIS CODEBASE:\n"
             f"{pages_str}\n"
             "You MUST use ONLY filenames from the list above in 'pages' arrays.\n"
-            "Do NOT invent filenames like 'registration.php', 'catalog.php', "
-            "'cart.php', 'checkout.php' unless they actually appear in this list."
+            "Do NOT invent filenames that do not appear in this list."
         )
     if known_fields:
         fields_str = ", ".join(known_fields[:200])   # cap to avoid token overflow
@@ -752,31 +1106,86 @@ Output ONLY this JSON (no other fields):
 Now produce the JSON for user_roles and workflows only:"""
 
 
+def _system_roles_only(quality_score: int) -> str:
+    """Call C1 — user roles only."""
+    return f"""{_get_preamble()}
+{_evidence_instruction(quality_score)}
+
+Output ONLY this JSON (no other fields):
+{{
+  "user_roles": [
+    {{
+      "role": "Role name (e.g. Customer, Admin, Staff)",
+      "description": "What this role can do in the system",
+      "entry_points": ["login.php", "registration.php"]
+    }}
+  ]
+}}
+
+Now produce the JSON for user_roles only:"""
+
+
+def _system_workflows_only(quality_score: int) -> str:
+    """Call C2 — workflows only."""
+    return f"""{_get_preamble()}
+{_evidence_instruction(quality_score)}
+
+Output ONLY this JSON (no other fields):
+{{
+  "workflows": [
+    {{
+      "name": "Workflow name (e.g. Rental Booking Flow)",
+      "actor": "Who performs this workflow",
+      "steps": [
+        {{"step": 1, "action": "User navigates to login.php", "page": "login.php"}},
+        {{"step": 2, "action": "User submits credentials", "page": "login.php"}}
+      ],
+      "preconditions": ["User must have an account"],
+      "postconditions": ["Booking is saved in request table"]
+    }}
+  ]
+}}
+
+Now produce the JSON for workflows only:"""
+
+
 def _group_uncovered_by_module(
     uncovered_files: list[str],
     exec_paths: list[dict],
 ) -> tuple[dict[str, list[str]], list[str]]:
     """
-    Group uncovered file basenames by their module directory.
+    Group uncovered file basenames by their logical module.
+
+    Supports both SugarCRM-style modules/ directories (PHP) and
+    Next.js / TypeScript route-group / feature-directory structure.
+
+    Collision handling: when two files share the same basename (e.g. page.tsx
+    in different route segments), both candidate module names are recorded and
+    the basename is placed in the FIRST module seen — the collision avoidance
+    logic in _build_module_expansion handles cross-module expansion separately.
 
     Returns
     -------
-    module_groups : {module_name: [file1.php, file2.php, ...]}
+    module_groups : {module_name: [file1, file2, ...]}
         Only modules that have at least one uncovered file.
-    flat_remainder : [file.php, ...]
-        Files that are NOT inside a modules/ directory (no module grouping possible).
+    flat_remainder : [file, ...]
+        Files for which no module could be determined.
     """
     from collections import defaultdict
 
-    # Build file-basename → module name map from exec_paths
+    # Build file-basename → module name map from exec_paths.
+    # For collisions (same basename in multiple modules), keep the first module
+    # assigned — gap-fill will retry remaining files in subsequent rounds.
     basename_to_module: dict[str, str] = {}
     for ep in exec_paths:
         f = ep.get("file", "")
         if not f:
             continue
-        mod = _extract_module_name(f)
+        mod = _extract_module_name(f) or _extract_module_name_ts(f)
         if mod:
-            basename_to_module[Path(f).name.lower()] = mod
+            basename = Path(f).name.lower()
+            if basename not in basename_to_module:
+                basename_to_module[basename] = mod
 
     module_groups: dict[str, list[str]] = defaultdict(list)
     flat_remainder: list[str] = []
@@ -795,14 +1204,15 @@ def _system_gap_fill(quality_score: int, uncovered_pages: list[str],
                      existing_feature_names: list[str],
                      known_tables: list[str] | None = None,
                      known_fields: list[str] | None = None,
-                     module_groups: dict[str, list[str]] | None = None) -> str:
+                     module_groups: dict[str, list[str]] | None = None,
+                     language: str = "php") -> str:
     """Call D — gap-fill features for pages not yet covered by known features.
 
     When *module_groups* is supplied the prompt presents modules (with sample
     filenames) instead of bare filenames — one feature per module covers all
     sibling files through module-expansion and is far more token-efficient.
     """
-    existing_str = ", ".join(f'"{n}"' for n in existing_feature_names[:20])
+    existing_str = ", ".join(f'"{n}"' for n in existing_feature_names)
     grounding_parts: list[str] = []
     if known_tables:
         t_str = ", ".join(known_tables[:100])
@@ -817,6 +1227,11 @@ def _system_gap_fill(quality_score: int, uncovered_pages: list[str],
         )
     tables_grounding = ("\n" + "\n\n".join(grounding_parts) + "\n") if grounding_parts else ""
 
+    is_php  = language == "php"
+    file_term  = "PHP files" if is_php else "source files"
+    file_ext   = ".php"     if is_php else ""
+    module_dir = "modules/<ModuleName>/" if is_php else "the application"
+
     if module_groups:
         # Module-grouped format: one feature per module
         module_lines = []
@@ -827,24 +1242,25 @@ def _system_gap_fill(quality_score: int, uncovered_pages: list[str],
         modules_str = "\n".join(module_lines)
 
         coverage_instruction = f"""The following application MODULES are NOT yet covered by any existing feature.
-Each module is a group of PHP files under modules/<ModuleName>/:
+Each module is a group of {file_term} within {module_dir}:
 
 {modules_str}
 
 Existing features already extracted (do NOT duplicate): {existing_str}
 
 Create ONE feature per module (or merge closely related small modules into one feature).
-Each feature's "pages" array MUST include the representative PHP filenames listed above."""
+Each feature's "pages" array MUST include the representative filenames listed above."""
     else:
         pages_str = ", ".join(f'"{p}"' for p in uncovered_pages)
-        coverage_instruction = f"""The following PHP pages are NOT yet covered by any existing feature:
+        coverage_instruction = f"""The following {file_term} are NOT yet covered by any existing feature:
 {pages_str}
 
 Existing features already extracted (do NOT duplicate): {existing_str}
 
-For each uncovered page, determine what business feature it represents.
-Group multiple uncovered pages under one feature if they implement the same business function."""
+For each uncovered file, determine what business feature it represents.
+Group multiple uncovered files under one feature if they implement the same business function."""
 
+    example_file = f"representative_file{file_ext}"
     return f"""{_get_preamble()}
 {_evidence_instruction(quality_score)}{tables_grounding}
 
@@ -856,7 +1272,7 @@ Output ONLY this JSON (no other fields):
     {{
       "name": "Feature name",
       "description": "What this feature does from a business perspective",
-      "pages": ["representative_file.php"],
+      "pages": ["{example_file}"],
       "tables": ["relevant_table"],
       "inputs": ["field1", "field2"],
       "outputs": "What the user gets after completing this feature",
@@ -889,11 +1305,83 @@ def _rag_sort(items: list, key_fn, relevant_stems: set[str]) -> list:
     return sorted(items, key=lambda x: (0 if Path(key_fn(x)).stem.lower() in relevant_stems else 1))
 
 
-def _build_user_prompt(ctx: PipelineContext, chunks: list[dict]) -> str:
+def _build_user_prompt(
+    ctx: PipelineContext,
+    chunks: list[dict],
+    profile: str = "full",
+) -> str:
     """
     Assemble the user prompt from retrieved chunks, CodeMap metadata,
     and graph summary.
     """
+    profile = (profile or "full").upper()
+    _is_full = profile in {"FULL", "ALL"}
+
+    _include_db_tables     = _is_full or profile in {"B_CORE", "GAP"}
+    _include_ts_types      = _is_full or profile in {"A", "B_CORE", "GAP"}
+    _include_components    = _is_full or profile in {"B_UI", "GAP"}
+    _include_form_inputs   = _is_full or profile in {"B_UI", "GAP", "C_WORKFLOWS"}
+    _include_redirects     = _is_full or profile in {"B_UI", "GAP", "C_WORKFLOWS"}
+    _include_pages         = _is_full or profile in {"B_UI", "GAP", "C_WORKFLOWS"}
+    _include_functions     = _is_full
+    _include_call_graph    = _is_full
+    _include_form_fields   = _is_full or profile in {"B_UI", "GAP", "C_WORKFLOWS"}
+    _include_service_deps  = _is_full
+    _include_env_vars      = _is_full
+    _include_sem_roles     = _is_full or profile in {"A", "C_ROLES", "C_WORKFLOWS"}
+    _include_ext_systems   = _is_full or profile in {"A"}
+    _include_db_schema     = _is_full or profile in {"B_CORE", "GAP"}
+    _include_auth_signals  = _is_full or profile in {"C_ROLES", "C_WORKFLOWS", "GAP"}
+    _include_http_eps      = _is_full or profile in {"B_UI", "GAP", "C_ROLES", "C_WORKFLOWS"}
+    _include_table_cols    = _is_full or profile in {"A", "B_CORE", "GAP"}
+    _include_exec_paths    = _is_full or profile in {"B_CORE", "B_UI", "GAP", "C_WORKFLOWS"}
+    _include_modules       = _is_full or profile in {"A"}
+    _include_entities      = _is_full or profile in {"A", "B_CORE", "GAP"}
+    _include_relationships = _is_full or profile in {"A", "B_CORE", "GAP"}
+    _include_rules         = _is_full or profile in {"B_CORE", "GAP", "C_WORKFLOWS"}
+    _include_state         = _is_full or profile in {"B_CORE", "GAP", "C_WORKFLOWS"}
+    _include_graphrag      = _is_full or profile in {"B_CORE", "B_UI", "GAP", "C_ROLES", "C_WORKFLOWS"}
+
+    if profile == "A":
+        _cap_db_tables = min(_CAP_DB_TABLES, 12)
+        _cap_ts_types = min(_CAP_TS_TYPES, 20)
+        _cap_table_cols = min(_CAP_TABLE_COLS, 20)
+        _cap_modules = 25
+        _cap_entities = 20
+        _cap_relationships = 20
+        _cap_type_fields = 10
+        _cap_graphrag_chars = 1_200
+        _cap_table_refs = 4
+    elif profile == "B_CORE":
+        _cap_db_tables = min(_CAP_DB_TABLES, 20)
+        _cap_ts_types = min(_CAP_TS_TYPES, 30)
+        _cap_table_cols = min(_CAP_TABLE_COLS, 30)
+        _cap_modules = 20
+        _cap_entities = 25
+        _cap_relationships = 25
+        _cap_type_fields = 12
+        _cap_graphrag_chars = 1_800
+        _cap_table_refs = 5
+    else:
+        _cap_db_tables = _CAP_DB_TABLES if _is_full else min(_CAP_DB_TABLES, 40)
+        _cap_ts_types = _CAP_TS_TYPES if _is_full else min(_CAP_TS_TYPES, 40)
+        _cap_table_cols = _CAP_TABLE_COLS if _is_full else min(_CAP_TABLE_COLS, 40)
+        _cap_modules = 40 if not _is_full else 999_999
+        _cap_entities = 30 if not _is_full else 999_999
+        _cap_relationships = 40 if not _is_full else 999_999
+        _cap_type_fields = 12 if not _is_full else 999_999
+        _cap_graphrag_chars = 2_000 if not _is_full else 10_000
+        _cap_table_refs = 6 if not _is_full else 999_999
+
+    _cap_components = _CAP_COMPONENTS if _is_full else min(_CAP_COMPONENTS, 40)
+    _cap_form_files = _CAP_FORM_FILES if _is_full else min(_CAP_FORM_FILES, 40)
+    _cap_redirects = _CAP_REDIRECTS if _is_full else min(_CAP_REDIRECTS, 40)
+    _cap_functions = _CAP_FUNCTIONS if _is_full else min(_CAP_FUNCTIONS, 40)
+    _cap_call_graph = _CAP_CALL_GRAPH if _is_full else min(_CAP_CALL_GRAPH, 25)
+    _cap_auth_signals = _CAP_AUTH_SIGNALS if _is_full else min(_CAP_AUTH_SIGNALS, 30)
+    _cap_http_eps = _CAP_HTTP_EPS if _is_full else min(_CAP_HTTP_EPS, 40)
+    _cap_exec_paths = _CAP_EXEC_PATHS if _is_full else min(_CAP_EXEC_PATHS, 20)
+
     parts: list[str] = []
     _rel_stems = _rag_relevant_stems(chunks)   # files surfaced by RAG — prioritised in caps
 
@@ -916,8 +1404,8 @@ def _build_user_prompt(ctx: PipelineContext, chunks: list[dict]) -> str:
         q.get("table", "") for q in cm.sql_queries
         if q.get("table") and q["table"] not in ("UNKNOWN", "")
     })
-    if unique_tables:
-        _shown_tables = unique_tables[:_CAP_DB_TABLES] if _CAP_DB_TABLES > 0 else unique_tables
+    if _include_db_tables and unique_tables:
+        _shown_tables = unique_tables[:_cap_db_tables] if _cap_db_tables > 0 else unique_tables
         _omitted_tbl  = len(unique_tables) - len(_shown_tables)
         parts.append(f"\n=== DATABASE TABLES ({len(unique_tables)} total"
                      + (f", showing {len(_shown_tables)})" if _omitted_tbl else ")"))
@@ -935,22 +1423,163 @@ def _build_user_prompt(ctx: PipelineContext, chunks: list[dict]) -> str:
                           if q.get("table") == table
                           and q.get("operation") in ("CREATE","ALTER","DROP")})
             lines = [f"Table '{table}':"]
-            if ddl:     lines.append(f"  Schema defined in: {', '.join(ddl)}")
-            if writers: lines.append(f"  Written by: {', '.join(writers)}")
-            if readers: lines.append(f"  Read by: {', '.join(readers)}")
+            if ddl:
+                _ddl = ddl[:_cap_table_refs]
+                _suffix = f" ... +{len(ddl) - len(_ddl)} more" if len(ddl) > len(_ddl) else ""
+                lines.append(f"  Schema defined in: {', '.join(_ddl)}{_suffix}")
+            if writers:
+                _writers = writers[:_cap_table_refs]
+                _suffix = f" ... +{len(writers) - len(_writers)} more" if len(writers) > len(_writers) else ""
+                lines.append(f"  Written by: {', '.join(_writers)}{_suffix}")
+            if readers:
+                _readers = readers[:_cap_table_refs]
+                _suffix = f" ... +{len(readers) - len(_readers)} more" if len(readers) > len(_readers) else ""
+                lines.append(f"  Read by: {', '.join(_readers)}{_suffix}")
             parts.append("\n".join(lines))
 
+    # ── TypeScript type definitions (interfaces + type aliases) ─────────────
+    # This is the primary schema source of truth for serverless/NoSQL projects
+    # that have no SQL tables or ORM models.  Always shown when present so the
+    # LLM can ground entity names, field names, and relationships.
+    _ts_types = getattr(cm, "type_definitions", None) or []
+    if _include_ts_types and _ts_types:
+        _shown_types = _ts_types[:_cap_ts_types] if _cap_ts_types > 0 else _ts_types
+        _omitted_ty  = len(_ts_types) - len(_shown_types)
+        parts.append(
+            f"\n=== TYPESCRIPT TYPE DEFINITIONS ({len(_ts_types)} total"
+            + (f", showing {len(_shown_types)})" if _omitted_ty else ")")
+            + " — treat as the data schema ===" )
+        for td in _shown_types:
+            kind   = td.get("kind", "interface")
+            name   = td.get("name", "?")
+            src_f  = Path(td.get("file", "")).name
+            fields = td.get("fields", [])
+            if fields:
+                field_strs = [
+                    f"{f['name']}{'?' if f.get('optional') else ''}: {f.get('type','any')}"
+                    for f in fields[:_cap_type_fields]
+                ]
+                if len(fields) > _cap_type_fields:
+                    field_strs.append(f"... +{len(fields) - _cap_type_fields} more")
+                parts.append(f"  {kind} {name}  [{src_f}]")
+                parts.append(f"    fields: {', '.join(field_strs)}")
+            else:
+                parts.append(f"  {kind} {name}  [{src_f}]  (no fields extracted)")
+        if _omitted_ty:
+            parts.append(f"  … +{_omitted_ty} more type definitions omitted")
+
+    # ── Component hierarchy (stage22) ────────────────────────────────────────
+    # Feed page-level component trees to the LLM so it sees distinct features
+    # (e.g. SprintPlanningTab, RiskRegisterTab) as separate documented features
+    # rather than one undifferentiated "Dashboard" page.
+    components = getattr(cm, "components", None) or []
+    if _include_components and components:
+        pages    = [c for c in components if c.get("is_page")]
+        non_pages = [c for c in components if not c.get("is_page")]
+
+        # Build a name→file lookup for quick child resolution
+        _name_to_file: dict[str, str] = {
+            c["name"]: c["file"] for c in components if c.get("name") and c.get("file")
+        }
+
+        _shown_comps = components[:_cap_components] if _cap_components > 0 else components
+        _omit_comp   = len(components) - len(_shown_comps)
+
+        parts.append(
+            f"\n=== COMPONENT HIERARCHY ({len(components)} total"
+            + (f", showing {len(_shown_comps)}" if _omit_comp else "")
+            + f" | {len(pages)} page(s), {len(non_pages)} shared component(s)) ==="
+        )
+        parts.append(
+            "These are the frontend React/Vue components extracted from Stage 2.2. "
+            "Page-level components are labelled with their route. "
+            "Each component's children list reveals sub-features visible on that page. "
+            "Use this hierarchy to identify distinct functional areas and user workflows."
+        )
+
+        # Show pages first (they are the feature entry points)
+        _page_shown = 0
+        for comp in _shown_comps:
+            if not comp.get("is_page"):
+                continue
+            _page_shown += 1
+            name   = comp.get("name", "?")
+            file_  = comp.get("file", "?")
+            route  = comp.get("route", "")
+            hooks  = comp.get("hooks", [])
+            ch     = comp.get("children", [])
+            props  = comp.get("props", [])
+
+            route_str = f"  route={route}" if route else ""
+            parts.append(f"\n  [PAGE] {name}  ({file_}){route_str}")
+            if props:
+                parts.append(f"    props: {', '.join(props[:8])}")
+            if hooks:
+                parts.append(f"    hooks: {', '.join(hooks[:6])}")
+            if ch:
+                # Prefer pre-resolved children_files dict (stage22 post-process);
+                # fall back to runtime lookup for old component_graph.json files.
+                # children_files values are list[str] — len>1 means a name collision.
+                _cf = comp.get("children_files") or {}
+                ch_resolved = []
+                for child_name in ch[:12]:
+                    paths = _cf.get(child_name)
+                    if paths is None:
+                        # old graph (str value) or runtime fallback
+                        legacy = _name_to_file.get(child_name)
+                        paths = [legacy] if legacy else None
+                    elif isinstance(paths, str):
+                        # old graph serialised as plain string — normalise to list
+                        paths = [paths]
+                    if paths:
+                        if len(paths) == 1:
+                            ch_resolved.append(f"{child_name} ({paths[0]})")
+                        else:
+                            # Ambiguous: two+ components share this name
+                            joined = ", ".join(paths[:3])
+                            ch_resolved.append(
+                                f"{child_name} ({len(paths)} matches: {joined})"
+                            )
+                    else:
+                        ch_resolved.append(child_name)
+                parts.append(f"    children: {', '.join(ch_resolved)}")
+
+        # Then shared/reusable components (condensed — one line each)
+        _shared_lines = []
+        for comp in _shown_comps:
+            if comp.get("is_page"):
+                continue
+            name   = comp.get("name", "?")
+            file_  = comp.get("file", "?")
+            hooks  = comp.get("hooks", [])
+            ch     = comp.get("children", [])
+            line   = f"  [COMPONENT] {name}  ({file_})"
+            if hooks:
+                line += f"  hooks=[{', '.join(hooks[:4])}]"
+            if ch:
+                line += f"  children=[{', '.join(ch[:6])}]"
+            _shared_lines.append(line)
+
+        if _shared_lines:
+            parts.append("\n  Shared / reusable components:")
+            parts.extend(_shared_lines[:30])   # cap to avoid excessive prompt bloat
+            if len(_shared_lines) > 30:
+                parts.append(f"  … +{len(_shared_lines) - 30} more shared components omitted")
+
+        if _omit_comp:
+            parts.append(f"  … +{_omit_comp} more components omitted (raise STAGE4_CAP_COMPONENTS to include)")
+
     # ── Form inputs summary ───────────────────────────────────────────────────
-    if cm.superglobals:
+    if _include_form_inputs and cm.superglobals:
         parts.append(f"\n=== FORM INPUTS (by page) ===")
         from collections import defaultdict
         sg_by_file: dict[str, list] = defaultdict(list)
         for sg in cm.superglobals:
             sg_by_file[sg["file"]].append(sg)
         _form_files = _rag_sort(list(sg_by_file.items()), lambda x: x[0], _rel_stems)
-        if _CAP_FORM_FILES > 0 and len(_form_files) > _CAP_FORM_FILES:
-            parts.append(f"  (showing {_CAP_FORM_FILES}/{len(_form_files)} files — RAG-prioritised)")
-            _form_files = _form_files[:_CAP_FORM_FILES]
+        if _cap_form_files > 0 and len(_form_files) > _cap_form_files:
+            parts.append(f"  (showing {_cap_form_files}/{len(_form_files)} files — RAG-prioritised)")
+            _form_files = _form_files[:_cap_form_files]
         for filepath, sgs in _form_files:
             filename  = Path(filepath).name
             post_keys = sorted({s["key"] for s in sgs
@@ -963,12 +1592,12 @@ def _build_user_prompt(ctx: PipelineContext, chunks: list[dict]) -> str:
                 parts.append(f"{filename} SESSION keys: {', '.join(sess_keys)}")
 
     # ── Redirect / navigation summary ────────────────────────────────────────
-    if cm.redirects:
+    if _include_redirects and cm.redirects:
         _redirects = _rag_sort(list(cm.redirects), lambda r: r.get("file", ""), _rel_stems)
         _omit_r = 0
-        if _CAP_REDIRECTS > 0 and len(_redirects) > _CAP_REDIRECTS:
-            _omit_r = len(_redirects) - _CAP_REDIRECTS
-            _redirects = _redirects[:_CAP_REDIRECTS]
+        if _cap_redirects > 0 and len(_redirects) > _cap_redirects:
+            _omit_r = len(_redirects) - _cap_redirects
+            _redirects = _redirects[:_cap_redirects]
         parts.append(f"\n=== NAVIGATION / REDIRECTS"
                      + (f" ({len(cm.redirects)} total, showing {len(_redirects)})" if _omit_r else "") + " ===")
         for r in _redirects:
@@ -978,32 +1607,36 @@ def _build_user_prompt(ctx: PipelineContext, chunks: list[dict]) -> str:
             parts.append(f"  … +{_omit_r} more redirects omitted")
 
     # ── HTML pages (entry points) ─────────────────────────────────────────────
-    if cm.html_pages:
+    if _include_pages and cm.html_pages:
         parts.append(f"\n=== PAGE ENTRY POINTS ===")
         parts.append(", ".join(Path(p).name for p in sorted(cm.html_pages)))
 
     # ── Functions ─────────────────────────────────────────────────────────────
-    if cm.functions:
+    if _include_functions and cm.functions:
         _fns = cm.functions
         _omit_fn = 0
-        if _CAP_FUNCTIONS > 0 and len(_fns) > _CAP_FUNCTIONS:
-            _omit_fn = len(_fns) - _CAP_FUNCTIONS
-            _fns = _fns[:_CAP_FUNCTIONS]
+        if _cap_functions > 0 and len(_fns) > _cap_functions:
+            _omit_fn = len(_fns) - _cap_functions
+            _fns = _fns[:_cap_functions]
         parts.append(f"\n=== USER-DEFINED FUNCTIONS ({len(cm.functions)} total"
                      + (f", showing {len(_fns)})" if _omit_fn else ")"))
         for fn in _fns:
             params = [p["name"] for p in fn.get("params", [])]
-            doc    = fn.get("docblock") or ""
+            db     = fn.get("docblock") or {}
+            doc    = db.get("summary", "")
+            doc_ret = db.get("return") or ""
             line   = f"  {fn['name']}({', '.join(params)})"
             if doc:
                 line += f" — {doc}"
+            if doc_ret and doc_ret.strip() != (fn.get("return_type") or "").strip():
+                line += f" [returns: {doc_ret}]"
             parts.append(line)
         if _omit_fn:
             parts.append(f"  … +{_omit_fn} more functions omitted")
 
     # ── Call graph ────────────────────────────────────────────────────────────
     call_graph = getattr(cm, "call_graph", None) or []
-    if call_graph:
+    if _include_call_graph and call_graph:
         parts.append(f"\n=== FUNCTION CALL GRAPH ({len(call_graph)} edges) ===")
         # Group by file for readability
         from collections import defaultdict
@@ -1014,9 +1647,9 @@ def _build_user_prompt(ctx: PipelineContext, chunks: list[dict]) -> str:
             )
         _cg_files = _rag_sort(list(by_file.items()), lambda x: x[0], _rel_stems)
         _omit_cg = 0
-        if _CAP_CALL_GRAPH > 0 and len(_cg_files) > _CAP_CALL_GRAPH:
-            _omit_cg = len(_cg_files) - _CAP_CALL_GRAPH
-            _cg_files = _cg_files[:_CAP_CALL_GRAPH]
+        if _cap_call_graph > 0 and len(_cg_files) > _cap_call_graph:
+            _omit_cg = len(_cg_files) - _cap_call_graph
+            _cg_files = _cg_files[:_cap_call_graph]
         for fpath, edges in _cg_files:
             parts.append(f"{Path(fpath).name}: {', '.join(edges[:8])}"
                          + (" ..." if len(edges) > 8 else ""))
@@ -1025,7 +1658,7 @@ def _build_user_prompt(ctx: PipelineContext, chunks: list[dict]) -> str:
 
     # ── Form fields ───────────────────────────────────────────────────────────
     form_fields = getattr(cm, "form_fields", None) or []
-    if form_fields:
+    if _include_form_fields and form_fields:
         parts.append(f"\n=== HTML FORM FIELDS ===")
         for form in form_fields:
             fname  = Path(form.get("file","?")).name
@@ -1036,7 +1669,7 @@ def _build_user_prompt(ctx: PipelineContext, chunks: list[dict]) -> str:
 
     # ── Service dependencies ──────────────────────────────────────────────────
     service_deps = getattr(cm, "service_deps", None) or []
-    if service_deps:
+    if _include_service_deps and service_deps:
         parts.append(f"\n=== SERVICE DEPENDENCIES (DI / Constructor Injection) ===")
         from collections import defaultdict
         deps_by_class: dict = defaultdict(list)
@@ -1047,7 +1680,7 @@ def _build_user_prompt(ctx: PipelineContext, chunks: list[dict]) -> str:
 
     # ── Environment variables ─────────────────────────────────────────────────
     env_vars = getattr(cm, "env_vars", None) or []
-    if env_vars:
+    if _include_env_vars and env_vars:
         parts.append(f"\n=== ENVIRONMENT VARIABLES ===")
         # Group by category prefix (DB_, MAIL_, APP_, etc.)
         from collections import defaultdict
@@ -1066,7 +1699,7 @@ def _build_user_prompt(ctx: PipelineContext, chunks: list[dict]) -> str:
     # grounded user-role names instead of having to guess from file names.
     # Also exposes detected external integrations (Stripe, email, S3, …).
     sr = getattr(ctx, "semantic_roles", None)
-    if sr:
+    if _include_sem_roles and sr:
         biz_actions = [t for t in (sr.actions or [])
                        if t.role == "BUSINESS_ACTION" and t.confidence >= 0.70]
         if biz_actions:
@@ -1083,7 +1716,7 @@ def _build_user_prompt(ctx: PipelineContext, chunks: list[dict]) -> str:
             for _actor, _syms in sorted(_by_actor.items()):
                 parts.append(f"  Actor '{_actor}': {', '.join(_syms[:6])}"
                              + (" …" if len(_syms) > 6 else ""))
-        if sr.external_systems:
+        if _include_ext_systems and sr.external_systems:
             parts.append(f"\n=== EXTERNAL SYSTEM INTEGRATIONS — STAGE 2.7 ===")
             parts.append(
                 "These external systems were detected from env-var keys, class names, "
@@ -1097,7 +1730,7 @@ def _build_user_prompt(ctx: PipelineContext, chunks: list[dict]) -> str:
     # Migration history gives schema-evolution context: which tables were
     # created/altered and with what columns — useful for entity lifecycle.
     db_schema = getattr(cm, "db_schema", None) or []
-    if db_schema:
+    if _include_db_schema and db_schema:
         parts.append(f"\n=== DB SCHEMA / MIGRATIONS ({len(db_schema)} migration(s)) ===")
         parts.append("Use for entity lifecycle, column-level data model, and schema evolution.")
         _seen_mig: set = set()
@@ -1115,16 +1748,19 @@ def _build_user_prompt(ctx: PipelineContext, chunks: list[dict]) -> str:
 
     # ── Auth signals ──────────────────────────────────────────────────────────
     auth_signals = getattr(cm, "auth_signals", None) or []
-    if auth_signals:
+    if _include_auth_signals and auth_signals:
         from collections import Counter as _Counter
         parts.append(f"\n=== AUTHENTICATION & AUTHORISATION SIGNALS ===")
-        by_type: _Counter = _Counter(s["type"] for s in auth_signals)
+        # PHP parser uses "type"; TypeScript parser uses "kind" — accept both
+        def _sig_type(s: dict) -> str:
+            return s.get("type") or s.get("kind") or "unknown"
+        by_type: _Counter = _Counter(_sig_type(s) for s in auth_signals)
         parts.append("  Signal counts: " + ", ".join(
             f"{t}={n}" for t, n in sorted(by_type.items())))
         seen_pats: set = set()
         _auth_shown = 0
         for sig in auth_signals:
-            if _CAP_AUTH_SIGNALS > 0 and _auth_shown >= _CAP_AUTH_SIGNALS:
+            if _cap_auth_signals > 0 and _auth_shown >= _cap_auth_signals:
                 parts.append(f"  … +{len(auth_signals) - _auth_shown} more signals omitted")
                 break
             pat = sig.get("pattern", "?")
@@ -1133,17 +1769,17 @@ def _build_user_prompt(ctx: PipelineContext, chunks: list[dict]) -> str:
             seen_pats.add(pat)
             _auth_shown += 1
             detail = f" [{sig['detail']}]" if sig.get("detail") else ""
-            parts.append(f"  {sig['type']}: {pat}{detail}"
+            parts.append(f"  {_sig_type(sig)}: {pat}{detail}"
                          f" ({Path(sig.get('file','?')).name}:{sig.get('line','?')})")
 
     # ── HTTP entry points ─────────────────────────────────────────────────────
     http_endpoints = getattr(cm, "http_endpoints", None) or []
-    if http_endpoints:
+    if _include_http_eps and http_endpoints:
         _eps = http_endpoints
         _omit_ep = 0
-        if _CAP_HTTP_EPS > 0 and len(_eps) > _CAP_HTTP_EPS:
-            _omit_ep = len(_eps) - _CAP_HTTP_EPS
-            _eps = _eps[:_CAP_HTTP_EPS]
+        if _cap_http_eps > 0 and len(_eps) > _cap_http_eps:
+            _omit_ep = len(_eps) - _cap_http_eps
+            _eps = _eps[:_cap_http_eps]
         parts.append(f"\n=== HTTP ENTRY POINTS ({len(http_endpoints)} total"
                      + (f", showing {len(_eps)})" if _omit_ep else ")"))
         for ep in _eps:
@@ -1157,12 +1793,12 @@ def _build_user_prompt(ctx: PipelineContext, chunks: list[dict]) -> str:
 
     # ── Table/column definitions ──────────────────────────────────────────────
     table_columns = getattr(cm, "table_columns", None) or []
-    if table_columns:
+    if _include_table_cols and table_columns:
         _tcols = table_columns
         _omit_tc = 0
-        if _CAP_TABLE_COLS > 0 and len(_tcols) > _CAP_TABLE_COLS:
-            _omit_tc = len(_tcols) - _CAP_TABLE_COLS
-            _tcols = _tcols[:_CAP_TABLE_COLS]
+        if _cap_table_cols > 0 and len(_tcols) > _cap_table_cols:
+            _omit_tc = len(_tcols) - _cap_table_cols
+            _tcols = _tcols[:_cap_table_cols]
         parts.append(f"\n=== DATABASE TABLES & COLUMNS ({len(table_columns)} tables"
                      + (f", showing {len(_tcols)})" if _omit_tc else ")"))
         for tbl in _tcols:
@@ -1178,12 +1814,12 @@ def _build_user_prompt(ctx: PipelineContext, chunks: list[dict]) -> str:
 
     # ── Execution paths (stage15) ────────────────────────────────────────────
     exec_paths = getattr(cm, "execution_paths", None) or []
-    if exec_paths:
+    if _include_exec_paths and exec_paths:
         _exps = _rag_sort(list(exec_paths), lambda ep: ep.get("file", ""), _rel_stems)
         _omit_exp = 0
-        if _CAP_EXEC_PATHS > 0 and len(_exps) > _CAP_EXEC_PATHS:
-            _omit_exp = len(_exps) - _CAP_EXEC_PATHS
-            _exps = _exps[:_CAP_EXEC_PATHS]
+        if _cap_exec_paths > 0 and len(_exps) > _cap_exec_paths:
+            _omit_exp = len(_exps) - _cap_exec_paths
+            _exps = _exps[:_cap_exec_paths]
         parts.append(f"\n=== EXECUTION PATHS & BRANCH ANALYSIS ({len(exec_paths)} files"
                      + (f", showing {len(_exps)})" if _omit_exp else ")"))
         parts.append(
@@ -1196,15 +1832,18 @@ def _build_user_prompt(ctx: PipelineContext, chunks: list[dict]) -> str:
 
             # Auth guard
             ag = ep.get("auth_guard")
-            if ag:
+            if ag and ag.get("present", True):
+                key = ag.get("key") or ag.get("guard") or "auth"
                 parts.append(
-                    f"  Auth guard: session['{ag['key']}'] required "
+                    f"  Auth guard: {key!r} required "
                     f"(else redirect → {ag.get('redirect','?')})"
                 )
 
-            # Entry conditions
+            # Entry conditions (PHP: dicts with "type"; TS: plain strings)
             for ec in ep.get("entry_conditions", []):
-                if ec.get("type") == "method_check":
+                if isinstance(ec, str):
+                    parts.append(f"  Condition: {ec}")
+                elif isinstance(ec, dict) and ec.get("type") == "method_check":
                     parts.append(f"  Accepts: HTTP {ec.get('method','?')}")
 
             # Happy path (primary success scenario)
@@ -1214,8 +1853,10 @@ def _build_user_prompt(ctx: PipelineContext, chunks: list[dict]) -> str:
                 for step in hp:
                     parts.append(f"    → {step}")
 
-            # Data flows
-            for flow in ep.get("data_flows", []):
+            # Data flows (PHP: "data_flows" list of dicts; TS: "data_flow")
+            for flow in ep.get("data_flows", ep.get("data_flow", [])):
+                if not isinstance(flow, dict):
+                    continue
                 fields = ", ".join(flow.get("field_mapping", {}).keys())
                 table  = flow.get("table", "?")
                 op     = flow.get("sink", "sql_query")
@@ -1224,18 +1865,24 @@ def _build_user_prompt(ctx: PipelineContext, chunks: list[dict]) -> str:
                         f"  Data flow: POST fields [{fields}] → {op} on `{table}`"
                     )
 
-            # Branches summary (condition + outcome)
-            branches = ep.get("branches", [])
+            # Branches summary (PHP: "branches" with then/else; TS: "branch_map" with outcome)
+            branches = ep.get("branches", ep.get("branch_map", []))
             if branches:
                 parts.append(f"  Branches ({len(branches)}):")
                 for b in branches[:3]:          # cap at 3 per file
+                    if not isinstance(b, dict):
+                        continue
                     cond = b.get("condition","?")[:80]
-                    then = [a.get("action","?") for a in b.get("then",[])]
-                    els  = [a.get("action","?") for a in b.get("else",[])]
-                    parts.append(f"    if ({cond})")
-                    parts.append(f"      then: {', '.join(then) or 'none'}")
-                    if els:
-                        parts.append(f"      else: {', '.join(els)}")
+                    # PHP format: then/else lists; TS format: outcome string
+                    if "outcome" in b:
+                        parts.append(f"    if ({cond}) → {b['outcome']}")
+                    else:
+                        then = [a.get("action","?") for a in b.get("then",[])]
+                        els  = [a.get("action","?") for a in b.get("else",[])]
+                        parts.append(f"    if ({cond})")
+                        parts.append(f"      then: {', '.join(then) or 'none'}")
+                        if els:
+                            parts.append(f"      else: {', '.join(els)}")
         if _omit_exp:
             parts.append(f"\n  … +{_omit_exp} more execution-path files omitted")
 
@@ -1243,7 +1890,7 @@ def _build_user_prompt(ctx: PipelineContext, chunks: list[dict]) -> str:
     # Pre-seed the LLM with structurally-detected bounded contexts so it
     # refines evidence-based modules rather than inventing them from scratch.
     detected_modules = _modules_from_graph(ctx)
-    if detected_modules:
+    if _include_modules and detected_modules:
         parts.append(f"\n=== STRUCTURALLY DETECTED MODULES ({len(detected_modules)}) ===")
         parts.append(
             "These modules were detected automatically from directory structure, "
@@ -1251,7 +1898,8 @@ def _build_user_prompt(ctx: PipelineContext, chunks: list[dict]) -> str:
             "for bounded_contexts — rename or merge if the code evidence warrants it, "
             "but do not drop modules that have significant node counts."
         )
-        for mod_id, info in sorted(detected_modules.items()):
+        _mods = list(sorted(detected_modules.items()))[:_cap_modules]
+        for mod_id, info in _mods:
             method  = info.get("method", "unknown")
             q_score = info.get("q_score")
             count   = info.get("node_count", 0)
@@ -1263,13 +1911,15 @@ def _build_user_prompt(ctx: PipelineContext, chunks: list[dict]) -> str:
                 f"  detection={method}{q_str}"
                 f"  ({type_summary})"
             )
+        if len(detected_modules) > len(_mods):
+            parts.append(f"  … +{len(detected_modules) - len(_mods)} more modules omitted")
 
     # ── Action Clusters from Stage 2.8 ───────────────────────────────────────
     # Provide the similarity-based cluster map as an alternative bounded-context
     # seed.  This is especially useful when the Stage 2 graph was built without
     # community detection (no detected_modules) or the graph is absent.
     ac = getattr(ctx, "action_clusters", None)
-    if ac and ac.clusters and not detected_modules:
+    if _include_modules and ac and ac.clusters and not detected_modules:
         parts.append(f"\n=== ACTION CLUSTERS — STAGE 2.8 ({len(ac.clusters)}) ===")
         parts.append(
             "These clusters were computed from shared DB tables, route prefixes, "
@@ -1289,7 +1939,7 @@ def _build_user_prompt(ctx: PipelineContext, chunks: list[dict]) -> str:
 
     # ── Entities from Stage 4.1 ──────────────────────────────────────────────
     ent_col = getattr(ctx, "entities", None)
-    if ent_col and ent_col.entities:
+    if _include_entities and ent_col and ent_col.entities:
         core_ents = [e for e in ent_col.entities if e.is_core and not e.is_system]
         if core_ents:
             parts.append(
@@ -1299,7 +1949,8 @@ def _build_user_prompt(ctx: PipelineContext, chunks: list[dict]) -> str:
                 "These entities were extracted statically from the DB schema. "
                 "Use them as your key_entities and as the basis for bounded_contexts."
             )
-            for ent in core_ents[:30]:
+            _ents = core_ents[:_cap_entities]
+            for ent in _ents:
                 col_names = [c.name for c in ent.columns[:6]]
                 pk_note   = f"  pk={ent.primary_key}" if ent.primary_key else ""
                 pivot_note = "  [pivot]" if ent.is_pivot else ""
@@ -1309,12 +1960,12 @@ def _build_user_prompt(ctx: PipelineContext, chunks: list[dict]) -> str:
                     + (f"  cols=[{', '.join(col_names)}{'…' if len(ent.columns) > 6 else ''}]"
                        if col_names else "")
                 )
-            if len(core_ents) > 30:
-                parts.append(f"  … and {len(core_ents) - 30} more core entities")
+            if len(core_ents) > len(_ents):
+                parts.append(f"  … and {len(core_ents) - len(_ents)} more core entities")
 
     # ── Relationships from Stage 4.2 ─────────────────────────────────────────
     rel_col = getattr(ctx, "relationships", None)
-    if rel_col and rel_col.relationships:
+    if _include_relationships and rel_col and rel_col.relationships:
         high_rel = [r for r in rel_col.relationships if r.confidence >= 0.75]
         if high_rel:
             parts.append(
@@ -1327,21 +1978,22 @@ def _build_user_prompt(ctx: PipelineContext, chunks: list[dict]) -> str:
                 "Use them to define accurate cardinality in bounded_contexts and "
                 "data models.  Do NOT invent relationships that contradict these."
             )
-            for rel in high_rel[:40]:
+            _rels = high_rel[:_cap_relationships]
+            for rel in _rels:
                 parts.append(
                     f"  • {rel.from_entity:<25} {rel.cardinality:<5} {rel.to_entity:<25}"
                     f"  via={rel.via_column or rel.via_table or '?':<20}"
                     f"  [{','.join(rel.signals)}]"
                 )
-            if len(high_rel) > 40:
-                parts.append(f"  … and {len(high_rel) - 40} more")
+            if len(high_rel) > len(_rels):
+                parts.append(f"  … and {len(high_rel) - len(_rels)} more")
 
     # ── Detected Business Rules from Stage 2.9 ───────────────────────────────
     # High-confidence rules (schema-enforced ≥ 0.9, guard-clause ≥ 0.75) are
     # injected as hard constraints.  The LLM must surface these in features,
     # workflows, and key_entities rather than inventing its own constraints.
     inv = getattr(ctx, "invariants", None)
-    if inv and inv.rules:
+    if _include_rules and inv and inv.rules:
         high_conf = [r for r in inv.rules if r.confidence >= 0.75]
         if high_conf:
             parts.append(
@@ -1364,7 +2016,7 @@ def _build_user_prompt(ctx: PipelineContext, chunks: list[dict]) -> str:
 
     # ── State machines (Stage 4.3) ───────────────────────────────────────────
     sm_col = getattr(ctx, "state_machines", None)
-    if sm_col and sm_col.machines:
+    if _include_state and sm_col and sm_col.machines:
         parts.append(
             f"\n=== DETECTED STATE MACHINES — STAGE 4.3 "
             f"({sm_col.total} machine(s)) ==="
@@ -1390,7 +2042,7 @@ def _build_user_prompt(ctx: PipelineContext, chunks: list[dict]) -> str:
     # operations that are not obvious from directory structure alone.
     # Previously computed but never used in LLM prompts — wiring it here
     # prevents the stage38 computation from being wasted.
-    if hasattr(ctx, "graph_query"):
+    if _include_graphrag and hasattr(ctx, "graph_query"):
         _grag_topics = [
             "user roles permissions authentication",
             "business features workflows operations",
@@ -1402,7 +2054,10 @@ def _build_user_prompt(ctx: PipelineContext, chunks: list[dict]) -> str:
             except Exception:
                 _gc = None
             if _gc and _gc.strip():
-                _grag_hits.append(_gc.strip())
+                _gc_txt = _gc.strip()
+                if len(_gc_txt) > _cap_graphrag_chars:
+                    _gc_txt = _gc_txt[:_cap_graphrag_chars].rstrip() + " ..."
+                _grag_hits.append(_gc_txt)
         if _grag_hits:
             parts.append(f"\n=== GRAPH-AWARE SEMANTIC CONTEXT ===")
             parts.append(
@@ -1431,33 +2086,28 @@ def _build_user_prompt(ctx: PipelineContext, chunks: list[dict]) -> str:
 
 def _call_part(system_prompt: str, user_prompt: str,
                max_tokens: int, label: str,
-               model_override: str | None = None) -> str:
+               model_override: str | None = None,
+               temperature: float = 0.2,
+               json_schema: dict | None = None) -> str:
     """Call the configured LLM and return the raw response string.
 
-    json_mode=True forces local models (Ollama etc.) to output valid JSON:
-      - OpenAI-compat path:   response_format={"type":"json_object"}
-      - Ollama native path:   format="json"  (top-level payload field)
-
-    prefill="{" is a secondary safety net for thinking models (Qwen3,
-    DeepSeek-R1): the assistant turn starts with "{" so the model cannot
-    emit any preamble or markdown fence before the JSON object.
-    On Claude the prefill is sent as a partial assistant message; on local
-    models it is appended to the messages array the same way.
+    json_mode=True is always set.  When json_schema is provided it is passed
+    to the server for grammar-level constrained decoding (vLLM guided_json /
+    response_format.json_schema), making invalid JSON literally impossible.
+    Falls back to plain json_mode when json_schema is None.
     """
-    from pipeline.llm_client import call_llm, get_provider
-    # Use prefill only for local models — Claude handles structured output
-    # differently and prefill interferes with its extended-thinking mode.
-    use_prefill = "{" if get_provider() == "local" else ""
-    return call_llm(
+    from pipeline.llm_client import call_llm
+    raw = call_llm(
         system_prompt  = system_prompt,
         user_prompt    = user_prompt,
         max_tokens     = max_tokens,
-        temperature    = 0.2,   # extraction: recall > precision, keep generous default
+        temperature    = temperature,
         label          = label,
         json_mode      = True,
-        prefill        = use_prefill,
+        json_schema    = json_schema,
         model_override = model_override,
     )
+    return raw
 
 
 # ─── Hallucination Filter ──────────────────────────────────────────────────────
@@ -1535,6 +2185,225 @@ def _extract_module_name(filepath: str) -> str | None:
     return None
 
 
+# Directories that are pure infrastructure in TypeScript projects
+_TS_INFRA_DIRS: frozenset[str] = frozenset({
+    "src", "app", "pages", "api", "lib", "utils", "helpers", "types",
+    "hooks", "styles", "public", "config", ".", "", "node_modules",
+    "dist", "build", ".next",
+})
+# Generic component sub-folders that don't represent a domain concept
+_TS_GENERIC_COMPONENTS: frozenset[str] = frozenset({
+    "common", "shared", "base", "core", "ui", "layout", "primitives",
+})
+
+
+def _extract_module_name_ts(filepath: str) -> str | None:
+    """
+    Extract a logical module name from a TypeScript / Next.js path.
+
+    Priority
+    --------
+    1. Route groups  : app/(auth)/login/page.tsx     → "auth"
+    2. API segment   : app/api/users/route.ts        → "users_api"
+    3. App segment   : app/dashboard/page.tsx        → "dashboard"
+    4. Feature dir   : src/features/payments/svc.ts  → "payments"
+    5. Component grp : components/UserProfile/Card   → "UserProfile"
+
+    Returns None for infra files (lib/, utils/, hooks/, config/ …).
+    """
+    parts = [p for p in Path(filepath).parts if p not in (".", "..")]
+
+    # Pass 1 — route groups take highest priority
+    for part in parts:
+        m = re.match(r'^\((\w+)\)$', part)
+        if m:
+            return m.group(1)
+
+    # Pass 2 — structural keywords
+    for i, part in enumerate(parts):
+        part_l = part.lower()
+
+        # app/api/<module>/  (avoid dynamic segments [id])
+        if part_l == "api" and i + 1 < len(parts):
+            nxt = parts[i + 1]
+            if not nxt.startswith("[") and nxt.lower() not in _TS_INFRA_DIRS:
+                return f"{nxt}_api"
+
+        # app/<segment>/  – first meaningful segment directly under app/
+        if part_l == "app" and i + 1 < len(parts):
+            nxt = parts[i + 1]
+            if (not re.match(r'^[\[\(]', nxt)
+                    and nxt.lower() not in _TS_INFRA_DIRS
+                    and nxt.lower() != "api"):
+                return nxt
+
+        # src/features/<module>/
+        if part_l == "features" and i + 1 < len(parts):
+            return parts[i + 1]
+
+        # components/<Group>/ or ui/<Group>/
+        if part_l in ("components", "ui") and i + 1 < len(parts):
+            nxt = parts[i + 1]
+            if nxt.lower() not in _TS_GENERIC_COMPONENTS | _TS_INFRA_DIRS:
+                return nxt
+
+    return None
+
+
+def _is_valid_feature_name(name: str) -> bool:
+    """
+    Return False for feature names that are model thinking / commentary leaked
+    into a JSON string value instead of a real BA feature name.
+
+    Heuristics (any one failing → invalid):
+      - Name must be ≤ 150 chars  (real names are short titles)
+      - Must not start with punctuation that signals JSON/code artefacts
+      - Must not contain newlines (multi-line = reasoning block)
+      - Must not look like a comment or placeholder
+    """
+    if not name or not name.strip():
+        return False
+    n = name.strip()
+    if len(n) > 150:
+        return False
+    if n[0] in (',', '"', '/', '*', '#', '-', '`'):
+        return False
+    if '\n' in n:
+        return False
+    _commentary_markers = ("//", "/*", "placeholder", "wait,", "let me",
+                           "actually,", "however,", "i will", "i need to",
+                           "looking at", "re-read", "the evidence")
+    _nl = n.lower()
+    if any(_nl.startswith(m) for m in _commentary_markers):
+        return False
+    return True
+
+
+def _coerce_feature_item_to_str(v: object) -> str:
+    """Coerce a feature list item to a plain string.
+
+    The LLM sometimes returns dicts like {"name": "email", "type": "string"}
+    instead of bare strings.  Extract the most useful key so the item is
+    still usable for dedup / coverage matching.
+    """
+    if isinstance(v, dict):
+        return str(v.get("name") or v.get("key") or v.get("field")
+                   or next(iter(v.values()), ""))
+    return str(v)
+
+
+def _static_enrich_tables_and_fields(
+    domain_model: "DomainModel",
+    cm: Any,
+) -> tuple[int, int]:
+    """
+    Static (no-LLM) enrichment pass: derive table and field coverage directly
+    from the code_map data that was already collected by Stage 1 parsers.
+
+    Logic
+    -----
+    Tables  — for every file that a feature already references in its 'pages'
+              array, look up which SQL tables that file queries (from
+              cm.sql_queries) and add any missing tables to the feature.
+              Also uses cm.table_columns to add Prisma/ORM model names for
+              TypeScript projects.
+
+    Fields  — same idea: look up which $_POST / input_params fields each
+              covered file uses (from cm.superglobals + cm.input_params) and
+              add them to the feature's 'inputs' array.
+
+    Returns (tables_added, fields_added) counts for logging.
+    """
+    from collections import defaultdict
+
+    # ── Build file-basename → tables index ────────────────────────────────────
+    file_to_tables: dict[str, set[str]] = defaultdict(set)
+    for q in (cm.sql_queries or []):
+        f = q.get("file", "")
+        t = q.get("table", "")
+        if f and t and t.upper() not in ("", "UNKNOWN"):
+            file_to_tables[Path(f).name.lower()].add(t.lower())
+    # Also index table_columns (flat Prisma/TS format)
+    for tc in (cm.table_columns or []):
+        f = tc.get("file", "")
+        t = tc.get("table", "")
+        if f and t:
+            file_to_tables[Path(f).name.lower()].add(t.lower())
+
+    # ── Build file-basename → fields index ────────────────────────────────────
+    _cm_lang = getattr(cm.language, "value", str(cm.language)).lower()
+    _is_ts_cm = _cm_lang in ("typescript", "javascript")
+
+    file_to_fields: dict[str, set[str]] = defaultdict(set)
+    # PHP superglobals — $_POST only (domain inputs); $_GET is usually pagination/filter
+    for s in (cm.superglobals or []):
+        f = s.get("file", "")
+        k = s.get("key", "")
+        if f and k and s.get("var") in ("$_POST", "$_REQUEST"):
+            file_to_fields[Path(f).name.lower()].add(k.lower())
+    # TypeScript / Java input_params — body only; query/route params are infrastructure.
+    # PHP already has its fields from the superglobals loop above; running input_params
+    # for PHP would double-add those keys AND add $_SERVER/$_SESSION/$_GET keys as fields.
+    if _is_ts_cm:
+        for ip in (cm.input_params or []):
+            f = ip.get("file", "")
+            k = ip.get("name", "") or ip.get("key", "")
+            if not f or not k:
+                continue
+            if ip.get("source", "body") != "body":
+                continue   # skip req.query.* and req.params.*
+            file_to_fields[Path(f).name.lower()].add(k.lower())
+
+    # ── Build module → file-basenames index (used for module-expanded enrichment) ──
+    # When a feature references one file in a module, enrich it with data from ALL
+    # sibling files in that module.  This recovers fields/tables that the LLM omitted
+    # because its evidence window only contained one or two representative files.
+    _module_to_basenames: dict[str, list[str]] = defaultdict(list)
+    _basename_to_module: dict[str, str] = {}
+    for ep in (cm.execution_paths or []):
+        _f = ep.get("file", "")
+        if not _f:
+            continue
+        _mod = _extract_module_name(_f) or _extract_module_name_ts(_f)
+        if _mod:
+            _bn = Path(_f).name.lower()
+            _module_to_basenames[_mod].append(_bn)
+            if _bn not in _basename_to_module:
+                _basename_to_module[_bn] = _mod
+
+    tables_added = 0
+    fields_added = 0
+
+    for feat in domain_model.features:
+        existing_tables = {_coerce_feature_item_to_str(t).lower() for t in feat.get("tables", [])}
+        existing_fields = {_coerce_feature_item_to_str(inp).lower() for inp in feat.get("inputs", [])}
+
+        # Collect explicit page basenames, then expand to module siblings
+        explicit_basenames: set[str] = {
+            Path(page).name.lower() for page in feat.get("pages", [])
+        }
+        expanded_basenames: set[str] = set(explicit_basenames)
+        for bn in explicit_basenames:
+            mod = _basename_to_module.get(bn)
+            if mod:
+                expanded_basenames.update(_module_to_basenames[mod])
+
+        for basename in expanded_basenames:
+            for tbl in file_to_tables.get(basename, set()):
+                if tbl not in existing_tables:
+                    feat.setdefault("tables", []).append(tbl)
+                    existing_tables.add(tbl)
+                    tables_added += 1
+
+            for fld in file_to_fields.get(basename, set()):
+                if fld not in existing_fields:
+                    feat.setdefault("inputs", []).append(fld)
+                    existing_fields.add(fld)
+                    fields_added += 1
+
+    return tables_added, fields_added
+
+
 def _build_module_expansion(
     exec_paths: list[dict],
     covered_pages: set[str],
@@ -1558,7 +2427,7 @@ def _build_module_expansion(
         f = ep.get("file", "")
         if not f:
             continue
-        mod = _extract_module_name(f)
+        mod = _extract_module_name(f) or _extract_module_name_ts(f)
         if mod:
             module_files[mod].append(Path(f).name.lower())
         else:
@@ -1614,13 +2483,14 @@ def _compute_coverage(
     covered_pages  : set[str] = set()
     covered_tables : set[str] = set()
     covered_inputs : set[str] = set()
+
     for feat in domain_model.features:
         for p in feat.get("pages", []):
-            covered_pages.add(Path(p).name.lower())
+            covered_pages.add(Path(_coerce_feature_item_to_str(p)).name.lower())
         for t in feat.get("tables", []):
-            covered_tables.add(t.lower())
+            covered_tables.add(_coerce_feature_item_to_str(t).lower())
         for inp in feat.get("inputs", []):
-            covered_inputs.add(inp.lower())
+            covered_inputs.add(_coerce_feature_item_to_str(inp).lower())
 
     # ── Module-expanded coverage set ──────────────────────────────────────────
     # If any file in a module dir is explicitly covered, all sibling files in
@@ -1663,20 +2533,49 @@ def _compute_coverage(
 
     pages_covered = sorted(set(ep_covered + html_covered))
 
-    # ── Table coverage ────────────────────────────────────────────────────────
-    all_tables = sorted({
+    # ── Table coverage (language-aware) ───────────────────────────────────────
+    _lang = getattr(cm.language, "value", str(cm.language)).lower()
+    _is_ts = _lang in ("typescript", "javascript")
+
+    # SQL tables from queries (all languages)
+    _sql_tables: set[str] = {
         q.get("table", "") for q in (cm.sql_queries or [])
         if q.get("table") and q["table"] not in ("UNKNOWN", "")
-    })
+    }
+    if _is_ts and not _sql_tables:
+        # TypeScript (Prisma/Firebase) — use type_definition model names as entities
+        _sql_tables = {
+            td.get("name", "") for td in (getattr(cm, "type_definitions", None) or [])
+            if td.get("name")
+        }
+    all_tables = sorted(_sql_tables)
     tables_covered   = [t for t in all_tables if t.lower() in covered_tables]
     tables_uncovered = [t for t in all_tables if t.lower() not in covered_tables]
     table_cov        = len(tables_covered) / len(all_tables) if all_tables else 1.0
 
-    # ── Field coverage ────────────────────────────────────────────────────────
-    all_fields = sorted({
+    # ── Field coverage (language-aware) ──────────────────────────────────────
+    # PHP: $_POST fields are domain inputs; $_GET is mostly pagination/filter
+    _php_fields: set[str] = {
         s["key"] for s in (cm.superglobals or [])
-        if s.get("var") == "$_POST" and s.get("key")
-    })
+        if s.get("var") in ("$_POST", "$_REQUEST") and s.get("key")
+    }
+    # TypeScript: only req.body.* fields are domain inputs.
+    # req.query.* (page, limit, cursor, sort, filter) and req.params.* (id, slug)
+    # are infrastructure — they inflate the denominator without being LLM-coverable.
+    # Guard with _is_ts: PHP populates cm.input_params with all superglobal data
+    # (no "source" field), so the default "body" would pull in every $_SERVER,
+    # $_SESSION, and $_GET key — inflating the PHP denominator by ~25%.
+    _ts_fields: set[str] = (
+        {
+            k
+            for ip in (cm.input_params or [])
+            if (k := (ip.get("name") or ip.get("key", "")))
+            and ip.get("source", "body") == "body"
+        }
+        if _is_ts else set()
+    )
+    # Merge both so a mixed PHP+TS project gets full coverage
+    all_fields = sorted(_php_fields | _ts_fields)
     fields_covered   = [f for f in all_fields if f.lower() in covered_inputs]
     fields_uncovered = [f for f in all_fields if f.lower() not in covered_inputs]
     field_cov        = len(fields_covered) / len(all_fields) if all_fields else 1.0
@@ -1755,14 +2654,21 @@ def _gap_fill_pass(
     Returns the (possibly enriched) DomainModel.
     """
     cm = ctx.code_map
+    _lang = getattr(cm.language, "value", str(cm.language)).lower()
 
-    # Track which modules have already been sent to the LLM so we don't
-    # spin indefinitely on modules the model refuses to list page refs for.
-    attempted_modules: set[str] = set()
-    # Track which non-module files have already been sent to avoid re-sending.
-    attempted_flat: set[str] = set()
+    # Track how many times each module has been sent to the LLM.
+    # Using a count (not a bool) allows ONE retry for modules the model
+    # skipped on the first attempt without producing coverage — the most
+    # common cause of the 15-25% coverage gap on large codebases.
+    # Modules are permanently abandoned after MAX_MODULE_ATTEMPTS attempts.
+    MAX_MODULE_ATTEMPTS = int(os.environ.get("STAGE4_MAX_MODULE_ATTEMPTS", "2") or "2")
+    attempted_modules: dict[str, int] = {}   # module_name → attempt count
+    # Same retry logic for non-module (flat) files.
+    attempted_flat: dict[str, int] = {}      # basename_lower → attempt count
     # Allow up to this many consecutive empty/failed LLM rounds before giving up.
-    MAX_CONSECUTIVE_EMPTY = 3
+    # Set higher than 3 so repetition-loop failures on quantised models
+    # (which produce empty dicts) don't abort gap-fill prematurely.
+    MAX_CONSECUTIVE_EMPTY = int(os.environ.get("STAGE4_MAX_CONSECUTIVE_EMPTY", "5") or "5")
     consecutive_empty = 0
 
     for gap_round in range(1, MAX_GAP_ROUNDS + 1):
@@ -1800,10 +2706,12 @@ def _gap_fill_pass(
             uncovered, cm.execution_paths or []
         )
 
-        # Modules not yet attempted this pipeline run
+        # Modules that still have room for another attempt.
+        # First pass: prioritise never-tried modules; second pass: retry
+        # once-tried modules that are still uncovered (model skipped them).
         fresh_module_groups = {
             m: files for m, files in module_groups.items()
-            if m not in attempted_modules
+            if attempted_modules.get(m, 0) < MAX_MODULE_ATTEMPTS
         }
 
         call_label = f"stage4-D{gap_round}"
@@ -1811,8 +2719,14 @@ def _gap_fill_pass(
 
         if fresh_module_groups:
             # ── Module-grouped mode (covers ~10× more files per call) ──────
-            batch_modules = dict(list(fresh_module_groups.items())[:GAP_FILL_MAX_MODULES])
-            attempted_modules.update(batch_modules.keys())
+            # Prefer never-attempted modules first; only fall back to retries
+            # when all fresh modules have had their first attempt.
+            _never_tried = {m: f for m, f in fresh_module_groups.items()
+                            if attempted_modules.get(m, 0) == 0}
+            _batch_src = _never_tried if _never_tried else fresh_module_groups
+            batch_modules = dict(list(_batch_src.items())[:GAP_FILL_MAX_MODULES])
+            for m in batch_modules:
+                attempted_modules[m] = attempted_modules.get(m, 0) + 1
             n_files = sum(len(v) for v in batch_modules.values())
             print(
                 f"  [stage4] Call D{gap_round} — gap-fill "
@@ -1823,16 +2737,18 @@ def _gap_fill_pass(
             gap_system = _system_gap_fill(
                 quality_score, [], existing_names,
                 known_tables=known_tables, known_fields=known_fields,
-                module_groups=batch_modules,
+                module_groups=batch_modules, language=_lang,
             )
         elif flat_files:
             # ── Flat fallback: non-module files (include/, lib/, etc.) ──────
-            fresh_flat = [f for f in flat_files if f.lower() not in attempted_flat]
+            fresh_flat = [f for f in flat_files
+                          if attempted_flat.get(f.lower(), 0) < MAX_MODULE_ATTEMPTS]
             gap_pages = fresh_flat[:GAP_FILL_MAX_PAGES]
             if not gap_pages:
                 print(f"  [stage4] All flat files sent in previous rounds — done.")
                 break
-            attempted_flat.update(f.lower() for f in gap_pages)
+            for f in gap_pages:
+                attempted_flat[f.lower()] = attempted_flat.get(f.lower(), 0) + 1
             print(
                 f"  [stage4] Call D{gap_round} — gap-fill "
                 f"{len(gap_pages)}/{len(flat_files)} non-module file(s): "
@@ -1841,13 +2757,42 @@ def _gap_fill_pass(
             gap_system = _system_gap_fill(
                 quality_score, gap_pages, existing_names,
                 known_tables=known_tables, known_fields=known_fields,
+                language=_lang,
             )
         else:
             print(f"  [stage4] No fresh modules or flat files remain — done.")
             break
-        raw_d          = _call_part(gap_system, user_prompt, MAX_TOKENS_GAP_FILL,
-                                    call_label)
-        data_d         = _parse_partial(raw_d, f"D{gap_round}", debug_dir)
+        # ── Per-round targeted evidence ────────────────────────────────────────
+        # Build a fresh user-prompt by querying ChromaDB with module/file names
+        # as search terms.  The static gap_prompt (built before the loop) only
+        # contains the 12 highest-overall chunks; by round 3+ those are rarely
+        # relevant to the specific modules being asked about.
+        if fresh_module_groups:
+            _gap_q = " ".join(list(batch_modules.keys())[:6]) + " business logic features"
+        else:
+            _gap_q = " ".join((gap_pages or [])[:6]) + " business logic features"
+        try:
+            _fresh_chunks = _retrieve_context(
+                ctx,
+                queries           = [(_gap_q, "gap_round")],
+                max_total_chunks  = _PROFILE_MAX_TOTAL_CHUNKS["GAP"],
+                max_context_chars = _PROFILE_MAX_CONTEXT_CHARS["GAP"],
+            )
+            round_user_prompt = (
+                _build_user_prompt(ctx, _fresh_chunks, profile="GAP")
+                if _fresh_chunks else user_prompt
+            )
+        except Exception:
+            round_user_prompt = user_prompt   # fall back to static prompt on error
+
+        try:
+            raw_d = _call_part(gap_system, round_user_prompt, MAX_TOKENS_GAP_FILL, call_label,
+                               temperature=GAP_FILL_TEMPERATURE, json_schema=_SCHEMA_B)
+        except Exception as _gf_exc:
+            print(f"  [stage4-gap] ⚠️  Round {gap_round} LLM call failed after retries: "
+                  f"{_gf_exc} — skipping round")
+            continue
+        data_d = _parse_partial(raw_d, f"D{gap_round}", debug_dir)
 
         # Filter hallucinated refs from gap-fill response
         if known_pages_lower or known_tables:
@@ -1875,11 +2820,13 @@ def _gap_fill_pass(
 
         consecutive_empty = 0  # reset on any successful response
 
-        # Merge — skip duplicates by name (case-insensitive)
+        # Merge — skip duplicates by name (case-insensitive) and leaked thinking
         existing_lower = {f["name"].lower() for f in domain_model.features}
         added: list[str] = []
         for feat in new_features:
             if isinstance(feat, dict) and feat.get("name"):
+                if not _is_valid_feature_name(feat["name"]):
+                    continue
                 if feat["name"].lower() not in existing_lower:
                     domain_model.features.append(feat)
                     existing_lower.add(feat["name"].lower())
@@ -1908,27 +2855,74 @@ def _gap_fill_pass(
 
 def _attempt_json_recovery(text: str) -> dict | None:
     """
-    Try to recover a partial JSON response that was truncated mid-stream.
-    Attempts to close all open brackets/braces to make it valid JSON.
-    Returns parsed dict on success, None on failure.
+    Recover a partial/truncated JSON response.
+
+    Strategy: collect all positions of '}' that are outside string literals,
+    then — starting from the rightmost — try to close the JSON from that point.
+    The first (rightmost) candidate that produces valid JSON is returned.
+
+    This is O(N + K·N) where K ≤ _MAX_CANDIDATES = 30, effectively O(N).
+    String-aware scanning skips { } [ ] characters inside quoted values,
+    which the old naive brace-count approach confused with structural tokens.
     """
-    import re
+    _MAX_CANDIDATES = 30   # try at most this many } positions from the right
 
-    # Find the last complete top-level field by scanning for the deepest
-    # valid truncation point — remove the last incomplete entry
-    # Strategy: strip back to the last complete '},' or '}' at depth 1
     t = text.strip()
+    if not t:
+        return None
 
-    # Remove trailing partial content after last complete array/object close
-    # Walk backwards finding the last valid comma-terminated or closed block
-    for cutpoint in range(len(t), 0, -1):
-        candidate = t[:cutpoint].rstrip().rstrip(",")
-        # Try closing all open structures
-        open_braces   = candidate.count("{") - candidate.count("}")
-        open_brackets = candidate.count("[") - candidate.count("]")
-        if open_braces < 0 or open_brackets < 0:
+    # ── Collect all out-of-string '}' positions (forward scan, O(N)) ─────────
+    close_positions: list[int] = []
+    in_string   = False
+    escape_next = False
+
+    for i, ch in enumerate(t):
+        if escape_next:
+            escape_next = False
             continue
-        closed = candidate + ("]" * open_brackets) + ("}" * open_braces)
+        if ch == "\\" and in_string:
+            escape_next = True
+            continue
+        if ch == '"':
+            in_string = not in_string
+            continue
+        if in_string:
+            continue
+        if ch == "}":
+            close_positions.append(i)
+
+    if not close_positions:
+        return None
+
+    # ── Try candidates from rightmost backwards ───────────────────────────────
+    def _count_open(s: str) -> tuple[int, int]:
+        """String-aware count of unclosed { [ in s. Returns (braces, brackets)."""
+        ob = obr = 0
+        in_string = escape_next = False
+        for c in s:
+            if escape_next:
+                escape_next = False
+                continue
+            if c == "\\" and in_string:
+                escape_next = True
+                continue
+            if c == '"':
+                in_string = not in_string
+                continue
+            if in_string:
+                continue
+            if   c == "{": ob  += 1
+            elif c == "}": ob  -= 1
+            elif c == "[": obr += 1
+            elif c == "]": obr -= 1
+        return ob, obr
+
+    for pos in reversed(close_positions[-_MAX_CANDIDATES:]):
+        candidate = t[: pos + 1].rstrip().rstrip(",")
+        ob, obr = _count_open(candidate)
+        if ob < 0 or obr < 0:
+            continue
+        closed = candidate + ("]" * obr) + ("}" * ob)
         try:
             return json.loads(closed)
         except json.JSONDecodeError:
@@ -1954,7 +2948,8 @@ def _parse_partial(raw: str, label: str, debug_dir: str | None = None) -> dict:
         except Exception:
             pass  # never let debug I/O crash the pipeline
 
-    text = raw.strip()
+    from pipeline.llm_client import _normalize_llm_json
+    text = _normalize_llm_json(raw.strip())
 
     # Strip markdown / prose — find the outermost { or [ block
     if not text.startswith("{") and not text.startswith("["):
@@ -1983,8 +2978,10 @@ def _parse_partial(raw: str, label: str, debug_dir: str | None = None) -> dict:
                 and not line.strip().startswith("#")
             ).strip()
 
+    # raw_decode stops at the first complete JSON object — handles "Extra data"
+    # errors when the model emits a second object or trailing thinking tokens.
     try:
-        data = json.loads(text)
+        data, _ = json.JSONDecoder().raw_decode(text)
     except json.JSONDecodeError:
         recovered = _attempt_json_recovery(text)
         if recovered:
@@ -1996,12 +2993,33 @@ def _parse_partial(raw: str, label: str, debug_dir: str | None = None) -> dict:
 
     # ── Handle top-level array (model returned [...] instead of {{...}}) ─────
     # This happens with some local models when asked for a list field.
-    _LABEL_KEY = {"A": None, "B": "features", "C": "user_roles"}
+    _label_upper = label.upper()
+    wrap_key = None
+    if _label_upper.startswith("B") or _label_upper.startswith("D"):
+        wrap_key = "features"
+    elif _label_upper in {"C", "C1", "C_ROLES"}:
+        wrap_key = "user_roles"
+    elif _label_upper in {"C2", "C_WORKFLOWS"}:
+        wrap_key = "workflows"
     if isinstance(data, list):
-        wrap_key = _LABEL_KEY.get(label)
         if wrap_key:
+            # Coerce non-dict items — without prefill the model sometimes
+            # returns a bare list of strings instead of feature objects.
+            # Convert strings to minimal stubs so the feature name survives
+            # into later stages; silently drop anything else (int, None, etc.).
+            coerced: list[dict] = []
+            salvaged = 0
+            for item in data:
+                if isinstance(item, dict):
+                    coerced.append(item)
+                elif isinstance(item, str) and item.strip():
+                    coerced.append({"name": item.strip(), "pages": [], "tables": [], "inputs": []})
+                    salvaged += 1
+            if salvaged:
+                print(f"  [stage4-{label}] Salvaged {salvaged} string item(s) as name-only stubs in '{wrap_key}'.")
+            dict_items = coerced
             print(f"  [stage4-{label}] Top-level array — wrapping as '{wrap_key}'.")
-            data = {wrap_key: data}
+            data = {wrap_key: dict_items}
         else:
             print(f"  [stage4-{label}] ⚠️  Unexpected top-level array — discarding.")
             return {}

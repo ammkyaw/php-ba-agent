@@ -348,7 +348,10 @@ class ProjectVisitor extends NodeVisitorAbstract
             'line'      => $node->getStartLine(),
             'type'      => 'interface',
             'docblock'  => $this->extractDocblock($node),
-            'extends'   => array_map(fn($e) => $e->toString(), $node->extends),
+            'extends'    => !empty($node->extends) ? $node->extends[0]->toString() : null,
+            'implements' => count($node->extends) > 1
+                                ? array_map(fn($e) => $e->toString(), array_slice($node->extends, 1))
+                                : [],
             'methods'   => $this->extractMethods($node),
         ];
     }
@@ -1198,7 +1201,7 @@ class ProceduralVisitor extends NodeVisitorAbstract
             'line'        => $node->getStartLine(),
             'params'      => $params,
             'return_type' => $node->returnType ? $this->typeToString($node->returnType) : null,
-            'docblock'    => $this->extractDocSummary($node),
+            'docblock'    => $this->extractDocblock($node),
         ];
     }
 
@@ -1606,16 +1609,53 @@ class ProceduralVisitor extends NodeVisitorAbstract
         }
     }
 
-    private function extractDocSummary(Node $node): ?string
+    private function extractDocblock(Node $node): ?array
     {
         $doc = $node->getDocComment();
-        if (!$doc) return null;
-        $lines = explode("\n", $doc->getText());
+        if (!$doc instanceof Doc) return null;
+        $raw = $doc->getText();
+
+        $lines = explode("\n", $raw);
+        $clean = [];
         foreach ($lines as $line) {
             $line = trim($line, " \t\r\n*\/");
-            if ($line !== '' && !str_starts_with($line, '@')) return $line;
+            if ($line !== '') $clean[] = $line;
         }
-        return null;
+        $text = implode(' ', $clean);
+
+        $summary = '';
+        if (preg_match('/^([^@]+?)(?=\s*@|\z)/s', $text, $m)) {
+            $summary = trim($m[1]);
+        } else {
+            $summary = trim($text);
+        }
+
+        $params = [];
+        preg_match_all('/@param\s+(\S+)\s+(\$\S+)(?:\s+(.+))?/', $raw, $pm, PREG_SET_ORDER);
+        foreach ($pm as $m) {
+            $params[] = ['type' => $m[1], 'name' => $m[2], 'desc' => isset($m[3]) ? trim($m[3]) : ''];
+        }
+
+        $return = null;
+        if (preg_match('/@return\s+(\S+)(?:\s+(.+))?/', $raw, $m)) {
+            $return = $m[1] . (isset($m[2]) ? ' ' . trim($m[2]) : '');
+        }
+
+        $tags = [];
+        preg_match_all('/@(\w+)(?:\s+([^\n@]*))?/', $raw, $tm, PREG_SET_ORDER);
+        foreach ($tm as $m) {
+            if (in_array($m[1], ['param', 'return'])) continue;
+            $tags[$m[1]][] = isset($m[2]) ? trim($m[2]) : '';
+        }
+
+        return [
+            'raw'         => $raw,
+            'summary'     => $summary,
+            'params'      => $params,
+            'return'      => $return,
+            'tags'        => $tags,
+            'annotations' => [],
+        ];
     }
 }
 

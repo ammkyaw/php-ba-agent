@@ -678,7 +678,10 @@ def _chunks_function_defs(cm: CodeMap, file_module: dict[str, str] | None = None
         filename  = Path(filepath).name
         params    = [p["name"] for p in fn.get("params", [])]
         ret       = fn.get("return_type") or "void"
-        docblock  = fn.get("docblock") or ""
+        db        = fn.get("docblock") or {}
+        docblock  = db.get("summary", "")
+        doc_params = db.get("params") or []
+        doc_return = db.get("return") or ""
         line      = fn.get("line", "?")
 
         parts = [
@@ -689,6 +692,11 @@ def _chunks_function_defs(cm: CodeMap, file_module: dict[str, str] | None = None
         ]
         if docblock:
             parts.append(f"Description: {docblock}")
+        for dp in doc_params:
+            if dp.get("desc"):
+                parts.append(f"  Param {dp['name']} ({dp.get('type', '')}) — {dp['desc']}")
+        if doc_return and doc_return.strip() != ret.strip():
+            parts.append(f"  Returns: {doc_return}")
 
         # Pull SQL ops attributed to this function
         fn_sqls = [q for q in cm.sql_queries if q.get("caller") == name]

@@ -44,6 +44,9 @@ except ImportError:
 
 OUTPUT_FILE = "accuracy_report.html"
 
+# Shared write-op set — single source of truth lives in flow_validator.
+from pipeline.flow_validator import _WRITE_OPS  # noqa: E402
+
 # ─── Artifact filenames produced by upstream stages ───────────────────────────
 _V47_FILE   = "flow_validation.json"
 _TR_FILE    = "traceability_matrix.json"
@@ -84,7 +87,7 @@ def run(ctx: PipelineContext) -> None:
         "routes":  len(getattr(cm, "routes", None) or []),
         "writes":  sum(
             1 for q in (getattr(cm, "sql_queries", None) or [])
-            if (q.get("operation") or "").upper() in {"INSERT", "UPDATE", "DELETE", "REPLACE"}
+            if (q.get("operation") or "").upper() in _WRITE_OPS
         ),
         "forms":   len(getattr(cm, "form_fields", None) or []),
     }
@@ -219,7 +222,7 @@ def _build_module_matrix(
     # group SQL writes by module
     write_by_mod: dict[str, list] = {}
     for q in queries_all:
-        if (q.get("operation") or "").upper() not in {"INSERT","UPDATE","DELETE","REPLACE"}:
+        if (q.get("operation") or "").upper() not in _WRITE_OPS:
             continue
         m = _module_from_path(q.get("file", ""))
         write_by_mod.setdefault(m, []).append(q)

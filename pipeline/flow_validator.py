@@ -91,8 +91,17 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-# ── SQL write operations that represent meaningful state changes ───────────────
-_WRITE_OPS: frozenset[str] = frozenset({"INSERT", "UPDATE", "DELETE", "REPLACE"})
+# ── Write operations that represent meaningful state changes ──────────────────
+# Covers SQL/ORM and Firestore client SDK (read ops getDocs/getDoc excluded).
+_WRITE_OPS: frozenset[str] = frozenset({
+    # SQL / traditional ORM
+    "INSERT", "UPDATE", "DELETE", "REPLACE",
+    # Firestore client SDK
+    "ADDDOC", "SETDOC", "UPDATEDOC", "DELETEDOC",
+    "RUNTRANSACTION", "WRITEBATCH",
+    # React Query / Async Hooks
+    "USEMUTATION",
+})
 
 # ── Tables too generic to be informative ──────────────────────────────────────
 _SKIP_TABLES: frozenset[str] = frozenset({"", "unknown", "temp", "tmp", "dual"})
@@ -764,9 +773,13 @@ def _check_route_coverage(
     covered:    list[dict] = []
     uncovered:  list[dict] = []
 
+    # UI page routes (Next.js page.tsx) are not API handlers — skip from coverage
+    _SKIP_KINDS = {"nextjs_page", "nextjs_app_router", "nextjs_pages_router"}
     for route in (getattr(cm, "routes", None) or []):
         method = (route.get("method") or "").upper()
         if method in ("GROUP", "MIDDLEWARE", "PREFIX", ""):
+            continue
+        if route.get("kind", "") in _SKIP_KINDS:
             continue
         path  = route.get("path") or route.get("uri") or ""
         rfile = route.get("file", "")
@@ -798,8 +811,11 @@ def _check_route_coverage(
             })
 
     total = len(covered) + len(uncovered)
-    pct   = len(covered) / total if total else 0.0
-    status, icon = _cov_status(pct)
+    if total == 0:
+        pct, status, icon = 1.0, "ok", "✅"
+    else:
+        pct = len(covered) / total
+        status, icon = _cov_status(pct)
 
     return {
         "name":      "Route Coverage Validation",
@@ -808,7 +824,8 @@ def _check_route_coverage(
         "covered":   len(covered),
         "total":     total,
         "pct":       round(pct, 4),
-        "detail":    f"{len(covered)}/{total} ({pct:.0%}) routes covered by flows",
+        "detail":    (f"N/A (no API routes)" if total == 0
+                      else f"{len(covered)}/{total} ({pct:.0%}) routes covered by flows"),
         "uncovered": uncovered[:_MAX_LIST],
     }
 
@@ -923,8 +940,13 @@ def _check_form_coverage(
             })
 
     total = covered_count + len(uncovered)
-    pct   = covered_count / total if total else 0.0
-    status, icon = _cov_status(pct)
+    if total == 0:
+        # Warn rather than silently pass — "no forms found" may mean the
+        # parser missed React-controlled forms, not that the app has none.
+        pct, status, icon = 0.0, "warn", "⚠️"
+    else:
+        pct = covered_count / total
+        status, icon = _cov_status(pct)
 
     return {
         "name":      "Form Coverage",
@@ -933,7 +955,8 @@ def _check_form_coverage(
         "covered":   covered_count,
         "total":     total,
         "pct":       round(pct, 4),
-        "detail":    f"{covered_count}/{total} ({pct:.0%}) forms covered by flows",
+        "detail":    ("No forms detected (check for React-controlled forms)" if total == 0
+                      else f"{covered_count}/{total} ({pct:.0%}) forms covered by flows"),
         "uncovered": uncovered[:_MAX_LIST],
     }
 

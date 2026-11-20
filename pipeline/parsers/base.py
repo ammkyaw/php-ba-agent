@@ -103,6 +103,7 @@ class LanguageParser(ABC):
             "vendor", "node_modules", ".git", "cache", "logs", "storage",
             "dist", "build", ".next", ".nuxt", "target", "out", "__pycache__",
             "tests", "test", "spec", "stubs", "fixtures", ".idea", ".vscode",
+            ".claude",  # Claude Code worktrees / project files
         }
         skip = skip_dirs if skip_dirs is not None else _default_skip
         for f in root.rglob("*"):

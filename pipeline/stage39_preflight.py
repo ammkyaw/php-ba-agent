@@ -132,7 +132,7 @@ def run(ctx: PipelineContext) -> None:
     else:
         if ctx.code_map.total_files == 0:
             blockers.append(
-                "B1: CodeMap reports 0 PHP files parsed. "
+                "B1: CodeMap reports 0 source files parsed. "
                 "Re-run Stage 1 or check the project path."
             )
         details["total_files"]    = ctx.code_map.total_files
@@ -202,10 +202,12 @@ def run(ctx: PipelineContext) -> None:
     details["unique_tables"] = sorted(unique_tables)
 
     if sql_count == 0 and table_count == 0:
+        _b2_lang = ctx.code_map.language.value if ctx.code_map else "unknown"
         blockers.append(
             "B2: No SQL queries or DB tables found anywhere in the codebase. "
             "BA documents would have no data model section. "
-            "Check that parse_project.php is extracting SQL from your project "
+            f"Check that the Stage 1 parser is extracting DB queries or ORM models "
+            f"from your {_b2_lang} project "
             "(run: python run_stage1.py <project> then inspect code_map.json)."
         )
 
@@ -266,12 +268,16 @@ def run(ctx: PipelineContext) -> None:
             signals["has_sql"]    = sql_count > 0
             signals["has_tables"] = table_count > 0
 
-        # W2: No form inputs (Laravel-aware)
+        # W2: No form inputs — language-aware
+        from context import Framework as _FwW2, Language as _LangW2
+        _lang_w2 = ctx.code_map.language
+
+        # PHP: superglobals ($_POST, $_GET, $_REQUEST)
         post_reads = [s for s in ctx.code_map.superglobals
                       if s.get("var") in ("$_POST", "$_GET", "$_REQUEST")]
-        # For Laravel count controller inputs from Stage 1.5 and POST endpoints.
+
+        # Laravel: controller inputs + POST endpoints
         _laravel_inputs = 0
-        from context import Framework as _FwW2
         if ctx.code_map.framework == _FwW2.LARAVEL:
             for _ep in (getattr(ctx.code_map, "execution_paths", []) or []):
                 for _cf in _ep.get("controller_flows", []):
@@ -280,18 +286,41 @@ def run(ctx: PipelineContext) -> None:
                 1 for e in ctx.code_map.http_endpoints
                 if e.get("method", "").upper() in ("POST", "PUT", "PATCH", "DELETE")
             )
-        if post_reads or _laravel_inputs > 0:
+
+        # TypeScript/JavaScript: React-controlled form_fields (RHF, Shadcn, onSubmit)
+        # and input_params (req.body, req.query, req.params from API routes)
+        _ts_form_count = len(getattr(ctx.code_map, "form_fields", None) or [])
+        _ts_input_count = len([
+            p for p in (getattr(ctx.code_map, "input_params", None) or [])
+            if p.get("source") in ("body", "query", "params")
+        ])
+        # Also count POST/PUT/PATCH HTTP endpoints as evidence of form submissions
+        _ts_post_eps = sum(
+            1 for e in (ctx.code_map.http_endpoints or [])
+            if e.get("method", "").upper() in ("POST", "PUT", "PATCH", "DELETE")
+        )
+        _ts_forms = _ts_form_count + _ts_input_count + _ts_post_eps
+
+        _total_form_signals = len(post_reads) + _laravel_inputs + _ts_forms
+        if _total_form_signals > 0:
             signals["has_forms"] = True
             details["form_field_count"] = (
                 len({s.get("key") for s in post_reads if s.get("key")})
                 + _laravel_inputs
+                + _ts_forms
             )
         else:
-            from context import Framework as _FwW2b
-            if ctx.code_map.framework == _FwW2b.LARAVEL:
+            details["form_field_count"] = 0
+            if ctx.code_map.framework == _FwW2.LARAVEL:
                 warnings.append(
                     "W2 (INFO): No $_POST/$_GET reads found (expected for Laravel — "
                     "uses $request->input()). Re-run Stage 1.5 if execution_paths is empty."
+                )
+            elif _lang_w2 in (_LangW2.TYPESCRIPT, _LangW2.JAVASCRIPT):
+                warnings.append(
+                    "W2: No React form fields or API route inputs detected. "
+                    "SRS functional requirements sections will lack form field details. "
+                    "Check that TypeScript parser extracted form_fields and input_params."
                 )
             else:
                 warnings.append(
@@ -299,14 +328,14 @@ def run(ctx: PipelineContext) -> None:
                     "SRS functional requirements sections will lack form field details."
                 )
 
-        # W3: No redirects (Laravel-aware)
-        # Laravel uses return redirect()/view()/response() not header().
-        # Count any controller method with a non-null return_type as navigation
-        # evidence; only "redirect"/"redirect_back" imply auth-relevant flows.
+        # W3: No navigation / auth signals — language-aware
+        from context import Framework as _FwW3, Language as _LangW3
+        _lang_w3 = ctx.code_map.language
+
+        # PHP: header() redirects
         _REDIRECT_TYPES = {"redirect", "redirect_back"}
         _laravel_return_count = 0
         _laravel_redirects = 0
-        from context import Framework as _FwW3
         if ctx.code_map.framework == _FwW3.LARAVEL:
             for _ep in (getattr(ctx.code_map, "execution_paths", []) or []):
                 for _cf in _ep.get("controller_flows", []):
@@ -315,6 +344,24 @@ def run(ctx: PipelineContext) -> None:
                         _laravel_return_count += 1
                     if rt in _REDIRECT_TYPES:
                         _laravel_redirects += 1
+
+        # TypeScript/JavaScript: auth signals (middleware, guards, useRouter, redirect())
+        # and Next.js Server Action / API route navigation evidence
+        _TS_AUTH_KINDS = {
+            "auth_guard", "nextjs_redirect", "useRouter", "clerk_auth",
+            "next_auth", "firebase_auth", "middleware", "protected_route",
+        }
+        _ts_auth_signals = [
+            s for s in (getattr(ctx.code_map, "auth_signals", None) or [])
+            if (s.get("kind") or s.get("type") or "") in _TS_AUTH_KINDS
+        ]
+        # Also count execution_paths with an auth_guard as navigation evidence
+        _ts_exec_guards = sum(
+            1 for ep in (getattr(ctx.code_map, "execution_paths", None) or [])
+            if ep.get("auth_guard") and ep["auth_guard"].get("present", False)
+        )
+        _ts_nav = len(_ts_auth_signals) + _ts_exec_guards
+
         if ctx.code_map.redirects:
             signals["has_auth"] = any(
                 r.get("target", "").endswith("login.php") or
@@ -322,14 +369,20 @@ def run(ctx: PipelineContext) -> None:
                 for r in ctx.code_map.redirects
             )
         elif _laravel_return_count > 0:
-            # Any controller return type (json/view/redirect) means navigation exists
             signals["has_auth"] = _laravel_redirects > 0
+        elif _ts_nav > 0:
+            signals["has_auth"] = True
         else:
-            from context import Framework as _FwW3b
-            if ctx.code_map.framework == _FwW3b.LARAVEL:
+            if ctx.code_map.framework == _FwW3.LARAVEL:
                 warnings.append(
                     "W3 (INFO): No header() redirects found (expected for Laravel). "
                     "Re-run Stage 1.5 to populate controller return types."
+                )
+            elif _lang_w3 in (_LangW3.TYPESCRIPT, _LangW3.JAVASCRIPT):
+                warnings.append(
+                    "W3: No auth guards or navigation signals detected. "
+                    "Navigation flow diagrams will be absent from BA docs. "
+                    "Check that TypeScript parser extracted auth_signals and execution_paths."
                 )
             else:
                 warnings.append(
@@ -339,9 +392,16 @@ def run(ctx: PipelineContext) -> None:
 
         # W4: No user-defined functions
         if not ctx.code_map.functions:
+            from context import Language as _LangW4
+            if ctx.code_map.language == _LangW4.PHP:
+                _w4_detail = "The codebase appears to be entirely inline procedural PHP."
+            else:
+                _w4_detail = (
+                    f"No functions were extracted from the "
+                    f"{ctx.code_map.language.value} codebase."
+                )
             warnings.append(
-                "W4: No user-defined functions found. "
-                "The codebase appears to be entirely inline procedural PHP. "
+                f"W4: No user-defined functions found. {_w4_detail} "
                 "Function-level BA coverage will be absent."
             )
         else:
@@ -366,17 +426,19 @@ def run(ctx: PipelineContext) -> None:
                 "Some features may be missing from BA docs."
             )
 
-        # W7: Old PHP version
-        php_ver = ctx.code_map.php_version or ""
-        try:
-            major = int(php_ver.split(".")[0])
-            if major < 7:
-                warnings.append(
-                    f"W7: PHP {php_ver} detected. Modern PHP patterns (typed properties, "
-                    "null coalescing, etc.) will not apply. BA docs will reflect legacy PHP idioms."
-                )
-        except (ValueError, IndexError):
-            pass
+        # W7: Old PHP version — only relevant for PHP projects
+        from context import Language as _LangW7
+        if ctx.code_map.language == _LangW7.PHP:
+            php_ver = ctx.code_map.php_version or ""
+            try:
+                major = int(php_ver.split(".")[0])
+                if major < 7:
+                    warnings.append(
+                        f"W7: PHP {php_ver} detected. Modern PHP patterns (typed properties, "
+                        "null coalescing, etc.) will not apply. BA docs will reflect legacy PHP idioms."
+                    )
+            except (ValueError, IndexError):
+                pass
 
     # ── W8–W11: Static analysis output checks (Stages 3.5–3.8) ───────────────
 
@@ -471,14 +533,28 @@ def run(ctx: PipelineContext) -> None:
 
 # ─── Checks ────────────────────────────────────────────────────────────────────
 
+_SANITY_QUERIES: dict[str, str] = {
+    "typescript":  "React component API route database query",
+    "javascript":  "JavaScript module function database query",
+    "java":        "Spring service repository database query",
+    "kotlin":      "Kotlin coroutine service repository database",
+    "php":         "PHP file database query SQL",
+}
+
 def _run_sanity_query(ctx: PipelineContext) -> tuple[bool, str, float]:
     """
     Fire a basic semantic query at ChromaDB to confirm it's returning
     sensible results. Returns (ok, message, best_distance).
+
+    The query string is language-adaptive so it retrieves chunks that are
+    actually relevant to the project's tech stack rather than always
+    searching for PHP-specific terminology.
     """
+    lang = ctx.code_map.language.value if ctx.code_map else "php"
+    query = _SANITY_QUERIES.get(lang, f"{lang} source file function class database")
     try:
         from pipeline.stage30_embed import query_collection
-        results = query_collection(ctx, "PHP file database query", n_results=1)
+        results = query_collection(ctx, query, n_results=1)
         if not results:
             return False, "Query returned zero results", 1.0
         dist = results[0]["distance"]

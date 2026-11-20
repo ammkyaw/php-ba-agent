@@ -201,8 +201,12 @@ def _collect_route_gaps(ctx: PipelineContext) -> list[dict]:
                 page = step.get("page", "") if isinstance(step, dict) else getattr(step, "page", "")
                 if page:
                     covered_uris.add(page.split("?")[0].lower().rstrip("/") or "/")
+        _SKIP_KINDS = {"nextjs_page", "nextjs_app_router", "nextjs_pages_router"}
         for route in routes:
             if not isinstance(route, dict):
+                continue
+            # UI page routes are not API handlers — no flow needed
+            if route.get("kind", "") in _SKIP_KINDS:
                 continue
             uri   = route.get("uri") or route.get("path", "")
             verb  = route.get("method") or route.get("verb", "GET")

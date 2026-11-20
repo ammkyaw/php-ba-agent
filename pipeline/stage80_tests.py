@@ -57,7 +57,8 @@ from pipeline.llm_client import call_llm
 # ── Constants ──────────────────────────────────────────────────────────────────
 
 STAGE_NAME = "stage80_tests"
-MAX_TOKENS = 32000  # code output is dense; raised to prevent mid-block truncation
+MAX_TOKENS           = 8192   # per-format call — one format per call avoids truncation
+TEST_GEN_TEMPERATURE = 0.1    # test code: syntax must be consistent across chunks
 
 # AC text budget per LLM call — keeps prompt + response within model limits
 _MAX_AC_CHARS    = 3_500  # halved — smaller input → smaller output → less truncation risk
@@ -108,71 +109,89 @@ def run(ctx: PipelineContext) -> None:
     chunks = _chunk_ac(ac_text)
     print(f"  [{STAGE_NAME}] AC split into {len(chunks)} chunk(s)")
 
-    all_gherkin:    list[str] = []
-    all_playwright: list[str] = []
-    all_pytest:     list[str] = []
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+    from pipeline.llm_client import get_max_workers
 
-    for idx, chunk in enumerate(chunks, 1):
-        label = f"{STAGE_NAME}_chunk{idx}"
-        print(f"  [{STAGE_NAME}] Calling LLM for chunk {idx}/{len(chunks)} ...")
+    all_gherkin:    list[str] = ["" for _ in chunks]
+    all_playwright: list[str] = ["" for _ in chunks]
+    all_pytest:     list[str] = ["" for _ in chunks]
 
-        raw = call_llm(
-            system_prompt = _SYSTEM_PROMPT,
-            user_prompt   = _USER_PROMPT_TEMPLATE.format(
-                context_block = context_block,
-                ac_chunk      = chunk,
-                chunk_index   = idx,
-                total_chunks  = len(chunks),
-            ),
-            max_tokens = MAX_TOKENS,
-            label      = label,
+    _FORMATS = ["gherkin", "playwright", "pytest"]
+
+    def _store(idx_0: int, fmt: str, res: str) -> None:
+        """Write a completed result into the correct output slot."""
+        if fmt == "gherkin":       all_gherkin[idx_0]    = res
+        elif fmt == "playwright":  all_playwright[idx_0] = res
+        elif fmt == "pytest":      all_pytest[idx_0]     = res
+
+    def _chunk_task(idx_0: int, chunk: str) -> list[tuple[str, str]]:
+        """
+        Process one chunk: fire all 3 format calls in parallel via an inner
+        pool, collect results, and return [(fmt, result), ...].
+        Raises if any format call fails — propagated to the outer pool.
+        """
+        idx = idx_0 + 1
+        base_user = _USER_PROMPT_BASE.format(
+            context_block = context_block,
+            ac_chunk      = chunk,
+            chunk_index   = idx,
+            total_chunks  = len(chunks),
         )
+        results: list[tuple[str, str]] = []
+        with ThreadPoolExecutor(max_workers=len(_FORMATS)) as inner:
+            fmt_futures = {
+                inner.submit(_call_single_format, base_user, fmt, idx): fmt
+                for fmt in _FORMATS
+            }
+            for fut in as_completed(fmt_futures):
+                fmt = fmt_futures[fut]
+                results.append((fmt, fut.result()))  # raises on LLM error
+        return results
 
-        data = _parse_llm_response(raw)
-        _validate_response(data, idx)
+    # workers controls chunk-level concurrency; each chunk always fires all
+    # 3 format calls in parallel, so total concurrent LLM calls = workers × 3.
+    workers         = get_max_workers()
+    chunk_slots     = min(len(chunks), workers)
+    total_calls     = len(chunks) * len(_FORMATS)
+    max_concurrent  = chunk_slots * len(_FORMATS)
+    print(
+        f"  [{STAGE_NAME}] {total_calls} LLM calls total "
+        f"({len(chunks)} chunk(s) × {len(_FORMATS)} formats) — "
+        f"{chunk_slots} chunk(s) at a time = {max_concurrent} concurrent calls ..."
+    )
 
-        gherkin_content    = data.get("gherkin",    "").strip()
-        playwright_content = data.get("playwright", "").strip()
-        pytest_content     = data.get("pytest",     "").strip()
-
-        # Bug 1 guard: Gemini sometimes returns delimiter tags with no content
-        # (e.g. when the AC chunk has no real criteria to generate from, or the
-        # model is confused by the input).  Detect this and retry once with an
-        # explicit nudge before giving up and skipping the chunk.
-        if not any([gherkin_content, playwright_content, pytest_content]):
-            preview = raw[:300].replace("\n", "\\n")
-            print(f"  [{STAGE_NAME}] DEBUG raw response start: {preview!r}")
-            print(f"  [{STAGE_NAME}] ⚠️  Chunk {idx}: empty response — retrying with nudge ...")
-            retry_raw = call_llm(
-                system_prompt = _SYSTEM_PROMPT,
-                user_prompt   = _USER_PROMPT_TEMPLATE.format(
-                    context_block = context_block,
-                    ac_chunk      = chunk,
-                    chunk_index   = idx,
-                    total_chunks  = len(chunks),
-                ) + "\n\nIMPORTANT: You MUST write actual test content between the delimiter tags. Do not return empty blocks.",
-                max_tokens = MAX_TOKENS,
-                label      = f"{label}_retry",
-            )
-            retry_data = _parse_llm_response(retry_raw)
-            gherkin_content    = retry_data.get("gherkin",    "").strip()
-            playwright_content = retry_data.get("playwright", "").strip()
-            pytest_content     = retry_data.get("pytest",     "").strip()
-            if not any([gherkin_content, playwright_content, pytest_content]):
-                print(f"  [{STAGE_NAME}] ⚠️  Chunk {idx}: retry also empty — skipping chunk.")
-
-        # Bug 2 guard: truncated response leaves playwright/pytest cut mid-block.
-        # Detect truncation by checking if the end tag is absent but start tag is
-        # present in the raw response — a sign the output was cut before completion.
-        for key, (start_tag, end_tag) in _DELIMITERS.items():
-            if start_tag in raw and end_tag not in raw:
-                print(f"  [{STAGE_NAME}] ⚠️  Chunk {idx}: '{key}' block truncated "
-                      f"(start tag present, end tag missing). "
-                      f"Consider reducing _MAX_AC_CHARS or raising MAX_TOKENS.")
-
-        all_gherkin.append(gherkin_content)
-        all_playwright.append(playwright_content)
-        all_pytest.append(pytest_content)
+    if workers > 1 and len(chunks) > 1:
+        with ThreadPoolExecutor(max_workers=chunk_slots) as pool:
+            future_to_idx = {
+                pool.submit(_chunk_task, idx_0, chunk): idx_0
+                for idx_0, chunk in enumerate(chunks)
+            }
+            failed = 0
+            for fut in as_completed(future_to_idx):
+                idx_0 = future_to_idx[fut]
+                try:
+                    for fmt, res in fut.result():
+                        _store(idx_0, fmt, res)
+                    print(f"  [{STAGE_NAME}] ✓ chunk {idx_0 + 1}/{len(chunks)} [all formats]")
+                except Exception as exc:
+                    failed += 1
+                    print(f"  [{STAGE_NAME}] ✗ chunk {idx_0 + 1}/{len(chunks)} failed — {exc}")
+            if failed:
+                raise RuntimeError(
+                    f"[{STAGE_NAME}] {failed}/{len(chunks)} chunk(s) failed. "
+                    f"See log above for details."
+                )
+    else:
+        # Single chunk or workers=1: still fire 3 formats in parallel per chunk
+        for idx_0, chunk in enumerate(chunks):
+            try:
+                for fmt, res in _chunk_task(idx_0, chunk):
+                    _store(idx_0, fmt, res)
+                print(f"  [{STAGE_NAME}] ✓ chunk {idx_0 + 1}/{len(chunks)} [all formats]")
+            except Exception as exc:
+                raise RuntimeError(
+                    f"[{STAGE_NAME}] chunk {idx_0 + 1} failed — {exc}"
+                ) from exc
 
     # ── Merge chunks into final files ─────────────────────────────────────────
     domain_name = ctx.domain_model.domain_name if ctx.domain_model else "System"
@@ -382,6 +401,15 @@ def _parse_json_fallback(text: str) -> dict[str, Any]:
             return {}
         text = text[start:]
 
+    # raw_decode stops at the first complete JSON object — handles "Extra data"
+    # errors when the model emits a second object or trailing thinking tokens.
+    try:
+        obj, _ = json.JSONDecoder().raw_decode(text)
+        if isinstance(obj, dict):
+            return obj
+    except json.JSONDecodeError:
+        pass
+
     end = text.rfind("}")
     clean = text[: end + 1] if end != -1 else text
     try:
@@ -582,23 +610,142 @@ _SYSTEM_PROMPT = textwrap.dedent("""    You are a senior QA automation engineer 
     Produce nothing outside these delimiter blocks. No preamble. No explanation.
 """)
 
-_USER_PROMPT_TEMPLATE = textwrap.dedent("""    === CONTEXT ===
+# Base user prompt — format label and delimiter injected per call
+_USER_PROMPT_BASE = textwrap.dedent("""    === CONTEXT ===
     {context_block}
 
     === ACCEPTANCE CRITERIA (chunk {chunk_index} of {total_chunks}) ===
     {ac_chunk}
-
-    Generate Gherkin scenarios, Playwright tests, and pytest stubs for every
-    acceptance criterion in the chunk above.
-
-    Respond using EXACTLY the delimiter format from your instructions:
-    ---GHERKIN---
-    (gherkin scenarios)
-    ---END_GHERKIN---
-    ---PLAYWRIGHT---
-    (playwright tests)
-    ---END_PLAYWRIGHT---
-    ---PYTEST---
-    (pytest stubs)
-    ---END_PYTEST---
 """)
+
+# Keep old name as alias so any external references still work
+_USER_PROMPT_TEMPLATE = _USER_PROMPT_BASE
+
+_FORMAT_INSTRUCTIONS: dict[str, str] = {
+    "gherkin": textwrap.dedent("""\
+        Generate ONLY Gherkin scenarios for every acceptance criterion above.
+        Use Given/When/Then/And steps. Tag each scenario. No Feature: line.
+        Wrap output EXACTLY like this — nothing outside the tags:
+        ---GHERKIN---
+        (scenarios here)
+        ---END_GHERKIN---
+    """),
+    "playwright": textwrap.dedent("""\
+        Generate ONLY Playwright (JavaScript) test blocks for every acceptance
+        criterion above. One test() per criterion inside a describe() block.
+        Use page.goto/fill/click/expect. No import lines.
+        Wrap output EXACTLY like this — nothing outside the tags:
+        ---PLAYWRIGHT---
+        (tests here)
+        ---END_PLAYWRIGHT---
+    """),
+    "pytest": textwrap.dedent("""\
+        Generate ONLY pytest stubs for every acceptance criterion above.
+        One test_ function per criterion. Use requests library. No import lines.
+        Wrap output EXACTLY like this — nothing outside the tags:
+        ---PYTEST---
+        (stubs here)
+        ---END_PYTEST---
+    """),
+}
+
+_FORMAT_SYSTEM: dict[str, str] = {
+    "gherkin": textwrap.dedent("""\
+        You are a senior QA engineer specialising in BDD testing.
+        Write Gherkin .feature scenarios from acceptance criteria.
+        Produce ONLY the content between the delimiter tags requested.
+        No preamble. No explanation. No JSON.
+    """),
+    "playwright": textwrap.dedent("""\
+        You are a senior QA automation engineer specialising in Playwright E2E tests.
+        Write Playwright JavaScript test blocks from acceptance criteria.
+        Produce ONLY the content between the delimiter tags requested.
+        No preamble. No explanation. No JSON. No import/require lines.
+    """),
+    "pytest": textwrap.dedent("""\
+        You are a senior QA automation engineer specialising in pytest API tests.
+        Write pytest stubs using the requests library from acceptance criteria.
+        Produce ONLY the content between the delimiter tags requested.
+        No preamble. No explanation. No JSON. No import lines.
+    """),
+}
+
+
+def _extract_format_content(raw: str, fmt: str) -> str:
+    """
+    Extract format content from raw LLM response using multiple strategies:
+    1. Delimiter tags  ---GHERKIN--- / ---END_GHERKIN---
+    2. Markdown code fence  ```gherkin / ``` or ```javascript / ``` or ```python / ```
+    3. Truncated delimiter (start tag present, end tag missing)
+    4. Bare response (whole response treated as content)
+    """
+    start_tag, end_tag = _DELIMITERS[fmt]
+
+    # Strategy 1: delimiters
+    pattern = re.escape(start_tag) + r"\s*(.*?)\s*" + re.escape(end_tag)
+    m = re.search(pattern, raw, re.DOTALL)
+    if m:
+        return m.group(1).strip()
+
+    # Strategy 2: markdown code fences
+    _FENCE_LANGS: dict[str, list[str]] = {
+        "gherkin":    ["gherkin", "feature", "cucumber"],
+        "playwright": ["javascript", "js", "typescript", "ts"],
+        "pytest":     ["python", "py"],
+    }
+    for lang in _FENCE_LANGS.get(fmt, []):
+        fence_pat = rf"```{lang}\s*(.*?)\s*```"
+        fm = re.search(fence_pat, raw, re.DOTALL | re.IGNORECASE)
+        if fm:
+            return fm.group(1).strip()
+    # generic fence
+    generic = re.search(r"```\s*(.*?)\s*```", raw, re.DOTALL)
+    if generic:
+        return generic.group(1).strip()
+
+    # Strategy 3: truncated delimiter
+    if start_tag in raw:
+        return raw[raw.index(start_tag) + len(start_tag):].strip()
+
+    # Strategy 4: bare response — use as-is if non-empty
+    stripped = raw.strip()
+    if stripped:
+        return stripped
+
+    return ""
+
+
+def _call_single_format(base_user: str, fmt: str, chunk_idx: int) -> str:
+    """Call LLM for one format (gherkin/playwright/pytest) and return extracted content."""
+    start_tag, _end_tag = _DELIMITERS[fmt]
+    label = f"{STAGE_NAME}_chunk{chunk_idx}_{fmt}"
+
+    # Prefill: end the user prompt with the start tag so the model continues from it
+    # rather than needing to emit the tag itself — more reliable on local models.
+    user_prompt = base_user + "\n" + _FORMAT_INSTRUCTIONS[fmt] + f"\n{start_tag}\n"
+
+    raw = call_llm(
+        system_prompt = _FORMAT_SYSTEM[fmt],
+        user_prompt   = user_prompt,
+        max_tokens    = MAX_TOKENS,
+        temperature   = TEST_GEN_TEMPERATURE,
+        label         = label,
+    )
+
+    content = _extract_format_content(raw, fmt)
+    if content:
+        return content
+
+    # Last resort retry
+    print(f"  [{STAGE_NAME}] ⚠️  Chunk {chunk_idx} {fmt}: empty — retrying ...")
+    retry_raw = call_llm(
+        system_prompt = _FORMAT_SYSTEM[fmt],
+        user_prompt   = user_prompt,
+        max_tokens    = MAX_TOKENS,
+        temperature   = TEST_GEN_TEMPERATURE,
+        label         = f"{label}_retry",
+    )
+    result = _extract_format_content(retry_raw, fmt)
+    if not result:
+        print(f"  [{STAGE_NAME}] ⚠️  Chunk {chunk_idx} {fmt}: retry also empty — skipping.")
+    return result

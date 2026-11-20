@@ -39,7 +39,7 @@ from context import CodeMap, Framework, Language, PipelineContext
 from pipeline.parsers.base import LanguageParser
 
 
-_TS_EXTS = {".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs", ".vue"}
+_TS_EXTS = {".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs", ".vue", ".d.ts"}
 
 # ─── Adapter ──────────────────────────────────────────────────────────────────
 
@@ -89,8 +89,9 @@ class TypeScriptParser(LanguageParser):
         service_deps : list[dict] = []
         env_vars     : list[dict] = []
         auth_signals : list[dict] = []
-        input_params : list[dict] = []
-        http_endpoints: list[dict] = []
+        input_params     : list[dict] = []
+        http_endpoints   : list[dict] = []
+        type_definitions : list[dict] = []
 
         total_lines = 0
 
@@ -111,6 +112,7 @@ class TypeScriptParser(LanguageParser):
             _extract_call_graph(src, rel, call_graph)
             _extract_form_fields(src, rel, form_fields)
             _extract_sql_queries(src, rel, sql_queries)
+            _extract_ts_types(src, rel, type_definitions)
 
             if framework in (Framework.EXPRESS, Framework.FASTIFY, Framework.NESTJS, Framework.UNKNOWN):
                 _extract_express_routes(src, rel, routes)
@@ -163,9 +165,10 @@ class TypeScriptParser(LanguageParser):
             service_deps     = service_deps,
             env_vars         = env_vars,
             auth_signals     = auth_signals,
-            http_endpoints   = http_endpoints,
-            table_columns    = table_columns,
-            input_params     = input_params,
+            http_endpoints    = http_endpoints,
+            table_columns     = table_columns,
+            input_params      = input_params,
+            type_definitions  = type_definitions,
         )
 
         # Persist as code_map.json (add metadata wrapper)
@@ -255,6 +258,88 @@ def _extract_classes(src: str, rel: str, classes: list, controllers: list, model
             classes.append(entry)
 
 
+def _extract_ts_types(src: str, rel: str, type_definitions: list) -> None:
+    """Extract exported TypeScript interfaces and type aliases with their fields.
+
+    Each entry has the shape::
+
+        {
+          "name":   "Sprint",
+          "kind":   "interface" | "type_alias",
+          "file":   "src/types/sprint-data.ts",
+          "fields": [
+              {"name": "id",     "type": "string",   "optional": False},
+              {"name": "tasks",  "type": "Task[]",   "optional": True},
+          ]
+        }
+
+    Field extraction uses a single-depth regex pass — nested generics are
+    captured as their raw type string (e.g. ``Record<string, Task>``).
+    """
+    # ── Exported interfaces ───────────────────────────────────────────────────
+    for m in re.finditer(
+        r"export\s+(?:default\s+)?interface\s+(\w+)(?:\s+extends\s+[\w\s,<>]+)?\s*\{([^}]{0,2000})\}",
+        src, re.DOTALL
+    ):
+        name   = m.group(1)
+        body   = m.group(2)
+        fields = _parse_type_body(body)
+        type_definitions.append({
+            "name":   name,
+            "kind":   "interface",
+            "file":   rel,
+            "fields": fields,
+        })
+
+    # ── Exported type aliases (object shape only) ─────────────────────────────
+    # Matches: export type Sprint = { id: string; ... }
+    # Skips union/intersection aliases (no leading brace after =)
+    for m in re.finditer(
+        r"export\s+type\s+(\w+)\s*(?:<[^>]{0,100}>)?\s*=\s*\{([^}]{0,2000})\}",
+        src, re.DOTALL
+    ):
+        name   = m.group(1)
+        body   = m.group(2)
+        fields = _parse_type_body(body)
+        type_definitions.append({
+            "name":   name,
+            "kind":   "type_alias",
+            "file":   rel,
+            "fields": fields,
+        })
+
+
+def _parse_type_body(body: str) -> list[dict]:
+    """Extract field name, type, and optionality from an interface/type body string.
+
+    Handles both multi-line and inline (semicolon-separated) field formats::
+
+        # multi-line
+        id: string
+        name?: string
+
+        # inline
+        id: string; name?: string; tasks: Task[]
+    """
+    fields: list[dict] = []
+    # Split on ; or newlines so each segment contains at most one field declaration
+    for segment in re.split(r"[;\n]", body):
+        m = re.match(
+            r"\s*(?:readonly\s+)?(\w+)(\?)?\s*:\s*([^,;\n}{]{1,120})",
+            segment
+        )
+        if not m:
+            continue
+        field_name = m.group(1)
+        optional   = m.group(2) == "?"
+        field_type = m.group(3).strip().rstrip(",")
+        # Skip method signatures — field name would contain ( from the param list
+        if "(" in segment[:m.end()]:
+            continue
+        fields.append({"name": field_name, "type": field_type, "optional": optional})
+    return fields
+
+
 def _extract_functions(src: str, rel: str, functions: list) -> None:
     # Named function declarations
     for m in re.finditer(r"(?:export\s+)?(?:async\s+)?function\s+(\w+)\s*\(", src):
@@ -279,16 +364,32 @@ def _extract_env_vars(src: str, rel: str, env_vars: list) -> None:
 
 def _extract_auth_signals(src: str, rel: str, auth_signals: list) -> None:
     patterns = [
+        # Server-side patterns
         (r"passport\.authenticate\s*\(", "passport"),
         (r"jwt\.verify\s*\(", "jwt"),
         (r"@(?:UseGuards|AuthGuard)", "nestjs_guard"),
         (r"verifyToken|verifyJwt|checkAuth|isAuthenticated|requireAuth", "auth_middleware"),
         (r"\.session\s*\.\s*user|req\.user\b", "session_user"),
         (r"bearerAuth|Bearer\s+token", "bearer"),
+        # Firebase client-side auth
+        (r"signInWithEmailAndPassword\s*\(", "firebase_email_signin"),
+        (r"createUserWithEmailAndPassword\s*\(", "firebase_email_signup"),
+        (r"signInWithPopup\s*\(", "firebase_oauth_popup"),
+        (r"signInWithRedirect\s*\(", "firebase_oauth_redirect"),
+        (r"signOut\s*\(\s*auth", "firebase_signout"),
+        (r"onAuthStateChanged\s*\(", "firebase_auth_state"),
+        (r"GoogleAuthProvider|GithubAuthProvider|FacebookAuthProvider", "firebase_oauth_provider"),
+        # Supabase auth
+        (r"supabase\.auth\.signIn|supabase\.auth\.signUp", "supabase_auth"),
+        (r"supabase\.auth\.signOut", "supabase_signout"),
+        # Clerk
+        (r"useAuth\s*\(\)|SignIn|SignUp|useUser\s*\(\)", "clerk_auth"),
+        # NextAuth
+        (r"signIn\s*\(\s*['\"]|useSession\s*\(\)|getServerSession\s*\(", "nextauth"),
     ]
     for pattern, kind in patterns:
         if re.search(pattern, src, re.IGNORECASE):
-            auth_signals.append({"file": rel, "kind": kind})
+            auth_signals.append({"file": rel, "type": kind})
 
 
 def _extract_input_params(src: str, rel: str, input_params: list) -> None:
@@ -317,25 +418,128 @@ def _extract_call_graph(src: str, rel: str, call_graph: list) -> None:
 
 
 def _extract_form_fields(src: str, rel: str, form_fields: list) -> None:
-    # Zod / Yup schema fields: z.object({ email: z.string(), password: ... })
+    # ── Zod / Yup schema fields ────────────────────────────────────────────────
+    # z.object({ email: z.string(), password: ... })
     for m in re.finditer(r"z\.object\s*\(\s*\{([^}]{0,500})\}", src):
         for field_m in re.finditer(r"(\w+)\s*:", m.group(1)):
             form_fields.append({"file": rel, "field": field_m.group(1), "source": "zod"})
 
+    # ── React-controlled form containers ──────────────────────────────────────
+    # 1. Native JSX: <form onSubmit={handleLogin}> or <form onSubmit={(e) => {...}}>
+    #    [^}]+ stops at the first } so block-body inline functions are truncated.
+    #    Since the handler field is purely informational (V-07 only needs file/method),
+    #    we normalise any inline function to the label "(inline)".
+    for m in re.finditer(
+        r"<form\b[^>]*\bonSubmit\s*=\s*\{([^}]+)\}",
+        src, re.IGNORECASE
+    ):
+        raw = m.group(1).strip()
+        handler = "(inline)" if (raw.startswith("(") or "=>" in raw) else raw
+        form_fields.append({
+            "file": rel, "source": "react_form",
+            "method": "POST", "action": "", "handler": handler,
+        })
+
+    # 2. Next.js Server Actions: <form action={serverActionFn}>
+    #    action={fn} holds a function reference (not a URL) that IS the server
+    #    action.  Storing the function name in action lets flow coverage link it
+    #    to execution paths.  Exclude plain string literals ("/path") which are
+    #    traditional HTML actions handled separately.
+    for m in re.finditer(
+        r"<form\b[^>]*\baction\s*=\s*\{(\w+)\}",
+        src, re.IGNORECASE
+    ):
+        action_fn = m.group(1).strip()
+        form_fields.append({
+            "file": rel, "source": "server_action",
+            "method": "POST", "action": action_fn,
+        })
+
+    # 3. React Hook Form: useForm() / useForm<Schema>()
+    if re.search(r"\buseForm\s*[<(]", src):
+        form_fields.append({
+            "file": rel, "source": "rhf",
+            "method": "POST", "action": "",
+        })
+
+    # 4. Shadcn UI / RHF <Form> wrapper component
+    if re.search(r"<Form\b", src):
+        form_fields.append({
+            "file": rel, "source": "shadcn_form",
+            "method": "POST", "action": "",
+        })
+
+    # ── React form field names ─────────────────────────────────────────────────
+    # 4. RHF register("fieldName") / register("fieldName", { ... })
+    for m in re.finditer(r"\bregister\s*\(\s*['\"`](\w+)['\"`]", src):
+        form_fields.append({"file": rel, "field": m.group(1), "source": "rhf"})
+
+    # 5. <Input name="fieldName"> / <input name="fieldName"> (native + Shadcn)
+    for m in re.finditer(r"<[Ii]nput\b[^>]{0,200}\bname\s*=\s*['\"`](\w+)['\"`]", src):
+        form_fields.append({"file": rel, "field": m.group(1), "source": "react_input"})
+
+    # 6. RHF <Controller name="fieldName"> wrapper
+    for m in re.finditer(r"<Controller\b[^>]{0,200}\bname\s*=\s*['\"`](\w+)['\"`]", src):
+        form_fields.append({"file": rel, "field": m.group(1), "source": "rhf_controller"})
+
 
 def _extract_sql_queries(src: str, rel: str, sql_queries: list) -> None:
-    # Raw SQL strings
+    # Raw SQL strings — require a second SQL keyword to avoid matching UI strings
+    # e.g. "Select Role" is NOT SQL; "SELECT id FROM users" IS SQL
     for m in re.finditer(
         r"['\"`](SELECT|INSERT|UPDATE|DELETE|CREATE|DROP|ALTER)\b[^'\"`;]{0,300}",
         src, re.IGNORECASE
     ):
-        sql_queries.append({"file": rel, "operation": m.group(1).upper(), "raw": m.group(0)[:120]})
+        snippet = m.group(0)
+        if not re.search(r"\b(FROM|WHERE|INTO|SET|TABLE|JOIN|VALUES)\b", snippet, re.IGNORECASE):
+            continue   # UI string, not real SQL
+        sql_queries.append({"file": rel, "operation": m.group(1).upper(), "raw": snippet[:120]})
     # Prisma: prisma.user.create / findMany / update / delete
     for m in re.finditer(r"prisma\.(\w+)\.(create|findMany|findFirst|update|delete|upsert)\b", src):
         sql_queries.append({"file": rel, "orm": "prisma", "table": m.group(1), "operation": m.group(2)})
     # TypeORM: repository.save / find / delete
     for m in re.finditer(r"(?:repository|repo)\.(?:save|find|findOne|delete|update|insert)\b", src):
         sql_queries.append({"file": rel, "orm": "typeorm", "operation": m.group(0)})
+    # Firestore: collection(db, 'name') / collection(db, 'name').doc() etc.
+    # Also: addDoc/getDocs/setDoc/updateDoc/deleteDoc(collection(db, 'name'), ...)
+    for m in re.finditer(
+        r"collection\s*\([^,)]+,\s*['\"`](\w+)['\"`]\s*\)",
+        src
+    ):
+        sql_queries.append({"file": rel, "orm": "firestore", "table": m.group(1), "operation": "collection"})
+    # Chained form: addDoc(collection(db, 'tasks'), data)
+    for m in re.finditer(
+        r"(addDoc|setDoc|updateDoc|deleteDoc|getDocs|getDoc|getCountFromServer)\s*\(\s*collection\s*\([^,)]+,\s*['\"`](\w+)['\"`]",
+        src
+    ):
+        sql_queries.append({"file": rel, "orm": "firestore", "table": m.group(2), "operation": m.group(1)})
+    # Pre-referenced form: const ref = collection(db, 'tasks'); addDoc(ref, data)
+    # Table name is unknown but we still record the write so it counts in coverage.
+    _seen_chained = {m.start() for m in re.finditer(
+        r"(addDoc|setDoc|updateDoc|deleteDoc)\s*\(\s*collection\s*\(",
+        src
+    )}
+    for m in re.finditer(
+        r"(addDoc|setDoc|updateDoc|deleteDoc)\s*\(\s*(\w+)",
+        src
+    ):
+        if m.start() in _seen_chained:
+            continue   # already captured by chained form above
+        sql_queries.append({"file": rel, "orm": "firestore", "table": m.group(2), "operation": m.group(1)})
+
+    # React Query / SWR Mutations: useMutation(...)
+    # Note: useMutation is a broad signal — it wraps any async function, not
+    # exclusively DB writes.  It is recorded as a write because in Firebase
+    # projects it almost always wraps a Firestore mutation.
+    for m in re.finditer(r"\buseMutation\s*\(", src):
+        sql_queries.append({"file": rel, "orm": "hooks", "table": "(mutation)", "operation": "useMutation"})
+
+    # Firebase Transactions / Batches — use call-site regex to avoid matching
+    # comments, imports, or unrelated identifiers that contain the substring.
+    if re.search(r"\brunTransaction\s*\(", src):
+        sql_queries.append({"file": rel, "orm": "firestore", "table": "(transaction)", "operation": "runTransaction"})
+    if re.search(r"\bwriteBatch\s*\(", src) or re.search(r"\bbatch\s*\.\s*commit\s*\(", src):
+        sql_queries.append({"file": rel, "orm": "firestore", "table": "(batch)", "operation": "writeBatch"})
 
 
 # ─── Route extractors ─────────────────────────────────────────────────────────
@@ -372,30 +576,77 @@ def _extract_nestjs_routes(src: str, rel: str, routes: list, controllers: list) 
 def _extract_nextjs_routes(src_file: Path, root: Path, rel: str, routes: list) -> None:
     """
     Next.js file-based routing:
-    pages/api/users.ts       → /api/users  (all methods)
-    app/api/users/route.ts   → /api/users  (exported GET/POST/… functions)
+    pages/api/users.ts            → /api/users  (API route, all methods)
+    app/api/users/route.ts        → /api/users  (API route, exported GET/POST/…)
+    app/prism/page.tsx            → /prism       (page route, GET)
+    pages/dashboard/index.tsx     → /dashboard   (page route, GET)
     """
     parts = src_file.parts
-    # pages/api/...
+
+    def _normalise_path(path_parts: tuple) -> str:
+        path = "/" + "/".join(path_parts).replace("\\", "/")
+        path = re.sub(r"\(([^)]+)\)", "", path)   # remove (group) layout segments
+        path = re.sub(r"\[(\w+)\]", r":\1", path)  # [id] → :id
+        path = re.sub(r"//+", "/", path)            # collapse double slashes
+        return path.rstrip("/") or "/"
+
+    # pages/api/** — API routes
     if "pages" in parts:
         idx = list(parts).index("pages")
         api_parts = parts[idx+1:]
         if api_parts and api_parts[0] == "api":
-            path = "/" + "/".join(api_parts).replace("\\", "/")
+            path = _normalise_path(api_parts)
             path = re.sub(r"\.(ts|tsx|js|jsx)$", "", path)
-            path = re.sub(r"\[(\w+)\]", r":\1", path)   # [id] → :id
-            routes.append({"method": "ANY", "path": path, "file": rel, "kind": "nextjs_pages"})
+            # handler = file stem (conventionally the default-export handler fn)
+            # Sanitise dynamic segments so e.g. [id].ts → id, [...slug].ts → catchall_slug
+            handler = re.sub(r"\.(ts|tsx|js|jsx)$", "", src_file.name)
+            handler = re.sub(r"\[\.\.\.(\w+)\]", r"catchall_\1", handler)
+            handler = re.sub(r"\[(\w+)\]", r"\1", handler)
+            routes.append({"method": "ANY", "path": path, "handler": handler,
+                           "file": rel, "kind": "nextjs_pages_api"})
+        elif src_file.name in ("page.tsx", "page.ts", "page.jsx", "page.js",
+                               "index.tsx", "index.ts", "index.jsx", "index.js"):
+            # pages/** page routes
+            page_parts = parts[idx+1:]
+            path = _normalise_path(page_parts)
+            path = re.sub(r"\.(ts|tsx|js|jsx)$", "", path)
+            path = re.sub(r"/index$", "", path)
+            path_stem = (path.rstrip("/").split("/")[-1] or "root").lstrip(":")
+            routes.append({"method": "GET", "path": path or "/", "handler": f"{path_stem}_page",
+                           "file": rel, "kind": "nextjs_page"})
 
-    # app/**/route.ts (App Router)
-    if "app" in parts and src_file.name in ("route.ts", "route.js"):
+    # app/** (App Router)
+    if "app" in parts:
         idx = list(parts).index("app")
-        path_parts = parts[idx+1:-1]   # exclude "route.ts"
-        path = "/" + "/".join(path_parts).replace("\\", "/")
-        path = re.sub(r"\(([^)]+)\)", "", path)   # (group) → removed
-        path = re.sub(r"\[(\w+)\]", r":\1", path)
-        src = LanguageParser.safe_read(src_file) or ""
-        for method in re.findall(r"export\s+(?:async\s+)?function\s+(GET|POST|PUT|PATCH|DELETE)\b", src):
-            routes.append({"method": method, "path": path or "/", "file": rel, "kind": "nextjs_app"})
+        # API routes: app/**/route.ts
+        if src_file.name in ("route.ts", "route.js", "route.tsx", "route.jsx"):
+            path_parts = parts[idx+1:-1]
+            path = _normalise_path(path_parts)
+            src_content = LanguageParser.safe_read(src_file) or ""
+            dir_rel = str(Path(rel).parent).replace("\\", "/")
+
+            methods_found = False
+            for method in re.findall(
+                r"export\s+(?:const\s+|async\s+)?(?:function\s+)?(GET|POST|PUT|PATCH|DELETE|HEAD)\b",
+                src_content
+            ):
+                methods_found = True
+                # In App Router, the exported HTTP-verb name IS the handler function name
+                routes.append({"method": method, "path": path or "/", "handler": method,
+                               "file": rel, "dir": dir_rel, "kind": "nextjs_app_api"})
+
+            if not methods_found:
+                routes.append({"method": "ANY", "path": path or "/", "handler": "handler",
+                               "file": rel, "dir": dir_rel, "kind": "nextjs_app_api"})
+
+        # Page routes: app/**/page.tsx
+        elif src_file.name in ("page.tsx", "page.ts", "page.jsx", "page.js"):
+            path_parts = parts[idx+1:-1]
+            path = _normalise_path(path_parts)
+            dir_rel = str(Path(rel).parent).replace("\\", "/")
+            path_stem = (path.rstrip("/").split("/")[-1] or "root").lstrip(":")
+            routes.append({"method": "GET", "path": path or "/", "handler": f"{path_stem}_page",
+                           "file": rel, "dir": dir_rel, "kind": "nextjs_page"})
 
 
 def _extract_vue_router_routes(source_files: list[Path], root: Path, routes: list) -> None:

@@ -67,6 +67,24 @@ Environment variables:
                        Use this with vLLM < 0.4.3 that predates structured-
                        output support.  Default: 0 (use response_format).
                          export VLLM_GUIDED_JSON=1
+    VLLM_REPETITION_PENALTY
+                       Float penalty applied to already-generated tokens to
+                       prevent degenerate repetition loops (e.g. "Wait, I need
+                       to check…" repeating hundreds of times).
+                       1.0 = disabled; default = 1.05 (light nudge).
+                         export VLLM_REPETITION_PENALTY=1.1
+    VLLM_ENABLE_THINKING
+                       "1" to enable chain-of-thought reasoning for Qwen3 /
+                       DeepSeek-R1 models on vLLM (sets chat_template_kwargs
+                       enable_thinking=true per request).  Default: 0 (off).
+                       When disabled, no <think> scratchpad is generated so
+                       there is nothing to leak into the output document.
+                         export VLLM_ENABLE_THINKING=1
+    VLLM_REPETITION_WINDOW / VLLM_REPETITION_THRESHOLD
+                       Post-hoc loop detector: slide a window of WINDOW chars
+                       over the response; if the same block appears ≥ THRESHOLD
+                       times, truncate at the second occurrence.
+                       Defaults: WINDOW=200, THRESHOLD=3.
 
     Response cache (pipeline/llm_cache.py):
     LLM_CACHE_ENABLED  "1"|"true"|"yes" to enable the SQLite exact-match cache
@@ -126,10 +144,65 @@ Usage:
 from __future__ import annotations
 
 import os
+import re
 import socket
 import threading
 import time
 from typing import Optional
+
+
+# ── Backend config-file loader ─────────────────────────────────────────────────
+def _load_backend_config() -> None:
+    """
+    Load per-backend env config file, setting variables that are not already
+    in the environment (env vars always take precedence).
+
+    Lookup order (first found wins):
+      1. .llm/<backend>.env          — project-local (gitignored)
+      2. ~/.config/codebase-ba/<backend>.env  — user-level
+
+    File format — plain KEY=VALUE, one per line:
+      VLLM_MODEL=qwen3.5-27b-nvfp4
+      VLLM_MAX_WORKERS=8
+      # comments are ignored
+      OLLAMA_NUM_CTX=32768
+
+    Security: files are parsed as plain text (no eval/shell execution).
+    Sensitive values (API keys etc.) belong in the user-level file with
+    chmod 600, not in the project-local file.
+    """
+    backend = os.environ.get("LOCAL_LLM_BACKEND", "").strip().lower()
+    if not backend:
+        return
+
+    candidates = [
+        os.path.join(os.getcwd(), ".llm", f"{backend}.env"),
+        os.path.expanduser(f"~/.config/codebase-ba/{backend}.env"),
+    ]
+
+    for path in candidates:
+        if not os.path.isfile(path):
+            continue
+        loaded: list[str] = []
+        with open(path) as _f:
+            for line in _f:
+                line = line.strip()
+                if not line or line.startswith("#"):
+                    continue
+                if "=" not in line:
+                    continue
+                key, _, val = line.partition("=")
+                key = key.strip()
+                val = val.strip().strip('"').strip("'")
+                if key and key not in os.environ:
+                    os.environ[key] = val
+                    loaded.append(key)
+        if loaded:
+            print(f"  [llm_client] Loaded backend config: {path} ({', '.join(loaded)})")
+        return   # stop after first found
+
+
+_load_backend_config()   # runs once at import time
 
 
 # ── Per-call token stats ───────────────────────────────────────────────────────
@@ -147,10 +220,122 @@ def _get_tok() -> tuple[int, int]:
     return getattr(_tok_stats, "in_tok", -1), getattr(_tok_stats, "out_tok", -1)
 
 
+# ── LLM call telemetry ─────────────────────────────────────────────────────────
+# Collects one record per successful call; written to JSONL during the run and
+# summarised into a grouped JSON at pipeline end.
+import json as _json_tel
+import datetime as _dt
+
+_telemetry_path: str | None = None          # set by run_pipeline via set_telemetry_path()
+_telemetry_lock = threading.Lock()          # guards file writes from concurrent stage50 threads
+
+
+def set_telemetry_path(path: str) -> None:
+    """Point the telemetry writer at *path* (JSONL, one record per call).
+    Call once after PipelineContext is created, before the pipeline runs."""
+    global _telemetry_path
+    _telemetry_path = path
+
+
+def _record_telemetry(label: str, model: str, duration_s: float,
+                      tokens_in: int, tokens_out: int) -> None:
+    """Append one JSON line to the telemetry file (no-op if path not set)."""
+    if not _telemetry_path:
+        return
+    record = {
+        "timestamp":  _dt.datetime.now(tz=_dt.timezone.utc).isoformat(),
+        "stage":      label or "unknown",
+        "model":      model,
+        "duration_s": round(duration_s, 3),
+        "tokens_in":  tokens_in,
+        "tokens_out": tokens_out,
+    }
+    with _telemetry_lock:
+        with open(_telemetry_path, "a", encoding="utf-8") as _f:
+            _f.write(_json_tel.dumps(record) + "\n")
+
+
+def write_telemetry_summary(summary_path: str) -> None:
+    """Read the JSONL telemetry file and write a grouped summary JSON.
+
+    Output format::
+
+        {
+          "generated_at": "<iso timestamp>",
+          "total_calls": 42,
+          "total_tokens_in": 1234567,
+          "total_tokens_out": 234567,
+          "total_duration_s": 456.7,
+          "by_stage": {
+            "stage40_domain": {
+              "calls": 5,
+              "total_tokens_in": 50000,
+              "total_tokens_out": 10000,
+              "total_duration_s": 45.2,
+              "entries": [ {...}, ... ]
+            },
+            ...
+          }
+        }
+    """
+    if not _telemetry_path:
+        return
+    import os as _os
+    if not _os.path.exists(_telemetry_path):
+        return
+
+    records: list[dict] = []
+    with open(_telemetry_path, encoding="utf-8") as _f:
+        for line in _f:
+            line = line.strip()
+            if line:
+                try:
+                    records.append(_json_tel.loads(line))
+                except _json_tel.JSONDecodeError:
+                    pass
+
+    by_stage: dict[str, dict] = {}
+    for r in records:
+        stage = r.get("stage", "unknown")
+        if stage not in by_stage:
+            by_stage[stage] = {"calls": 0, "total_tokens_in": 0,
+                               "total_tokens_out": 0, "total_duration_s": 0.0,
+                               "entries": []}
+        g = by_stage[stage]
+        g["calls"]            += 1
+        g["total_tokens_in"]  += r.get("tokens_in",  0) if r.get("tokens_in",  -1) >= 0 else 0
+        g["total_tokens_out"] += r.get("tokens_out", 0) if r.get("tokens_out", -1) >= 0 else 0
+        g["total_duration_s"] = round(g["total_duration_s"] + r.get("duration_s", 0.0), 3)
+        g["entries"].append(r)
+
+    summary = {
+        "generated_at":     _dt.datetime.now(tz=_dt.timezone.utc).isoformat(),
+        "total_calls":      len(records),
+        "total_tokens_in":  sum(r.get("tokens_in",  0) for r in records if r.get("tokens_in",  -1) >= 0),
+        "total_tokens_out": sum(r.get("tokens_out", 0) for r in records if r.get("tokens_out", -1) >= 0),
+        "total_duration_s": round(sum(r.get("duration_s", 0.0) for r in records), 3),
+        "by_stage":         by_stage,
+    }
+    with open(summary_path, "w", encoding="utf-8") as _f:
+        _json_tel.dump(summary, _f, indent=2)
+
+
 # ── Defaults ──────────────────────────────────────────────────────────────────
 DEFAULT_CLAUDE_MODEL  = "claude-sonnet-4-20250514"
 DEFAULT_GEMINI_MODEL  = "gemini-2.5-flash-lite"      # stable free tier default
 DEFAULT_LOCAL_LLM_URL = "http://localhost:11434" # Ollama default
+
+# Default ports per backend — combined with LOCAL_LLM_HOST when set.
+# Set LOCAL_LLM_URL to override the full URL entirely.
+_BACKEND_DEFAULT_PORTS: dict[str, int] = {
+    "ollama":   11434,
+    "vllm":     8000,
+    "lmstudio": 1234,
+    "llamacpp": 8080,
+}
+_BACKEND_DEFAULT_URLS: dict[str, str] = {
+    k: f"http://localhost:{v}" for k, v in _BACKEND_DEFAULT_PORTS.items()
+}
 
 # Gemini free tier: 15 RPM, 1M TPM, 1500 RPD
 # Add a small delay between calls to stay well within limits
@@ -165,6 +350,49 @@ RETRY_BASE_DELAY   = 5.0        # seconds — first retry waits this long
 RETRY_BACKOFF      = 2.0        # multiplier: 5s → 10s → 20s
 RETRY_MAX_DELAY    = 60.0       # cap so we never wait more than 1 minute
 
+# ── vLLM-specific generation controls ─────────────────────────────────────────
+# VLLM_REPETITION_PENALTY — penalises the model for repeating tokens it has
+#   already generated.  1.0 = disabled.  Raised to 1.10 (from 1.05) because
+#   quantised coder-variant models (qwen3-coder-30b-int8) loop aggressively
+#   on structured JSON output even with a light nudge.  1.10 is still safe
+#   for general text; go to 1.15 only if loops persist.
+#   Override with VLLM_REPETITION_PENALTY=<float>.
+_VLLM_REPETITION_PENALTY = float(
+    os.environ.get("VLLM_REPETITION_PENALTY", "1.10") or "1.10"
+)
+
+# VLLM_FREQUENCY_PENALTY — complementary to repetition_penalty.
+#   Reduces log-probability of tokens proportional to how many times they
+#   have already appeared (OpenAI definition).  0.0 = disabled; 0.1 is a
+#   light nudge that further discourages verbatim repetition of key blocks
+#   without affecting the first occurrence.
+#   Override with VLLM_FREQUENCY_PENALTY=<float>.
+_VLLM_FREQUENCY_PENALTY = float(
+    os.environ.get("VLLM_FREQUENCY_PENALTY", "0.1") or "0.1"
+)
+
+# VLLM_ENABLE_THINKING — Qwen3/DeepSeek-R1 on vLLM expose a per-request
+#   enable_thinking flag via chat_template_kwargs.  Default: disabled (0).
+#   When disabled, the model skips its chain-of-thought scratchpad entirely —
+#   no <think> blocks are generated, so there is nothing to leak or strip.
+#   Set VLLM_ENABLE_THINKING=1 only if you deliberately want CoT reasoning.
+_VLLM_ENABLE_THINKING = (
+    os.environ.get("VLLM_ENABLE_THINKING", "0").strip().lower() in ("1", "true", "yes")
+)
+
+# VLLM_REPETITION_WINDOW / VLLM_REPETITION_THRESHOLD — post-hoc loop detector.
+#   After every vLLM response, slide a window of WINDOW chars across the output.
+#   If the same WINDOW-char block appears ≥ THRESHOLD times, the text is
+#   truncated at the second occurrence (preserving the first clean copy).
+_VLLM_REPETITION_WINDOW    = int(os.environ.get("VLLM_REPETITION_WINDOW",    "200") or "200")
+_VLLM_REPETITION_THRESHOLD = int(os.environ.get("VLLM_REPETITION_THRESHOLD", "3")   or "3")
+
+# Compiled once at module level — used by _strip_vllm_think (pattern 3).
+_DOC_START = re.compile(
+    r"^(#|\{|\[|\||---|```|-\s|\*\s|\d+\.\s)",
+    re.MULTILINE,
+)
+
 
 # ─── Public API ────────────────────────────────────────────────────────────────
 
@@ -172,26 +400,22 @@ def get_max_workers() -> int:
     """
     Recommended ThreadPoolExecutor size for concurrent LLM calls.
 
-    vLLM uses continuous batching — multiple requests are processed in
-    parallel on the GPU, so higher concurrency = higher throughput.
-    Ollama queues one request at a time, so concurrency > 1 gives no GPU
-    speedup but does eliminate Python hand-off overhead between calls.
-
-    Defaults:
-        vllm     → 4   (tune up if GPU has headroom)
-        ollama   → 1   (no GPU parallelism; sequential is fine)
-        lmstudio → 1
-        llamacpp → 1
-        cloud    → 1   (Claude / Gemini — rate-limited by the API)
-
-    Override any default with:
-        export LLM_MAX_WORKERS=8
+    Resolution order:
+      1. LLM_MAX_WORKERS          — global explicit override
+      2. OLLAMA_MAX_WORKERS /
+         VLLM_MAX_WORKERS / etc.  — backend-specific override
+      3. coded default per backend (vllm=4, others=1)
     """
     explicit = os.environ.get("LLM_MAX_WORKERS", "").strip()
     if explicit:
         return max(1, int(explicit))
     backend  = os.environ.get("LOCAL_LLM_BACKEND", "").strip().lower()
     provider = get_provider()
+    if provider == "local" and backend:
+        backend_var = f"{backend.upper()}_MAX_WORKERS"
+        backend_explicit = os.environ.get(backend_var, "").strip()
+        if backend_explicit:
+            return max(1, int(backend_explicit))
     if provider == "local" and backend == "vllm":
         return 4
     return 1
@@ -216,9 +440,8 @@ def get_provider() -> str:
             f"Valid values: claude | gemini | local"
         )
 
-    # Auto-detect: prefer local if LOCAL_LLM_URL is set (user explicitly
-    # configured a local server), then fall back to cloud providers.
-    if os.environ.get("LOCAL_LLM_URL"):
+    # Auto-detect: prefer local if backend or URL is configured.
+    if os.environ.get("LOCAL_LLM_URL") or os.environ.get("LOCAL_LLM_BACKEND"):
         return "local"
     if os.environ.get("ANTHROPIC_API_KEY"):
         return "claude"
@@ -237,11 +460,14 @@ def get_provider() -> str:
 
 def get_model() -> str:
     """
-    Return the active model name (respects LLM_MODEL override).
+    Return the active model name.
 
-    For the local provider, LOCAL_LLM_MODEL is the primary source.
-    LLM_MODEL overrides everything.
-    Raises RuntimeError if local is selected but no model is specified.
+    Resolution order:
+      1. LLM_MODEL               — global explicit override
+      2. OLLAMA_MODEL /
+         VLLM_MODEL / etc.       — backend-specific model
+      3. LOCAL_LLM_MODEL         — legacy fallback (any backend)
+      4. cloud defaults          — Claude / Gemini built-in defaults
     """
     override = os.environ.get("LLM_MODEL", "").strip()
     if override:
@@ -250,14 +476,19 @@ def get_model() -> str:
     provider = get_provider()
 
     if provider == "local":
+        backend = os.environ.get("LOCAL_LLM_BACKEND", "").strip().lower()
+        if backend:
+            backend_model = os.environ.get(f"{backend.upper()}_MODEL", "").strip()
+            if backend_model:
+                return backend_model
         model = os.environ.get("LOCAL_LLM_MODEL", "").strip()
         if not model:
             raise RuntimeError(
-                "LOCAL_LLM_MODEL is not set.\n"
-                "Set it to the model name your local server has loaded, e.g.:\n"
-                "  export LOCAL_LLM_MODEL=llama3.2          # Ollama\n"
-                "  export LOCAL_LLM_MODEL=qwen2.5-coder:14b # Ollama\n"
-                "  export LOCAL_LLM_MODEL=your-model-name   # LM Studio"
+                "No model configured for local LLM.\n"
+                "Set a backend-specific model or the generic fallback, e.g.:\n"
+                "  export VLLM_MODEL=qwen3.5-27b-nvfp4\n"
+                "  export OLLAMA_MODEL=qwen3.5:27b\n"
+                "  export LOCAL_LLM_MODEL=your-model-name   # any backend"
             )
         return model
 
@@ -267,8 +498,23 @@ def get_model() -> str:
 
 
 def get_local_url() -> str:
-    """Return the base URL for the local LLM server."""
-    return os.environ.get("LOCAL_LLM_URL", DEFAULT_LOCAL_LLM_URL).rstrip("/")
+    """Return the base URL for the local LLM server.
+
+    Resolution order:
+      1. LOCAL_LLM_URL   — full URL override, always wins
+      2. LOCAL_LLM_HOST  — host/IP only; port auto-derived from backend
+      3. backend default — http://localhost:<backend-port>
+      4. DEFAULT_LOCAL_LLM_URL (Ollama :11434) — final fallback
+    """
+    explicit = os.environ.get("LOCAL_LLM_URL", "").strip()
+    if explicit:
+        return explicit.rstrip("/")
+    host = os.environ.get("LOCAL_LLM_HOST", "").strip()
+    backend = os.environ.get("LOCAL_LLM_BACKEND", "").strip().lower()
+    port = _BACKEND_DEFAULT_PORTS.get(backend)
+    if host and port:
+        return f"http://{host}:{port}"
+    return _BACKEND_DEFAULT_URLS.get(backend, DEFAULT_LOCAL_LLM_URL).rstrip("/")
 
 
 def call_llm(
@@ -344,12 +590,11 @@ def call_llm(
     else:
         call_fn = _call_local
 
-    # For vLLM: omit max_tokens so the server uses remaining context space instead
-    # of pre-allocating a fixed KV-cache budget.  This avoids spurious 400 errors
-    # when prompt_tokens + max_tokens exceeds max_model_len even though the model
-    # would naturally stop well before that limit.
-    if provider == "local" and _backend_label == "vllm":
-        max_tokens = -1   # signals _call_local to omit the field from the payload
+    # vLLM note: max_tokens IS sent as-is.  The overflow handler (Phase 1/2
+    # below) will reduce it or truncate the prompt if prompt + max_tokens
+    # exceeds max_model_len.  Previously we omitted max_tokens (-1) to avoid
+    # spurious 400s, but that allowed unbounded outputs (17k+ token repetition
+    # loops) because the model had no stopping budget.
 
     last_exc: Exception | None = None
     delay    = RETRY_BASE_DELAY
@@ -379,19 +624,58 @@ def call_llm(
             else:
                 _tok_str = f"~{len(result.split()):,} words"  # fallback if provider didn't report
             print(f"  {tag}done in {_elapsed:.1f}s  ({_tok_str})")
-            # ── JSON validation + single correction retry ──────────────────
+            _record_telemetry(label, model, _elapsed, _in, _out)
+            # ── JSON validation + structural repair + correction retry ────
             if json_mode:
                 ok, err = _validate_json(result)
                 if not ok:
+                    # Step 1: try structural closure (handles repetition-loop
+                    # truncations cheaply — no LLM round-trip required).
+                    _closed = _try_close_truncated_json(
+                        _normalize_llm_json(_strip_markdown_fences(result))
+                    )
+                    ok_closed, _ = _validate_json(_closed)
+                    if ok_closed:
+                        print(f"  {tag}Truncated JSON repaired by structural closure.")
+                        result = _closed
+                        ok = True
+
+                if not ok:
+                    # Step 2: fall back to LLM correction call.
+                    # Trim the bad response before sending it to the correction
+                    # model.  A truncated-repetition-loop response can be 10-40k
+                    # chars; sending the full thing poisons the correction model
+                    # and causes it to loop too.  Keep the first 3 k (enough to
+                    # show structure) and the last 1 k (where the truncation is).
+                    _BAD_HEAD = 3_000
+                    _BAD_TAIL = 1_000
+                    if len(result) > _BAD_HEAD + _BAD_TAIL + 200:
+                        _result_for_corr = (
+                            result[:_BAD_HEAD]
+                            + f"\n… [{len(result) - _BAD_HEAD - _BAD_TAIL} chars omitted] …\n"
+                            + result[-_BAD_TAIL:]
+                        )
+                    else:
+                        _result_for_corr = result
                     corrected = _json_correction_call(
-                        system_prompt, result, err,
+                        system_prompt, _result_for_corr, err,
                         max_tokens, temperature, model, provider, label,
                     )
                     ok2, _ = _validate_json(corrected)
-                    if ok2:
+                    _corr_is_diag = ok2 and _is_error_diagnostic(corrected)
+                    if ok2 and not _corr_is_diag:
                         result = corrected
                     else:
-                        print(f"  {tag}JSON correction also invalid — using original")
+                        # Correction failed or returned an error diagnostic.
+                        # Raise so the outer retry loop re-issues the original
+                        # prompt — the model may produce valid JSON on a fresh
+                        # attempt (this is the intentional equivalent of the
+                        # accidental retry that occurred via the old NameError path).
+                        raise ValueError(
+                            f"JSON correction failed "
+                            f"({'error diagnostic' if _corr_is_diag else 'also invalid JSON'}) "
+                            f"— retrying original call"
+                        )
             _cache.put(cache_key, result, label=label)
             return result
 
@@ -448,20 +732,160 @@ def call_llm(
     )
 
 
-def _validate_json(text: str) -> tuple[bool, str]:
-    """
-    Try to parse *text* as JSON.  Returns (True, "") on success or
-    (False, error_message) on failure.  Strips markdown fences first.
-    """
-    import json as _json
+def _strip_markdown_fences(text: str) -> str:
+    """Strip opening/closing markdown code fences (e.g. ```json ... ```) from text."""
     t = text.strip()
     if t.startswith("```"):
         t = "\n".join(l for l in t.splitlines() if not l.strip().startswith("```")).strip()
+    return t
+
+
+def _fix_string_newlines(text: str) -> str:
+    """
+    Replace literal newlines/tabs inside JSON string values with their
+    escape sequences.  JSON forbids bare control characters inside strings;
+    models often emit them in long description fields, causing
+    "Expecting ',' delimiter" parse errors.
+
+    Uses a single-pass character scanner so it only touches characters that
+    are actually inside a quoted string — safe for arbitrary JSON structure.
+    """
+    out: list[str] = []
+    in_string   = False
+    escape_next = False
+    for ch in text:
+        if escape_next:
+            out.append(ch)
+            escape_next = False
+            continue
+        if ch == "\\" and in_string:
+            out.append(ch)
+            escape_next = True
+            continue
+        if ch == '"':
+            in_string = not in_string
+            out.append(ch)
+            continue
+        if in_string:
+            if ch == "\n":
+                out.append("\\n")
+                continue
+            if ch == "\r":
+                out.append("\\r")
+                continue
+            if ch == "\t":
+                out.append("\\t")
+                continue
+        out.append(ch)
+    return "".join(out)
+
+
+def _normalize_llm_json(text: str) -> str:
+    """
+    Fix common LLM JSON artifacts so json.loads can parse the result:
+      - Literal newlines/tabs inside strings  → escaped (\\n / \\t)
+      - Trailing commas before } or ]         → removed
+      - Python None / True / False            → JSON null / true / false
+    """
+    text = _fix_string_newlines(text)
+    text = re.sub(r",(\s*[}\]])", r"\1", text)
+    text = re.sub(r"\bNone\b",  "null",  text)
+    text = re.sub(r"\bTrue\b",  "true",  text)
+    text = re.sub(r"\bFalse\b", "false", text)
+    return text
+
+
+def _try_close_truncated_json(text: str) -> str:
+    """
+    Attempt to repair JSON that was truncated mid-stream (e.g. after a
+    repetition-loop truncation).  Scans the text to find unclosed strings,
+    arrays, and objects, then appends the minimum closing tokens needed to
+    produce a parseable document.
+
+    Returns the (possibly repaired) text.  Caller should still validate with
+    _validate_json — this is best-effort, not guaranteed.
+    """
+    import json as _json
+
+    # Already valid — nothing to do
     try:
-        _json.loads(t)
+        _json.loads(text)
+        return text
+    except _json.JSONDecodeError:
+        pass
+
+    out: list[str] = []
+    in_string   = False
+    escape_next = False
+    depth_stack: list[str] = []   # '{' or '['
+
+    for ch in text:
+        out.append(ch)
+        if escape_next:
+            escape_next = False
+            continue
+        if ch == "\\" and in_string:
+            escape_next = True
+            continue
+        if ch == '"':
+            in_string = not in_string
+            continue
+        if in_string:
+            continue
+        if ch == "{":
+            depth_stack.append("}")
+        elif ch == "[":
+            depth_stack.append("]")
+        elif ch in ("]", "}"):
+            if depth_stack and depth_stack[-1] == ch:
+                depth_stack.pop()
+
+    # Close any unterminated string first, then strip trailing comma
+    result = "".join(out)
+    if in_string:
+        result += '"'
+    result = re.sub(r",(\s*)$", r"\1", result.rstrip())
+
+    # Close open containers in reverse order
+    for closer in reversed(depth_stack):
+        result += closer
+
+    return result
+
+
+def _validate_json(text: str) -> tuple[bool, str]:
+    """
+    Try to parse *text* as JSON.  Returns (True, "") on success or
+    (False, error_message) on failure.  Normalises common LLM artifacts
+    (trailing commas, Python literals) before parsing so minor issues don't
+    trigger a full correction call.
+    """
+    import json as _json
+    try:
+        _json.loads(_normalize_llm_json(_strip_markdown_fences(text)))
         return True, ""
     except _json.JSONDecodeError as exc:
         return False, str(exc)
+
+
+def _is_error_diagnostic(text: str) -> bool:
+    """Return True if the model produced an error-report dict instead of the requested content.
+
+    Some models (notably quantised ones) respond to correction prompts by acting
+    as JSON linters: they return {"error": "..."} rather than the fixed content.
+    Detecting this prevents a syntactically-valid-but-useless response from being
+    accepted as a successful correction.
+    """
+    import json as _json
+    t = _strip_markdown_fences(text)
+    if not t.startswith("{"):
+        return False
+    try:
+        parsed = _json.loads(t)
+        # Error diagnostic: a small dict with an "error" key and nothing else meaningful
+        return isinstance(parsed, dict) and "error" in parsed and len(parsed) <= 3
+    except _json.JSONDecodeError:
+        return False
 
 
 def _json_correction_call(
@@ -477,18 +901,32 @@ def _json_correction_call(
     """
     Make a single correction call asking the model to fix its malformed JSON.
     Returns the corrected text (may still be invalid — caller decides).
+
+    Design notes
+    ------------
+    * Uses the ORIGINAL system_prompt so the model retains full task context.
+      A "JSON repair assistant" generic system causes quantised models to act as
+      JSON linters — they return {"error":"..."} diagnostics instead of the fix.
+    * Does NOT echo the bad_response back in the user message.  Sending the
+      malformed JSON to the model causes the same linter confusion: the model
+      describes what is wrong rather than producing the correct output.
     """
     tag = f"[{label}] " if label else ""
     fix_system = (
         system_prompt
         + "\n\nYour previous response was not valid JSON. "
-        "Return ONLY the corrected JSON — no prose, no fences, no explanation."
+        "Return ONLY valid JSON — no error messages, no prose, no fences."
     )
+    # Keep the correction user message minimal: tell the model what went wrong
+    # and ask it to try again.  Omitting the bad response prevents the model
+    # from treating the correction as a JSON-validation task.
     fix_user = (
-        f"Your previous response had a JSON parse error:\n{error_msg}\n\n"
-        f"Malformed response:\n{bad_response}\n\n"
-        "Please return the corrected JSON only."
+        f"Your previous response could not be parsed as JSON "
+        f"(error: {error_msg[:300]}).\n\n"
+        "Try again. Produce ONLY the valid JSON requested above."
     )
+    print(f"  {tag}JSON invalid — cause: {error_msg[:200]}")
+    print(f"  {tag}JSON invalid — response preview: {bad_response[:200]!r}")
     print(f"  {tag}JSON invalid — requesting correction")
     if provider == "local":
         return _call_local(fix_system, fix_user, max_tokens, temperature, model, json_mode=True)
@@ -564,7 +1002,13 @@ def _call_local(
     # "ollama" (default), "vllm", "lmstudio", "llamacpp"
 
     # ── Ollama native path: only when backend is ollama AND num_ctx is set ──────
-    num_ctx = int(os.environ.get("LOCAL_LLM_NUM_CTX", "0") or "0")
+    # Resolution: LOCAL_LLM_NUM_CTX (global) → OLLAMA_NUM_CTX (backend-specific)
+    _num_ctx_str = (
+        os.environ.get("LOCAL_LLM_NUM_CTX", "").strip()
+        or os.environ.get(f"{_backend.upper()}_NUM_CTX", "").strip()
+        or "0"
+    )
+    num_ctx = int(_num_ctx_str or "0")
     if num_ctx > 0 and _backend not in ("vllm", "lmstudio", "llamacpp"):
         return _call_local_ollama_native(
             system_prompt, user_prompt, max_tokens, temperature,
@@ -597,6 +1041,22 @@ def _call_local(
     # uses remaining context space rather than pre-allocating a fixed budget.
     if max_tokens > 0:
         payload["max_tokens"] = max_tokens
+
+    # ── vLLM-specific payload fields ─────────────────────────────────────────
+    if _backend == "vllm":
+        # Repetition penalty — prevents degenerate infinite loops.
+        # 1.0 = disabled; default 1.10 (stronger nudge for quantised coder models).
+        if _VLLM_REPETITION_PENALTY != 1.0:
+            payload["repetition_penalty"] = _VLLM_REPETITION_PENALTY
+        # Frequency penalty — complementary: reduces tokens proportional to
+        # how often they have already appeared.  0.0 = disabled; default 0.1.
+        if _VLLM_FREQUENCY_PENALTY != 0.0:
+            payload["frequency_penalty"] = _VLLM_FREQUENCY_PENALTY
+
+        # Qwen3 / DeepSeek-R1 thinking mode — disabled by default so the model
+        # skips its CoT scratchpad entirely (nothing to leak into the document).
+        # Passed via extra_body compatible with vLLM's OpenAI-compat endpoint.
+        payload["chat_template_kwargs"] = {"enable_thinking": _VLLM_ENABLE_THINKING}
     if json_schema is not None:
         # Constrained decoding — grammar-level JSON schema enforcement.
         # vLLM < 0.4.3: use guided_json in the request body (VLLM_GUIDED_JSON=1)
@@ -610,7 +1070,7 @@ def _call_local(
         else:
             payload["response_format"] = {
                 "type": "json_schema",
-                "json_schema": {"name": "response", "strict": True, "schema": json_schema},
+                "json_schema": {"name": "response", "schema": json_schema},
             }
     elif json_mode:
         # JSON-object mode — valid JSON output without a fixed schema.
@@ -678,10 +1138,19 @@ def _call_local(
     if not content:
         content = message.get("reasoning", "") or ""
 
-    # Strip <think>...</think> blocks that Qwen3 and DeepSeek-R1 prepend to
-    # their final answer — the pipeline only wants the answer, not the scratchpad.
-    import re as _re
-    content = _re.sub(r"<think>.*?</think>", "", content, flags=_re.DOTALL).strip()
+    # ── Post-processing: strip thinking / detect loops ───────────────────────
+    if _backend == "vllm":
+        # Full vLLM-specific pipeline: strip all CoT leakage then detect loops.
+        # Even with enable_thinking=False, some model builds still emit partial
+        # thinking tags — _strip_vllm_think handles all three leakage patterns.
+        content = _strip_vllm_think(content)
+        content = _strip_repetition_loop(content)
+    else:
+        # Ollama / LM Studio / llama.cpp: strip both properly-closed <think> blocks
+        # and unclosed <think> tags (model hit max_tokens during thinking phase).
+        # Alternation is left-to-right: non-greedy closed pattern wins when
+        # </think> is present; open-ended pattern handles the unclosed case.
+        content = re.sub(r"<think>.*?</think>|<think>.*$", "", content, flags=re.DOTALL).strip()
 
     if not content:
         raise _NonRetryableError(
@@ -705,7 +1174,104 @@ def _call_local(
     )
 
     # Restore prefill so the caller sees the complete value
-    return (prefill + content) if prefill else content
+    if prefill:
+        # Prevent "{" + "{\n" resulting in "{{\n"
+        return content if content.lstrip().startswith(prefill) else (prefill + content)
+    return content
+
+
+# ── vLLM post-processing helpers ───────────────────────────────────────────────
+
+def _strip_vllm_think(content: str) -> str:
+    """
+    Strip chain-of-thought leakage from vLLM responses.
+
+    Three patterns handled in order:
+      1. Properly closed <think>…</think> blocks  (Qwen3 happy path)
+      2. Unclosed <think>… to end-of-string       (model hit max_tokens mid-think)
+      3. Raw untagged thinking preamble            (vLLM leaked scratchpad without tags)
+
+    For pattern 3: if the response does not begin with a document marker
+    (# heading, { JSON, |table, -, *) we scan for the first such marker and
+    discard everything before it.  This covers the "141 lines of raw Thinking
+    Process" pattern seen in the Prism vLLM run.
+    """
+    # Patterns 1 + 2 combined — closed <think> blocks (non-greedy) and unclosed
+    # <think> tags (model hit max_tokens during thinking phase).  Alternation is
+    # left-to-right: the non-greedy closed pattern wins when </think> is present.
+    content = re.sub(r"<think>.*?</think>|<think>.*$", "", content, flags=re.DOTALL).strip()
+
+    if not content:
+        return content
+
+    # Pattern 3 — raw untagged preamble: strip everything before the first
+    # document-like line (# heading, { JSON open, | table, list marker, ---).
+    # Only applies when the response doesn't already start with such a marker.
+    if not _DOC_START.match(content):
+        m = _DOC_START.search(content)
+        if m and m.start() > 0:
+            stripped = content[m.start():]
+            print(
+                f"  [llm_client] ⚠️  vLLM thinking preamble stripped "
+                f"({m.start()} chars before first document marker)."
+            )
+            content = stripped
+
+    return content.strip()
+
+
+def _strip_repetition_loop(content: str) -> str:
+    """
+    Detect and truncate degenerate repetition loops in LLM output.
+
+    Tries multiple window sizes (50 → 400 chars) so it catches both short
+    tight loops (e.g. a 60-char "*Okay, writing.*" pattern) and long
+    paragraph-level loops (the "Wait, I need to check…" block that repeated
+    800+ times in the Prism vLLM SRS run).
+
+    For each window size, slides the window across the response with 50%
+    overlap.  If the same window block appears ≥ _VLLM_REPETITION_THRESHOLD
+    times from that position onward, the text is truncated at the start of
+    the second occurrence — preserving the first clean copy.
+    """
+    threshold = _VLLM_REPETITION_THRESHOLD
+    # Try windows from small to large; stop at first detected loop.
+    # Windows below 150 chars produce false positives on structured JSON output:
+    # normal keys like '"description": "' or '},\n    {' repeat 3+ times in any
+    # valid response.  150 chars is the practical minimum for a block that
+    # represents genuine degenerate repetition rather than valid JSON structure.
+    _WINDOWS = [150, 200, 300, 400]
+
+    # For structured JSON responses, boilerplate repeated key patterns
+    # ("inputs": [], "outputs": "...", "business_rules": []) cause false
+    # positives at small window sizes.  Only apply windows ≥ 300 when the
+    # content looks like JSON — a 300-char identical block in JSON genuinely
+    # means the model has looped on full feature entries.
+    _stripped = content.lstrip()
+    _is_json  = _stripped.startswith("{") or _stripped.startswith("[")
+    _JSON_MIN_WINDOW = 300
+
+    for window in _WINDOWS:
+        if _is_json and window < _JSON_MIN_WINDOW:
+            continue   # skip small windows for JSON — false-positive prone
+        if len(content) < window * threshold:
+            continue            # text too short for this window size
+        step = max(1, window // 2)
+        i = 0
+        while i <= len(content) - window:
+            chunk = content[i : i + window]
+            count = content[i:].count(chunk)
+            if count >= threshold:
+                second = content.find(chunk, i + 1)
+                if second > i:
+                    print(
+                        f"  [llm_client] ⚠️  Repetition loop detected "
+                        f"(window={window}, count={count}) — truncating at char {second}."
+                    )
+                    return content[:second].rstrip()
+            i += step
+
+    return content
 
 
 def _call_local_ollama_native(
