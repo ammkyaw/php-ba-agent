@@ -348,7 +348,10 @@ class ProjectVisitor extends NodeVisitorAbstract
             'line'      => $node->getStartLine(),
             'type'      => 'interface',
             'docblock'  => $this->extractDocblock($node),
-            'extends'   => array_map(fn($e) => $e->toString(), $node->extends),
+            'extends'    => !empty($node->extends) ? $node->extends[0]->toString() : null,
+            'implements' => count($node->extends) > 1
+                                ? array_map(fn($e) => $e->toString(), array_slice($node->extends, 1))
+                                : [],
             'methods'   => $this->extractMethods($node),
         ];
     }
