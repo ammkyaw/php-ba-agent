@@ -1201,7 +1201,7 @@ class ProceduralVisitor extends NodeVisitorAbstract
             'line'        => $node->getStartLine(),
             'params'      => $params,
             'return_type' => $node->returnType ? $this->typeToString($node->returnType) : null,
-            'docblock'    => $this->extractDocSummary($node),
+            'docblock'    => ($s = $this->extractDocSummary($node)) !== null ? ['summary' => $s] : null,
         ];
     }
 

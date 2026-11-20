@@ -1622,7 +1622,7 @@ def _build_user_prompt(
                      + (f", showing {len(_fns)})" if _omit_fn else ")"))
         for fn in _fns:
             params = [p["name"] for p in fn.get("params", [])]
-            doc    = fn.get("docblock") or ""
+            doc    = (fn.get("docblock") or {}).get("summary", "")
             line   = f"  {fn['name']}({', '.join(params)})"
             if doc:
                 line += f" — {doc}"

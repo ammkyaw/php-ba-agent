@@ -254,7 +254,7 @@
       "properties": {
         "method":   { "type": "string", "description": "HTTP method (GET, POST, PUT, DELETE, PATCH, etc)." },
         "path":     { "type": "string", "description": "Route pattern." },
-        "handler":  { "type": "string", "description": "Controller@method or function name. Optional for file-system routers (Next.js App Router, Nuxt) where the handler is implied by the file path." },
+        "handler":  { "type": ["string", "null"], "description": "Controller@method or function name. Optional for file-system routers (Next.js App Router, Nuxt) where the handler is implied by the file path." },
         "file":     { "type": "string" },
         "line":     { "type": "integer" },
         "source":   { "type": "string", "description": "Detection method (e.g. laravel_static, annotation, decorator)." },
