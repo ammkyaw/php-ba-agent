@@ -678,7 +678,7 @@ def _chunks_function_defs(cm: CodeMap, file_module: dict[str, str] | None = None
         filename  = Path(filepath).name
         params    = [p["name"] for p in fn.get("params", [])]
         ret       = fn.get("return_type") or "void"
-        docblock  = fn.get("docblock") or ""
+        docblock  = (fn.get("docblock") or {}).get("summary", "")
         line      = fn.get("line", "?")
 
         parts = [
