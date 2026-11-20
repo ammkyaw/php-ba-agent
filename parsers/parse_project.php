@@ -1373,7 +1373,7 @@ class ProceduralVisitor extends NodeVisitorAbstract
     /** Derive table name from module directory path: modules/<Module>/file.php → module_name */
     private function tableFromFile(string $file): string
     {
-        if (preg_match('|(?:^|/)modules/([^/]+)/|', $file, $m)) {
+        if (preg_match('#(?:^|/)modules/([^/]+)/#', $file, $m)) {
             return strtolower($m[1]);
         }
         return '';
