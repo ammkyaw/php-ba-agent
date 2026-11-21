@@ -1022,9 +1022,19 @@ def _call_local(
     endpoint = f"{base_url}/v1/chat/completions"
     api_key  = os.environ.get("LOCAL_LLM_API_KEY", "").strip()
 
+    # For vLLM with thinking disabled, prepend /no_think to the user message.
+    # This is the Qwen3-native per-message thinking suppression mechanism and
+    # acts as a belt-and-suspenders guard when chat_template_kwargs is ignored
+    # by some qwen3-coder builds (which burn the entire token budget on <think>
+    # and produce no visible output).
+    _user_content = user_prompt
+    if _backend == "vllm" and not _VLLM_ENABLE_THINKING:
+        if not _user_content.lstrip().startswith("/no_think"):
+            _user_content = "/no_think\n" + _user_content
+
     messages_payload: list[dict] = [
         {"role": "system",    "content": system_prompt},
-        {"role": "user",      "content": user_prompt},
+        {"role": "user",      "content": _user_content},
     ]
     if prefill:
         # OpenAI-compatible servers (Ollama ≥ 0.1, LM Studio ≥ 0.2) support
@@ -1153,8 +1163,11 @@ def _call_local(
         content = re.sub(r"<think>.*?</think>|<think>.*$", "", content, flags=re.DOTALL).strip()
 
     if not content:
-        raise _NonRetryableError(
-            f"Local LLM returned an empty content field.\n"
+        # Raise as plain RuntimeError (retryable) so the retry loop can attempt
+        # recovery — the /no_think prefix on retry may succeed where this failed.
+        raise RuntimeError(
+            f"Local LLM returned an empty content field "
+            f"(thinking likely consumed all tokens).\n"
             f"Full response: {json.dumps(data)[:300]}"
         )
 
