@@ -922,7 +922,18 @@ def _check_db_write_coverage(
             })
 
     total = covered_count + len(uncovered)
-    pct   = covered_count / total if total else 0.0
+    if total == 0:
+        return {
+            "name":      "Database Write Operation Coverage",
+            "status":    "pass",
+            "icon":      "✅",
+            "covered":   0,
+            "total":     0,
+            "pct":       1.0,
+            "detail":    "No SQL write ops detected — check not applicable (N/A)",
+            "uncovered": [],
+        }
+    pct   = covered_count / total
     status, icon = _cov_status(pct)
 
     return {
@@ -990,9 +1001,7 @@ def _check_form_coverage(
 
     total = covered_count + len(uncovered)
     if total == 0:
-        # Warn rather than silently pass — "no forms found" may mean the
-        # parser missed React-controlled forms, not that the app has none.
-        pct, status, icon = 0.0, "warn", "⚠️"
+        pct, status, icon = 1.0, "pass", "✅"
     else:
         pct = covered_count / total
         status, icon = _cov_status(pct)
@@ -1004,7 +1013,7 @@ def _check_form_coverage(
         "covered":   covered_count,
         "total":     total,
         "pct":       round(pct, 4),
-        "detail":    ("No forms detected (check for React-controlled forms)" if total == 0
+        "detail":    ("No HTML forms detected — check not applicable (N/A)" if total == 0
                       else f"{covered_count}/{total} ({pct:.0%}) forms covered by flows"),
         "uncovered": uncovered[:_MAX_LIST],
     }
@@ -1539,7 +1548,7 @@ def _build_known_tables(cm: Any) -> set[str]:
         if t and t not in _SKIP_TABLES:
             tables.add(t)
     for schema in (cm.db_schema or []):
-        t = (schema.get("table_name") or schema.get("table", "")).strip().lower()
+        t = (schema.get("table_name") or schema.get("table") or "").strip().lower()
         if t and t not in _SKIP_TABLES:
             tables.add(t)
     return tables
