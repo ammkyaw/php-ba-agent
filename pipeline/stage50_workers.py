@@ -316,7 +316,7 @@ List every feature: {all_feature_names}
 ## 4. Stakeholders
 Markdown table: Role | Description | Key Interests"""
 
-    parts.append(_call_section(front_system, front_user, "stage50_brd_front", 0.5, 1500))
+    parts.append(_call_section(front_system, front_user, "stage50_brd_front", 0.5, 2500))
 
     # ── Section B: business requirements batched by feature ───────────────────
     def _br_entry(i: int, f: dict) -> str:
@@ -381,7 +381,7 @@ Numbered list of all rules extracted from features and spec rules above.
 ## 9. Glossary
 Markdown table: Term | Definition"""
 
-    parts.append(_call_section(tail_system, tail_user, "stage50_brd_tail", 0.5, 1200))
+    parts.append(_call_section(tail_system, tail_user, "stage50_brd_tail", 0.5, 2000))
     return "\n\n".join(parts)
 
 
@@ -472,7 +472,7 @@ For each user role: name, technical level, frequency of use, key tasks.
 ### 2.3 Operating Environment
 ### 2.4 Assumptions and Dependencies"""
 
-    parts.append(_call_section(front_system, front_user, "stage50_srs_front", 0.4, 1500))
+    parts.append(_call_section(front_system, front_user, "stage50_srs_front", 0.4, 2500))
 
     # ── Section B: FR batches (Section 3) ────────────────────────────────────
     def _fr_entry(i: int, f: dict) -> str:
@@ -526,7 +526,9 @@ For trivial features write: Input=none, Processing=minimal, Output=redirect or d
     # ── Section C: tail (4–6) ─────────────────────────────────────────────────
     tail_user = f"""Write ONLY sections 4, 5, and 6 of the SRS. Do NOT repeat earlier sections.
 
-Output EXACTLY:
+IMPORTANT: Use EXACTLY these headings — do NOT change "Non-Functional" to "Non-Financial" or any other word.
+
+Output using EXACTLY these headings (copy them verbatim):
 
 ## 4. Non-Functional Requirements
 ### 4.1 Security Requirements
@@ -543,7 +545,7 @@ Describe each table, its purpose, and key fields.
 ## 6. System Constraints
 Technical and business constraints on the implementation."""
 
-    parts.append(_call_section(tail_system, tail_user, "stage50_srs_tail", 0.4, 1200))
+    parts.append(_call_section(tail_system, tail_user, "stage50_srs_tail", 0.4, 2000))
     return "\n\n".join(parts)
 
 
@@ -602,7 +604,7 @@ Output EXACTLY:
 ## Overview
 Brief description of how acceptance testing should be approached for this system."""
 
-    parts.append(_call_section(system_base, hdr_user, "stage50_ac_header", 0.35, 400))
+    parts.append(_call_section(system_base, hdr_user, "stage50_ac_header", 0.35, 700))
 
     # ── Section B: feature-batch calls (parallel) ─────────────────────────────
     def _ac_entry(i: int, f: dict) -> str:
@@ -711,7 +713,7 @@ Brief description of how acceptance testing should be approached for this system
         "Output EXACTLY:\n\n---\n\n## Test Data Requirements\n"
         "What test data is needed to execute these criteria (users, records, files, etc.)."
     )
-    parts.append(_call_section(system_base, tail_user, "stage50_ac_tail", 0.35, 500))
+    parts.append(_call_section(system_base, tail_user, "stage50_ac_tail", 0.35, 1000))
     return "\n\n".join(parts)
 
 
@@ -773,7 +775,7 @@ Output EXACTLY:
 {all_epics}
 """
 
-    parts.append(_call_section(system_base, hdr_user, "stage50_us_header", 0.5, 600))
+    parts.append(_call_section(system_base, hdr_user, "stage50_us_header", 0.5, 1200))
 
     # ── Section B: epic batches ───────────────────────────────────────────────
     def _epic_block(i: int, f: dict) -> str:
@@ -911,7 +913,7 @@ Markdown table: Story ID | Title | Epic | Priority | Points | Status
 ## Total Story Points
 Sum by priority band (Must Have / Should Have / Could Have / Won't Have)."""
 
-    parts.append(_call_section(system_base, tail_user, "stage50_us_tail", 0.5, 800))
+    parts.append(_call_section(system_base, tail_user, "stage50_us_tail", 0.5, 1500))
     return "\n\n".join(parts)
 
 

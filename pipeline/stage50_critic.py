@@ -76,7 +76,8 @@ CRITIC_DRAFT_CHARS = 6_000
 
 # Max tokens for critic and refiner calls
 CRITIC_MAX_TOKENS  = 768
-REFINER_MAX_TOKENS = 8_192
+# Large SRS docs can be 30k chars (~7500 tok) — allow room for the corrected full doc
+REFINER_MAX_TOKENS = 16_384
 
 # Required structural markers per doc type (case-insensitive substring match)
 _DOC_REQUIRED_MARKERS: dict[str, list[str]] = {
@@ -263,6 +264,36 @@ def critic_summary_block(ctx: PipelineContext) -> str:
     return "\n".join(lines)
 
 
+_PLACEHOLDER_ENTITY_RE = re.compile(r"^(a|an|the)\s+\w+$", re.I)
+_INFRA_CONTEXTS = frozenset({"nusoap", "install", "."})
+
+
+def _is_critic_worthy_rule(r) -> bool:
+    """
+    Return True if this rule should appear in the critic's catalog snapshot.
+
+    Filters out spec rules that are impossible for the writer to cover because
+    they were extracted from library internals or have corrupted entity names:
+      - entities that are entirely punctuation / whitespace (e.g. `'`, `"`)
+      - entities that look like LLM template placeholders ("A Info", "An Account")
+      - rules from infrastructure library contexts (nusoap, install) with low
+        confidence and no triangulation
+    """
+    entities = getattr(r, "entities", None) or []
+    if entities:
+        # All entities are punctuation → skip
+        if all(not re.search(r"\w", str(e)) for e in entities):
+            return False
+        # All entities look like "A <Noun>" template placeholder → skip
+        if all(_PLACEHOLDER_ENTITY_RE.match(str(e).strip()) for e in entities):
+            return False
+    bc   = (getattr(r, "bounded_context", "") or "").lower()
+    conf = float(getattr(r, "confidence", 1.0) or 1.0)
+    if bc in _INFRA_CONTEXTS and conf < 0.75:
+        return False
+    return True
+
+
 def critic_context_block(ctx: PipelineContext, doc_type: str) -> str:
     """
     Build the compact catalog snapshot given to the Critic LLM.
@@ -290,6 +321,10 @@ def critic_context_block(ctx: PipelineContext, doc_type: str) -> str:
         moderate = [r for r in rules if tri_status.get(r.rule_id) == "MODERATE"]
         other    = [r for r in rules if r.rule_id not in tri_status]
 
+        # Drop junk rules from OTHER (punctuation-only entities, infra libraries,
+        # template-placeholder entity names like "A Info").
+        other = [r for r in other if _is_critic_worthy_rule(r)]
+
         lines.append(f"SPEC RULES [{len(rules)} total]:")
         if strong:
             lines.append("  STRONG — must be covered:")
@@ -309,10 +344,25 @@ def critic_context_block(ctx: PipelineContext, doc_type: str) -> str:
 
     # ── Known Entities ──────────────────────────────────────────────────────
     if ctx.entities and ctx.entities.entities:
-        entity_names = sorted({e.table.lower() for e in ctx.entities.entities})
+        raw_names = {e.table.lower() for e in ctx.entities.entities}
+        # Also accept CamelCase / no-underscore / singular forms so
+        # AclRole ≡ acl_roles and ProjectTemplate ≡ am_projecttemplates
+        normalized: set[str] = set()
+        for t in raw_names:
+            normalized.add(t)
+            no_under = t.replace("_", "")
+            normalized.add(no_under)
+            camel = "".join(w.capitalize() for w in t.split("_"))
+            normalized.add(camel)
+            # Singular forms (strip trailing 's')
+            if no_under.endswith("s"):
+                normalized.add(no_under[:-1])
+            if camel.endswith("s"):
+                normalized.add(camel[:-1])
+        entity_names = sorted(normalized)
         lines.append(
-            f"KNOWN ENTITIES [{len(entity_names)} tables — "
-            f"flag any other table/entity names as hallucinations]:"
+            f"KNOWN ENTITIES [{len(raw_names)} tables, snake_case + CamelCase forms — "
+            f"flag names with NO match in any form as hallucinations]:"
         )
         lines.append("  " + ", ".join(entity_names))
         lines.append("")
@@ -392,16 +442,29 @@ def _critique(
     if len(draft) > CRITIC_DRAFT_CHARS:
         draft_trunc += f"\n… [truncated — {len(draft) - CRITIC_DRAFT_CHARS} chars omitted]"
 
-    # Required markers for this doc type
+    # Structural check on the FULL draft (before truncation) to avoid false positives
     req_markers = _DOC_REQUIRED_MARKERS.get(doc_type, [])
-    markers_str = "\n".join(f"  - {m}" for m in req_markers)
+    present_markers = [m for m in req_markers if re.search(re.escape(m), draft, re.I)]
+    missing_markers = [m for m in req_markers if m not in present_markers]
+
+    if present_markers and missing_markers:
+        markers_str = (
+            "CONFIRMED PRESENT (do NOT flag these): "
+            + ", ".join(f'"{m}"' for m in present_markers)
+            + "\nACTUALLY MISSING (flag these as structural issues): "
+            + ", ".join(f'"{m}"' for m in missing_markers)
+        )
+    elif missing_markers:
+        markers_str = "ALL MISSING — flag each:\n" + "\n".join(f'  - "{m}"' for m in missing_markers)
+    else:
+        markers_str = "All required sections confirmed present — do NOT add structural issues for section markers."
 
     user = (
         f"DOC TYPE: {_DOC_LABELS.get(doc_type, doc_type.upper())}\n\n"
         f"{catalog}\n"
-        f"REQUIRED SECTION MARKERS (check these appear in the draft):\n"
+        f"REQUIRED SECTION MARKERS (pre-verified against full document):\n"
         f"{markers_str}\n\n"
-        f"---\nDRAFT (turn {turn}):\n{draft_trunc}"
+        f"---\nDRAFT (turn {turn}, may be truncated):\n{draft_trunc}"
     )
 
     raw = call_llm(
