@@ -1058,6 +1058,8 @@ class ProceduralVisitor extends NodeVisitorAbstract
 
     private string  $currentFile;
     private ?string $currentFunction = null;
+    private ?string $currentClass    = null;
+    private ?string $currentTableName = null;  // $table_name property of current ORM class
 
     /**
      * Variable assignment table: tracks $var = "SQL string" assignments
@@ -1126,6 +1128,31 @@ class ProceduralVisitor extends NodeVisitorAbstract
             }
         }
 
+        // Track current class scope (for ORM table-name resolution)
+        if ($node instanceof Node\Stmt\Class_) {
+            $this->currentClass     = $node->name ? $node->name->toString() : null;
+            $this->currentTableName = null;
+            // Try to read $table_name or $module_name from class properties
+            foreach ($node->stmts as $stmt) {
+                if ($stmt instanceof Node\Stmt\Property) {
+                    foreach ($stmt->props as $prop) {
+                        $propName = $prop->name->toString();
+                        if (in_array($propName, ['table_name', 'module_name'], true)
+                            && $prop->default instanceof Node\Scalar\String_
+                        ) {
+                            if ($propName === 'table_name') {
+                                $this->currentTableName = $prop->default->value;
+                                break 2;
+                            }
+                            if ($propName === 'module_name' && !$this->currentTableName) {
+                                $this->currentTableName = strtolower($prop->default->value);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
         // Track current function scope
         if ($node instanceof Node\Stmt\Function_) {
             $this->handleFunctionDef($node);
@@ -1174,6 +1201,10 @@ class ProceduralVisitor extends NodeVisitorAbstract
     {
         if ($node instanceof Node\Stmt\Function_) {
             $this->currentFunction = null;
+        }
+        if ($node instanceof Node\Stmt\Class_) {
+            $this->currentClass     = null;
+            $this->currentTableName = null;
         }
         if ($node instanceof Node\Stmt\If_) {
             array_pop($this->conditionStack);
@@ -1299,6 +1330,53 @@ class ProceduralVisitor extends NodeVisitorAbstract
                 ]);
             }
         }
+
+        // SugarDB / DBManager ORM write methods: $db->insert($table, …), $db->update($table, …)
+        // These take the table name as the first string argument.
+        $dbWriteMethods = ['insert' => 'INSERT', 'update' => 'UPDATE', 'upsertQuery' => 'UPDATE'];
+        if (isset($dbWriteMethods[$method]) && !empty($node->args[0])) {
+            $tblArg = $node->args[0]->value ?? $node->args[0];
+            if ($tblArg instanceof Node\Arg) $tblArg = $tblArg->value;
+            $tblName = ($tblArg instanceof Node\Scalar\String_) ? $tblArg->value : '';
+            if ($tblName) {
+                $this->sqlQueries[] = [
+                    'operation' => $dbWriteMethods[$method],
+                    'table'     => $tblName,
+                    'caller'    => $caller,
+                    'via'       => 'sugardb_' . $method,
+                    'source'    => 'orm',
+                    'file'      => $this->currentFile,
+                    'line'      => $node->getStartLine(),
+                ];
+            }
+        }
+
+        // SugarBean ORM writes: $bean->save(), $bean->delete(), $bean->mark_deleted()
+        // Table name resolved via: (1) $table_name class property, (2) module dir heuristic.
+        $ormWrites = ['save' => 'UPDATE', 'delete' => 'DELETE', 'mark_deleted' => 'DELETE'];
+        if (isset($ormWrites[$method])) {
+            $table = $this->currentTableName ?? $this->tableFromFile($this->currentFile);
+            if ($table) {
+                $this->sqlQueries[] = [
+                    'operation' => $ormWrites[$method],
+                    'table'     => $table,
+                    'caller'    => $caller,
+                    'via'       => 'orm_' . $method,
+                    'source'    => 'orm',
+                    'file'      => $this->currentFile,
+                    'line'      => $node->getStartLine(),
+                ];
+            }
+        }
+    }
+
+    /** Derive table name from module directory path: modules/<Module>/file.php → module_name */
+    private function tableFromFile(string $file): string
+    {
+        if (preg_match('#(?:^|/)modules/([^/]+)/#', $file, $m)) {
+            return strtolower($m[1]);
+        }
+        return '';
     }
 
     // ── header() Redirect ────────────────────────────────────────────────────

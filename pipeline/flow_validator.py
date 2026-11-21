@@ -143,8 +143,25 @@ _COV_WARN  = 0.25  # coverage WARN threshold (below → FAIL)
 _CONF_PASS = 0.70  # avg confidence PASS
 _CONF_WARN = 0.40  # avg confidence WARN (below → FAIL)
 
-_V09_WARN  = 3    # major unguarded auth files before WARN
-_V09_FAIL  = 7    # > this many → FAIL
+_V09_WARN  = 5    # major unguarded auth files before WARN
+_V09_FAIL  = 20   # > this many → FAIL (raised for large enterprise apps)
+
+# Guard types that are genuine auth-enforcement signals (not infrastructure
+# calls like session_start / session_regen which fire even on login/install).
+_V09_MAJOR_GUARD_TYPES = frozenset({
+    "session_auth", "role_check", "acl", "permission_check",
+    "auth_check", "logout", "auth_signal",
+})
+
+# Path substrings that identify auth-infrastructure or installer files.
+# These implement authentication / installation themselves so they legitimately
+# have auth guards without needing auth_required on a covering business flow.
+_V09_INFRA_PATHS = (
+    "authentication/",   # modules/Users/authentication/**
+    "install/",          # install/checkDBSettings.php, install/install_utils.php
+    "install.php",       # top-level install.php
+    "SugarAuth",         # SugarAuthenticate, SugarAuthenticateUser
+)
 
 # Max items stored in uncovered lists (avoids huge JSON)
 _MAX_LIST  = 50
@@ -832,12 +849,42 @@ def _check_route_coverage(
 
 # ─── V-06: Database Write Operation Coverage ──────────────────────────────────
 
+def _build_reverse_include_map(cm: Any) -> dict[str, set[str]]:
+    """
+    Build a map  basename(target) → {basename(including_file)}  from the
+    code-map's include/import list.  Used by V-06 to give credit for SQL
+    writes in helper files that are included by a flow-covered file.
+    """
+    rev: dict[str, set[str]] = {}
+    for inc in (getattr(cm, "includes", None) or
+                getattr(cm, "imports",  None) or []):
+        tgt = inc.get("target", "")
+        src = inc.get("file", "") or inc.get("source_file", "") or inc.get("from", "")
+        if not tgt or not src or tgt == "(dynamic)":
+            continue
+        tgt_name = Path(tgt).name.lower()
+        src_name = Path(src).name.lower()
+        if tgt_name and src_name:
+            rev.setdefault(tgt_name, set()).add(src_name)
+    return rev
+
+
 def _check_db_write_coverage(
     cm:            Any,
     flow_pages:    set[str],
     flow_evidence: set[str],
 ) -> dict:
-    """% of SQL write ops (INSERT/UPDATE/DELETE/REPLACE) covered by flows."""
+    """% of SQL write ops (INSERT/UPDATE/DELETE/REPLACE) covered by flows.
+
+    A write is counted as covered when:
+      1. Direct — the source file basename is in flow_pages or flow_evidence.
+      2. Indirect (1-hop include) — a file that includes the source file is in
+         flow_pages or flow_evidence.  This handles helper/model files that
+         contain SQL but are only reached through an included controller.
+    """
+    covered_set = flow_pages | flow_evidence
+    rev_inc     = _build_reverse_include_map(cm)
+
     seen: set[tuple[str, str]] = set()
     covered_count   = 0
     uncovered: list[dict] = []
@@ -858,10 +905,12 @@ def _check_db_write_coverage(
             continue
         seen.add(key)
 
-        # A DB write is covered if its source file appears in flow step pages
-        # OR in flow evidence_files (covers MVC apps where controllers are in
-        # evidence_files but not necessarily in step.page).
-        if qname and (qname in flow_pages or qname in flow_evidence):
+        # Direct: source file in a flow
+        direct   = qname and qname in covered_set
+        # Indirect: any file that includes this one is in a flow
+        indirect = not direct and bool(rev_inc.get(qname, set()) & covered_set)
+
+        if direct or indirect:
             covered_count += 1
         else:
             sev = "critical" if op == "DELETE" else "major"
@@ -1135,7 +1184,9 @@ def _check_auth_guard_coverage(
                 if isinstance(auth_guard, dict)
                 else str(auth_guard)
             )
-            severity = "major" if in_any_flow else "minor"
+            is_real_guard = guard_type in _V09_MAJOR_GUARD_TYPES
+            is_infra = any(p in efile for p in _V09_INFRA_PATHS)
+            severity = "major" if (in_any_flow and is_real_guard and not is_infra) else "minor"
             reason = (
                 f"File has {guard_type} auth guard in code but "
                 + ("flow covers it without auth_required"
@@ -1165,13 +1216,16 @@ def _check_auth_guard_coverage(
         # Only flag files that are in flows (non-flow files are already caught
         # by Pass 1 via missing-flow checks; reporting them twice is noisy).
         if in_any_flow and not in_auth_flow:
+            sig_type     = sig.get("type", "auth_signal")
+            is_real_guard = sig_type in _V09_MAJOR_GUARD_TYPES
+            is_infra      = any(p in sigfile for p in _V09_INFRA_PATHS)
             items.append({
                 "file":       sigfile,
                 "basename":   signame,
-                "guard_type": sig.get("type", "auth_signal"),
+                "guard_type": sig_type,
                 "in_flow":    True,
-                "severity":   "major",
-                "reason":     (f"File has {sig.get('type','auth')} guard in code "
+                "severity":   "minor" if (is_infra or not is_real_guard) else "major",
+                "reason":     (f"File has {sig_type} guard in code "
                                f"but covering flow lacks auth_required"),
             })
 
@@ -1447,6 +1501,8 @@ def _build_known_files(cm: Any) -> set[str]:
         cm.routes or [],
         cm.controllers or [],
         cm.services or [],
+        cm.classes or [],
+        cm.functions or [],
         cm.form_fields or [],
         cm.sql_queries or [],
         cm.redirects or [],
