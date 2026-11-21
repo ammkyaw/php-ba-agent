@@ -1539,7 +1539,7 @@ def _build_known_tables(cm: Any) -> set[str]:
         if t and t not in _SKIP_TABLES:
             tables.add(t)
     for schema in (cm.db_schema or []):
-        t = (schema.get("table_name") or schema.get("table", "")).strip().lower()
+        t = (schema.get("table_name") or schema.get("table") or "").strip().lower()
         if t and t not in _SKIP_TABLES:
             tables.add(t)
     return tables
