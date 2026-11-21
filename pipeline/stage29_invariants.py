@@ -352,6 +352,8 @@ def _extract_schema_rules(
 
     def _emit_col(table: str, col_name: str, fpath: str,
                   nullable: bool, unique: bool, primary: bool) -> None:
+        if not table or not col_name:   # guard against None / empty from parser
+            return
         ctx_name = _assign_context(fpath, ac_file_map) if fpath else (table or "General")
         key = (table.lower(), col_name.lower())
         if key in seen or col_name.lower() in _SKIP_COLUMNS:
@@ -383,11 +385,11 @@ def _extract_schema_rules(
     # ── Format A: flat TableColumnEntry (Prisma / TS / Java) ──────────────────
     # Each entry represents a single column: {table, column, type, nullable, ...}
     for tc in (cm.table_columns or []):
-        col_name = tc.get("column", "")
+        col_name = tc.get("column") or ""
         if not col_name:
             continue   # not a flat entry — skip (grouped entries handled below)
         _emit_col(
-            table    = tc.get("table", ""),
+            table    = tc.get("table") or "",
             col_name = col_name,
             fpath    = tc.get("file", ""),
             nullable = tc.get("nullable", True),
@@ -398,10 +400,10 @@ def _extract_schema_rules(
     # ── Format B: grouped DbSchemaEntry (PHP / SQL migrations) ────────────────
     # Each entry represents a table with a "columns" list: {table, columns: [...]}
     for entry in (cm.db_schema or []):
-        table = entry.get("table", "")
+        table = entry.get("table") or ""
         fpath = entry.get("file", "")
         for col in entry.get("columns", []):
-            col_name = col.get("name", "") or col.get("column", "")
+            col_name = col.get("name") or col.get("column") or ""
             if not col_name:
                 continue
             _emit_col(
