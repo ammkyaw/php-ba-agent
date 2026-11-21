@@ -158,7 +158,9 @@ def run_critic_loop(
 
         # Refine: targeted surgical edit
         print(f"  [stage50_critic] {label} → triggering refiner pass …")
+        pre_refine = current
         current = _refine(current, cp)
+        current = _reject_elision(current, pre_refine, label)
 
     return current, passes
 
@@ -525,6 +527,49 @@ Rules:
   - Preserve all [BR-XXX] citation tags already present.
   - Output ONLY the corrected full document — no commentary, no preamble.\
 """
+
+
+_ELISION_PATTERNS = [
+    r"\.\.\.\s*\[Continuing remaining",
+    r"\.\.\.\s*remainder of document",
+    r"remainder of document remains unmodified",
+    r"\.\.\.\(remainder",
+    r"\[remainder",
+    r"sections? remain unchanged",
+    r"rest of (?:the )?document (?:remains?|is) unchanged",
+    r"content continues? unchanged",
+    r"BR-\[",          # placeholder bracket like BR-[N]
+]
+_ELISION_RE = re.compile("|".join(_ELISION_PATTERNS), re.IGNORECASE)
+
+_HEADING_RE = re.compile(r"^#{1,4}\s+\S", re.MULTILINE)
+
+
+def _reject_elision(refined: str, original: str, label: str) -> str:
+    """
+    Reject a refiner output that contains LLM lazy-shortcut elision markers
+    OR has lost markdown headings that were present in the original draft.
+    Returns `original` if either condition triggers, logging the reason.
+    """
+    if _ELISION_RE.search(refined):
+        print(
+            f"  [stage50_critic] {label} refiner output REJECTED "
+            f"— elision marker detected; keeping pre-refine draft"
+        )
+        return original
+
+    orig_headings = set(_HEADING_RE.findall(original))
+    ref_headings  = set(_HEADING_RE.findall(refined))
+    lost = orig_headings - ref_headings
+    if lost:
+        print(
+            f"  [stage50_critic] {label} refiner output REJECTED "
+            f"— {len(lost)} heading(s) dropped: {sorted(lost)[:3]}; "
+            f"keeping pre-refine draft"
+        )
+        return original
+
+    return refined
 
 
 def _refine(draft: str, cp: CriticPass) -> str:
