@@ -161,7 +161,12 @@ class TypeScriptParser(LanguageParser):
 
         # Build HTTP endpoints from routes
         http_endpoints = [
-            {"method": r.get("method", ""), "handler": r.get("handler", ""), "path": r.get("path", "")}
+            {
+                "method":  r.get("method", ""),
+                "handler": r.get("handler", ""),
+                "path":    r.get("path", ""),
+                "file":    r.get("file", ""),
+            }
             for r in routes
         ]
 
