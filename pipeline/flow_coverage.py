@@ -223,24 +223,36 @@ def _compute(ctx: Any) -> dict[str, Any]:
     rt_missing = sorted(route_files - module_flow_pages)
 
     # ── 3. Database table coverage ────────────────────────────────────────────
-    # All unique tables in the codebase
-    all_tables: set[str] = set()
-    if cm and cm.sql_queries:
-        all_tables = {
-            q["table"].lower()
-            for q in cm.sql_queries
-            if q.get("table") and q["table"].upper() not in ("", "UNKNOWN")
-        }
+    # For BaaS/SPA projects (Firebase, Supabase…) Firestore accesses live in
+    # custom hook files (useXxx.ts), not in page components, so the file-join
+    # to flow_pages always produces 0% — the check is N/A for these projects.
+    arch_style = getattr(ctx, "arch_style", "mvc")
+    if arch_style in ("spa_baas", "spa_graphql"):
+        all_tables      = set()   # empty → _entry() returns N/A / ok
+        tables_in_flows = set()
+    else:
+        # All unique tables in the codebase; exclude internal pseudo-names
+        # (entries starting with "(" such as "(mutation)", "(transaction)").
+        def _real_table(name: str) -> bool:
+            return bool(name) and name.upper() not in ("", "UNKNOWN") and not name.startswith("(")
 
-    # Tables reachable by joining sql_query['file'] → module_flow_pages
-    tables_in_flows: set[str] = set()
-    if cm and cm.sql_queries and module_flow_pages:
-        tables_in_flows = {
-            q["table"].lower()
-            for q in cm.sql_queries
-            if (q.get("table") and q["table"].upper() not in ("", "UNKNOWN")
-                and Path(q.get("file", "")).name.lower() in module_flow_pages)
-        }
+        all_tables = set()
+        if cm and cm.sql_queries:
+            all_tables = {
+                q["table"].lower()
+                for q in cm.sql_queries
+                if _real_table(q.get("table") or "")
+            }
+
+        # Tables reachable by joining sql_query['file'] → module_flow_pages
+        tables_in_flows = set()
+        if cm and cm.sql_queries and module_flow_pages:
+            tables_in_flows = {
+                q["table"].lower()
+                for q in cm.sql_queries
+                if (_real_table(q.get("table") or "")
+                    and Path(q.get("file", "")).name.lower() in module_flow_pages)
+            }
     tbl_covered = tables_in_flows
     tbl_missing = sorted(all_tables - tables_in_flows)
 

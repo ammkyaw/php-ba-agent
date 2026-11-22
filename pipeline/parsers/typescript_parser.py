@@ -551,7 +551,9 @@ def _extract_sql_queries(src: str, rel: str, sql_queries: list) -> None:
     ):
         if m.start() in _seen_chained:
             continue   # already captured by chained form above
-        sql_queries.append({"file": rel, "orm": "firestore", "table": m.group(2), "operation": m.group(1)})
+        # Second arg is a variable name (the pre-fetched ref), not a collection
+        # name — record as (ref) so coverage checks exclude it.
+        sql_queries.append({"file": rel, "orm": "firestore", "table": "(ref)", "operation": m.group(1)})
 
     # React Query / SWR Mutations: useMutation(...)
     # Note: useMutation is a broad signal — it wraps any async function, not
