@@ -905,12 +905,53 @@ def _build_system_preamble(ctx) -> str:
         Language.UNKNOWN:    "software applications",
     }
     desc = _lang_desc.get(lang, "software applications")
-    return (
+    base = (
         f"You are a senior Business Analyst and software architect specialising in\n"
         f"reverse-engineering {desc} into structured business domain models.\n\n"
         f"Your task is to analyse the provided codebase evidence and extract specific\n"
         f"parts of the domain model in JSON format."
     )
+    arch_block = _arch_grounding_block(ctx)
+    return f"{base}\n\n{arch_block}" if arch_block else base
+
+
+def _arch_grounding_block(ctx) -> str:
+    """
+    Return an architecture-specific grounding clause to prevent LLM hallucination
+    of infrastructure that does not exist in the codebase.
+
+    Returns an empty string for mvc/unknown — no extra constraint needed.
+    """
+    arch = getattr(ctx, "arch_style", "mvc")
+    if arch == "spa_baas":
+        return (
+            "ARCHITECTURE GROUNDING — read this before producing any output:\n"
+            "This codebase is a client-side Single-Page Application (SPA) that "
+            "communicates with a Backend-as-a-Service (BaaS) database directly from "
+            "the browser. It has ZERO REST API routes, ZERO Server Actions, and ZERO "
+            "backend controllers.\n"
+            "FORBIDDEN — do NOT invent or assume:\n"
+            "  • REST API endpoints (e.g. /api/..., PATCH /api/..., PUT /api/...)\n"
+            "  • Server Actions (*.action.ts, server functions)\n"
+            "  • Backend controllers, services, or middleware files\n"
+            "  • SQL schemas, table joins, or top-level collections not evidenced in "
+            "TypeScript type definitions\n"
+            "REQUIRED — document all state mutations as:\n"
+            "  • 'Client SDK Mutation' (e.g. setDoc, updateDoc, addDoc, delete)\n"
+            "  • Reference the actual SDK call and collection path found in the evidence\n"
+            "Data model evidence comes from TypeScript interfaces/types — treat each "
+            "exported interface as a document shape, not a SQL table."
+        )
+    if arch == "spa_graphql":
+        return (
+            "ARCHITECTURE GROUNDING:\n"
+            "This codebase is a client-side SPA consuming a GraphQL API. "
+            "Do NOT invent REST endpoints. Document all data operations as GraphQL "
+            "queries or mutations using the schema types found in the evidence.\n"
+            "File paths, resolvers, and field names must come from the extracted evidence "
+            "— do not guess or extrapolate."
+        )
+    return ""
 
 
 # Set by run() to inject a language-aware preamble before calling prompt builders.
