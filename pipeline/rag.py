@@ -275,7 +275,7 @@ class CodeChunkIndex:
             if cid in seen:
                 continue
             seen.add(cid)
-            col_names = [c.get("column", "") for c in (tbl.get("columns") or [])[:15]]
+            col_names = [c.get("name", "") or c.get("column", "") for c in (tbl.get("columns") or [])[:15]]
             content = f"Database table {tname}. Columns: {', '.join(col_names)}."
             yield (cid, "table", tname, "", content)
 

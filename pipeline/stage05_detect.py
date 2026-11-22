@@ -131,20 +131,24 @@ def run(ctx: PipelineContext) -> None:
     root = Path(ctx.project_path)
     print(f"  [stage05] Detecting language & framework for: {root.name}")
 
-    language  = _detect_language(root)
-    framework = _detect_framework(root, language)
+    language   = _detect_language(root)
+    framework  = _detect_framework(root, language)
+    arch_style = _detect_arch_style(root, language)
 
-    print(f"  [stage05] Language  → {language.value}")
-    print(f"  [stage05] Framework → {framework.value}")
+    print(f"  [stage05] Language   → {language.value}")
+    print(f"  [stage05] Framework  → {framework.value}")
+    print(f"  [stage05] Arch style → {arch_style}")
 
     # Store on context (transient attributes; also written to JSON)
     ctx.detected_language  = language
     ctx.detected_framework = framework
+    ctx.arch_style         = arch_style
 
     result = {
-        "language":  language.value,
-        "framework": framework.value,
-        "project":   root.name,
+        "language":   language.value,
+        "framework":  framework.value,
+        "arch_style": arch_style,
+        "project":    root.name,
     }
     Path(output_path).parent.mkdir(parents=True, exist_ok=True)
     with open(output_path, "w", encoding="utf-8") as fh:
@@ -267,6 +271,92 @@ def _detect_framework(root: Path, language: Language) -> Framework:
     return Framework.UNKNOWN
 
 
+# ─── Architecture Style Detection ────────────────────────────────────────────
+
+#  Arch styles
+#  "mvc"      — traditional MVC/REST/SQL backend (PHP MVC, Spring Boot, Laravel REST, …)
+#  "spa_baas" — client-side SPA calling a BaaS directly (Firebase Firestore, Supabase, …)
+#              No REST API routes; all mutations via client SDK (setDoc, insert, etc.)
+#  "spa_graphql" — SPA consuming a GraphQL API (Apollo Client, urql, …)
+#  "unknown"  — insufficient signals
+
+_BAAS_PKG_SIGNALS = [
+    "firebase",          # firebase / firebase-admin
+    "@firebase/",        # modular Firebase SDK
+    "firestore",         # explicit firestore package reference
+    "@supabase/supabase-js",
+    "supabase",
+    "aws-amplify",
+    "@aws-amplify/",
+    "pocketbase",
+    "convex",
+    "@nhost/",
+    "nhost",
+    "appwrite",
+]
+
+_GRAPHQL_PKG_SIGNALS = [
+    "@apollo/client",
+    "apollo-client",
+    "graphql",
+    "urql",
+    "@urql/",
+    "react-query-graphql",
+    "graphql-request",
+]
+
+# Client-side BaaS is confirmed when the project also has NO backend API directories
+_API_ROUTE_DIRS = [
+    "src/app/api",       # Next.js App Router API
+    "pages/api",         # Next.js Pages Router API
+    "app/api",           # generic
+    "api",               # generic REST api folder
+    "routes",            # Express/Fastify style
+    "controllers",       # MVC controller directory
+    "app/Http",          # Laravel
+    "src/controller",
+    "src/controllers",
+]
+
+
+def _detect_arch_style(root: Path, language: Language) -> str:
+    """
+    Determine the high-level architecture style from package.json signals and
+    directory layout.  Returns one of: "mvc", "spa_baas", "spa_graphql", "unknown".
+    """
+    if language not in (Language.TYPESCRIPT, Language.JAVASCRIPT):
+        # PHP / Java / Kotlin are always MVC-style (at least at present)
+        return "mvc"
+
+    pkg_text = ""
+    pkg_path = root / "package.json"
+    if pkg_path.exists():
+        try:
+            pkg_text = pkg_path.read_text(encoding="utf-8", errors="ignore").lower()
+        except OSError:
+            pass
+
+    # Check for BaaS dependency signals in package.json
+    has_baas    = any(sig.lower() in pkg_text for sig in _BAAS_PKG_SIGNALS)
+    has_graphql = any(sig.lower() in pkg_text for sig in _GRAPHQL_PKG_SIGNALS)
+
+    if has_baas:
+        # Confirm: no backend API route directory exists
+        has_api_routes = any((root / d).exists() for d in _API_ROUTE_DIRS)
+        if not has_api_routes:
+            return "spa_baas"
+        # Mixed: has BaaS AND backend routes — treat as mvc (server takes precedence)
+        return "mvc"
+
+    if has_graphql:
+        # GraphQL schema file or generated types confirm it
+        gql_files = list(root.rglob("*.graphql")) + list(root.rglob("*.gql"))
+        if gql_files:
+            return "spa_graphql"
+
+    return "unknown" if language in (Language.TYPESCRIPT, Language.JAVASCRIPT) else "mvc"
+
+
 # ─── Restore from saved file ──────────────────────────────────────────────────
 
 def _restore_from_file(ctx: PipelineContext, output_path: str) -> None:
@@ -283,14 +373,17 @@ def _restore_from_file(ctx: PipelineContext, output_path: str) -> None:
             ctx.detected_framework = Framework(fw_val)
         except ValueError:
             ctx.detected_framework = Framework.UNKNOWN
+        ctx.arch_style = data.get("arch_style", "mvc")
         print(
             f"  [stage05] Resuming — language={ctx.detected_language.value}, "
-            f"framework={ctx.detected_framework.value}"
+            f"framework={ctx.detected_framework.value}, "
+            f"arch={ctx.arch_style}"
         )
     except Exception as exc:
         print(f"  [stage05] Warning: could not restore from {output_path}: {exc}")
         ctx.detected_language  = Language.UNKNOWN
         ctx.detected_framework = Framework.UNKNOWN
+        ctx.arch_style         = "mvc"
 
 
 # ─── Convenience accessor (used by stage10/13/15 dispatchers) ─────────────────

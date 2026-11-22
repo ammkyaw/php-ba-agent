@@ -1603,21 +1603,54 @@ def _format_background_flows(ctx: PipelineContext, max_flows: int = 15) -> str:
     return "\n".join(lines)
 
 
+def _arch_system_note(ctx) -> str:
+    """
+    Return an architecture-specific grounding block for BA document prompts.
+    Prevents the LLM from inventing infrastructure absent from the codebase
+    (e.g. REST endpoints for a pure Firebase SPA).
+    Returns "" for mvc/unknown architectures — no constraint needed.
+    """
+    arch = getattr(ctx, "arch_style", "mvc")
+    if arch == "spa_baas":
+        return (
+            "\n\nARCHITECTURE CONSTRAINT — strictly enforce in every section:\n"
+            "This system is a client-side SPA with a Backend-as-a-Service (BaaS) database. "
+            "It has NO REST API endpoints, NO Server Actions, NO backend controllers.\n"
+            "• FORBIDDEN: REST routes (/api/...), HTTP verbs on server endpoints, "
+            "Server Actions (*.action.ts), backend service files, SQL JOINs\n"
+            "• REQUIRED: describe state changes as 'Client SDK Mutation' citing the actual "
+            "SDK call (e.g. setDoc, updateDoc, addDoc) and Firestore collection path\n"
+            "• Data model: use TypeScript interface names as entity names — do NOT invent "
+            "top-level collections or tables absent from the type definitions"
+        )
+    if arch == "spa_graphql":
+        return (
+            "\n\nARCHITECTURE CONSTRAINT:\n"
+            "This system consumes a GraphQL API from the client. "
+            "Do NOT describe data access as REST endpoints. "
+            "Use GraphQL query/mutation names from the evidence. "
+            "Do not invent resolver logic or server-side files not present in the evidence."
+        )
+    return ""
+
+
 def _preflight_system_note(ctx: PipelineContext) -> str:
     """
-    Build a short system-prompt addendum from ctx.preflight warnings and
-    signal flags.  Previously ctx.preflight was consumed only for quality_score;
-    the richer warning/signal data was completely ignored by BA agents.
+    Build a short system-prompt addendum from ctx.preflight warnings, signal
+    flags, and detected architecture style.
 
-    Returns an empty string if no preflight data or no actionable signals.
+    Returns an empty string if no preflight data, no actionable signals, and no
+    architecture constraint applies.
 
     The note is injected into system prompts so the LLM knows up-front which
-    document sections will have thin evidence and how to handle them gracefully
-    (e.g. "no SQL found → data-model section will be sparse, use route evidence").
+    document sections will have thin evidence and how to handle them gracefully,
+    and cannot invent infrastructure the codebase does not have.
     """
+    arch_note = _arch_system_note(ctx)
+
     pf = getattr(ctx, "preflight", None)
     if not pf:
-        return ""
+        return arch_note
 
     notes: list[str] = []
     signals: dict = getattr(pf, "signals", {}) or {}
@@ -1650,14 +1683,15 @@ def _preflight_system_note(ctx: PipelineContext) -> str:
             notes.append(f"ℹ {w}")
 
     if not notes:
-        return ""
+        return arch_note
 
-    return (
+    signal_block = (
         "\n\nCODEBASE SIGNAL WARNINGS (from static pre-flight analysis):\n"
         + "\n".join(f"  {n}" for n in notes)
         + "\n\nWrite around these gaps — do not fabricate evidence for sections "
         + "where signals are absent."
     )
+    return arch_note + signal_block
 
 
 def _build_tech_stack_block(ctx) -> str:

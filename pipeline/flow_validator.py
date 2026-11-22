@@ -679,10 +679,22 @@ def _check_broken_flows(
 
     # Thresholds apply to major+critical only; minor issues (shallow stubs with
     # valid evidence) are informational and don't trigger FAIL/WARN escalation.
+    #
+    # Scale thresholds for larger projects: a codebase with hundreds of flows
+    # will naturally have more broken ones from evidence-file naming mismatches.
+    # Use proportional floors (15 % FAIL, 8 % WARN) with absolute minimums.
+    total_flows = len(flow_list)
+    if total_flows > 0:
+        v03_fail_eff = max(_V03_FAIL, int(total_flows * 0.15))
+        v03_warn_eff = max(_V03_WARN, int(total_flows * 0.08))
+    else:
+        v03_fail_eff = _V03_FAIL
+        v03_warn_eff = _V03_WARN
+
     major_critical = major + critical
-    if major_critical > _V03_FAIL or critical > 2:
+    if major_critical > v03_fail_eff or critical > 2:
         status, icon = "fail", "❌"
-    elif major_critical > _V03_WARN or critical > 0:
+    elif major_critical > v03_warn_eff or critical > 0:
         status, icon = "warn", "⚠️"
     elif n > 0:
         status, icon = "warn", "⚠️"   # minor-only issues
@@ -1523,6 +1535,22 @@ def _build_known_files(cm: Any) -> set[str]:
     for p in (cm.html_pages or []):
         if isinstance(p, str):
             files.add(Path(p).name.lower())
+    # Route handler class stems are authoritative: if the router declares
+    # "InvoicesController@index", that controller exists even if the PHP
+    # parser didn't reach its file.  Add the stem so broken-flow evidence
+    # matching doesn't flag it as unrecognised.
+    for r in (cm.routes or []):
+        handler = r.get("handler", "") or ""
+        if not handler or handler in ("(closure)", "(group)"):
+            continue
+        ctrl_fqn = (
+            handler.split("@")[0] if "@" in handler
+            else handler.split("::")[0] if "::" in handler
+            else handler
+        )
+        ctrl_short = ctrl_fqn.split("\\")[-1].split("/")[-1].strip()
+        if ctrl_short:
+            files.add(ctrl_short.lower() + ".php")
     return files
 
 

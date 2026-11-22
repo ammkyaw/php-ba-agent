@@ -687,13 +687,12 @@ def _pass5_from_auth_signals(ctx: PipelineContext) -> list[dict]:
     """
     Mine AUTHORIZATION rules directly from code_map.auth_signals.
 
-    auth_signals are extracted by stage15 from every PHP file that has
-    session checks, redirect guards, or role gates — they are the raw
-    code-level authentication patterns, more granular than what pass3
-    derives from flow steps.
-
-    Produces one AUTHORIZATION rule per unique (type, pattern) pair with
-    the source file attached so traceability links back to exact PHP guards.
+    Deduplication strategy: signals sharing the same (sig_type, pattern,
+    detail) triple are collapsed into ONE rule whose source_files lists every
+    guarded file.  This prevents dozens of near-identical session-check
+    stories when the same guard appears across many controllers/views.
+    When a guard covers more than 3 files the context label becomes
+    "Multiple Pages (N pages)" to avoid fabricating a single-page name.
     """
     cm = getattr(ctx, "code_map", None)
     if not cm:
@@ -702,67 +701,96 @@ def _pass5_from_auth_signals(ctx: PipelineContext) -> list[dict]:
     if not auth_signals:
         return []
 
+    _CONF = {
+        "session_check":  0.85,
+        "role_check":     0.88,
+        "redirect_guard": 0.80,
+    }
+
+    # Group by (sig_type, pattern, detail) — identical check = one rule
+    groups: dict[tuple, dict] = {}
+    for sig in auth_signals:
+        sig_type = sig.get("type", "")
+        pattern  = sig.get("pattern", "")
+        detail   = sig.get("detail", "")
+        fpath    = sig.get("file", "")
+        if not pattern:
+            continue
+        gkey = (sig_type, pattern, detail)
+        if gkey not in groups:
+            stem = Path(fpath).stem if fpath else ""
+            # Replace both underscores and hyphens so kebab-case stems
+            # render as proper words rather than "Completed-Sprint-List"
+            first_ctx = stem.replace("_", " ").replace("-", " ").title() if stem else "System"
+            groups[gkey] = {
+                "sig_type":    sig_type,
+                "pattern":     pattern,
+                "detail":      detail,
+                "first_ctx":   first_ctx,
+                "files":       [],
+                "conf":        _CONF.get(sig_type, 0.72),
+            }
+        if fpath:
+            groups[gkey]["files"].append(fpath)
+
     results: list[dict] = []
     seen_fps: set[str] = set()
 
-    for sig in auth_signals:
-        sig_type    = sig.get("type", "")
-        pattern     = sig.get("pattern", "")
-        detail      = sig.get("detail", "")
-        fpath       = sig.get("file", "")
-        context_key = Path(fpath).stem.replace("_", " ").title() if fpath else "System"
+    for (sig_type, pattern, detail), g in groups.items():
+        files   = g["files"]
+        conf    = g["conf"]
+        n_files = len(files)
 
-        if not pattern:
-            continue
+        # Use a generalised label when the guard spans many files so the LLM
+        # does not receive a single filename that may be half-visible mid-chunk
+        if n_files > 3:
+            context_key = f"Multiple Pages ({n_files} pages)"
+        else:
+            context_key = g["first_ctx"]
 
-        # Map signal type to human-readable guard description
         if sig_type == "session_check":
-            desc  = f"Access to '{context_key}' requires an authenticated session (checks {pattern})"
-            given = f"Given a user attempts to access '{context_key}'"
+            desc  = f"Protected pages require an authenticated session (checks {pattern})"
+            given = "Given a user attempts to access a protected page"
             when  = f"When the system checks session variable '{pattern}'"
             then  = "Then the user must be authenticated; unauthenticated users are redirected"
-            conf  = 0.85
         elif sig_type == "role_check":
-            desc  = f"Access to '{context_key}' is restricted to role: {detail or pattern}"
-            given = f"Given a user attempts to access '{context_key}'"
+            desc  = f"Protected pages are restricted to role: {detail or pattern}"
+            given = "Given a user attempts to access a role-restricted page"
             when  = f"When the system checks the user's role ({pattern})"
             then  = f"Then only users with role '{detail or pattern}' are permitted"
-            conf  = 0.88
         elif sig_type == "redirect_guard":
-            desc  = f"'{context_key}' redirects unauthorised users to: {detail or pattern}"
-            given = f"Given an unauthenticated user requests '{context_key}'"
+            desc  = f"Protected pages redirect unauthorised users to: {detail or pattern}"
+            given = "Given an unauthenticated user requests a protected page"
             when  = f"When the authentication guard evaluates '{pattern}'"
             then  = f"Then the user is redirected to '{detail or pattern}'"
-            conf  = 0.80
         else:
-            desc  = f"'{context_key}' enforces auth guard: {pattern}"
-            given = f"Given a user accesses '{context_key}'"
+            desc  = f"Protected pages enforce auth guard: {pattern}"
+            given = "Given a user accesses a protected page"
             when  = f"When the system evaluates guard '{pattern}'"
             then  = "Then the system enforces the authentication requirement"
-            conf  = 0.72
 
-        fp = _fingerprint("AUTHORIZATION", context_key, desc[:60])
+        fp = _fingerprint("AUTHORIZATION", sig_type, pattern)
         if fp in seen_fps:
             continue
         seen_fps.add(fp)
 
         results.append({
-            "category":        "AUTHORIZATION",
-            "title":           f"Auth guard: {context_key[:45]}",
-            "description":     desc,
-            "given":           given,
-            "when":            when,
-            "then":            then,
-            "entities":        [],
-            "bounded_context": context_key,
+            "category":          "AUTHORIZATION",
+            "title":             f"Auth guard: {context_key[:45]}",
+            "description":       desc,
+            "given":             given,
+            "when":              when,
+            "then":              then,
+            "entities":          [],
+            "bounded_context":   context_key,
             "source_invariants": [],
             "source_machines":   [],
             "source_flows":      [],
-            "source_files":      [fpath] if fpath else [],
+            "source_files":      files[:10],
             "confidence":        conf,
             "tags":              ["authorization", sig_type, "auth-guard"],
             "pass_origin":       "pass5_auth_signal",
-            "_fp": fp,
+            "_fp":               fp,
         })
 
     return results
