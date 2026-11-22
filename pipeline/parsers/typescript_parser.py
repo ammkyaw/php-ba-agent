@@ -125,8 +125,29 @@ class TypeScriptParser(LanguageParser):
         if framework in (Framework.VUE, Framework.NUXTJS):
             _extract_vue_router_routes(source_files, root, routes)
 
-        # Prisma schema
+        # Custom React hooks (use-*.ts / use*.ts) → controllers
+        for _hf in source_files:
+            _stem = _hf.stem
+            if not _stem.startswith("use"):
+                continue
+            _rel = self.rel(_hf, root)
+            if "-" in _stem:
+                _parts = _stem.split("-")
+                _hook_name = _parts[0] + "".join(p.capitalize() for p in _parts[1:])
+            else:
+                _hook_name = _stem
+            if not any(c.get("name") == _hook_name for c in controllers):
+                controllers.append({
+                    "name":    _hook_name,
+                    "file":    _rel,
+                    "type":    "hook",
+                    "methods": [],
+                })
+
+        # Prisma schema; fall back to TS interface derivation for NoSQL/BaaS apps
         db_schema, table_columns = _parse_prisma_schema(root)
+        if not db_schema:
+            db_schema, table_columns = _derive_schema_from_interfaces(type_definitions)
 
         # Deduplicate routes by (method, path)
         seen_routes: set[tuple[str, str]] = set()
@@ -707,6 +728,60 @@ def _parse_prisma_schema(root: Path) -> tuple[list[dict], list[dict]]:
             "table": table_name,
             "columns": columns,
         })
+
+    return db_schema, table_columns
+
+
+# Paths that signal domain / data-model type definitions
+_TYPE_DOMAIN_PATH_RE = re.compile(
+    r"(?:^|/)(?:src/)?(?:types|models|domain|entities|interfaces|schema)/",
+    re.IGNORECASE,
+)
+
+# Interface name suffixes that indicate UI/utility shapes (not domain entities)
+_NON_DOMAIN_SUFFIXES = (
+    "Props", "State", "Config", "Options", "Context", "Event",
+    "Handler", "Ref", "Attrs", "Args", "Params", "Query",
+    "Response", "Request", "Error", "Exception", "Hook",
+)
+
+
+def _derive_schema_from_interfaces(
+    type_definitions: list[dict],
+) -> tuple[list[dict], list[dict]]:
+    """Derive db_schema from TypeScript interfaces when no Prisma schema exists.
+
+    Used for BaaS/NoSQL apps (Firebase, Supabase, …) where the domain model
+    lives in src/types/ rather than a Prisma schema file.  Keeps only entries
+    from type/model/domain directories and excludes UI-only shapes.
+    """
+    db_schema: list[dict] = []
+    table_columns: list[dict] = []
+    seen: set[str] = set()
+
+    for td in type_definitions:
+        name      = td.get("name", "")
+        file_path = td.get("file", "").replace("\\", "/")
+
+        if not _TYPE_DOMAIN_PATH_RE.search(file_path):
+            continue
+        if any(name.endswith(sfx) for sfx in _NON_DOMAIN_SUFFIXES):
+            continue
+        if name in seen:
+            continue
+        seen.add(name)
+
+        table_name = _snake(name)
+        db_schema.append({"table": table_name, "model": name, "source": "ts_interface"})
+        columns = [
+            {
+                "name":     f["name"],
+                "type":     f.get("type", "unknown"),
+                "nullable": f.get("optional", False),
+            }
+            for f in td.get("fields", [])
+        ]
+        table_columns.append({"table": table_name, "columns": columns})
 
     return db_schema, table_columns
 
